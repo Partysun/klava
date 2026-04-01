@@ -3,9 +3,9 @@ name = "klava"
 version = "0.1.0"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
-description = ""
-license = ""
-repository = ""
+description = "AI proxy server for routing and transforming LLM requests"
+license = "Apache v. 2.0"
+repository = "https://github.com/Partysun/klava"
 
 [lib]
 name = "klava"
