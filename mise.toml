@@ -1,0 +1,14 @@
+[tools]
+rust = "stable"
+
+[tasks.test-watch]
+description = "Auto-run tests when files change"
+run = "cargo watch -x test"
+sources = [
+    "src/**/*.rs",
+    "tests/**/*.rs"
+]
+
+[tasks.test-hurl]
+description = "Run hurl integration tests against localhost:8085"
+run = "hurl --variable host=http://localhost:8085 --test tests.hurl"
