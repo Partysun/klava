@@ -9,10 +9,10 @@ const DEFAULT_PID_FILE: &str = "/tmp/klava.pid";
 #[command(
     name = "klava",
     version,
-    about = "Proxy Anthropic API requests to OpenAI-compatible endpoints",
-    long_about = "A high-performance proxy that translates Anthropic Claude API requests \
-                  to OpenAI-compatible endpoints like OpenRouter, allowing you to use \
-                  Claude-compatible clients with any OpenAI-compatible API."
+    about = "Klava is a cli for dead-simple usage cli code agents with any providers. Use claude code with your OpenAI-like provider. Make any code agents more secure - filter out any leaking secret keys and crypto keys from your filesystem.",
+    long_about = "A versatile CLI tool that enables AI code agents to work with any compatible AI provider. \
+                  Acts as a universal proxy translating API requests between different formats, \
+                  supporting providers like OpenRouter, Qwen, and OpenAI-compatible services."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -64,6 +64,14 @@ pub enum Command {
         /// Generate configuration without starting the agent
         #[arg(long, help = "Generate config without starting agents")]
         config: bool,
+
+        /// Set the active provider before launching
+        #[arg(
+            long,
+            value_name = "PROVIDER",
+            help = "Set the active provider (e.g., qwen, openrouter)"
+        )]
+        provider: Option<String>,
     },
     /// Start the proxy server
     ///
@@ -133,15 +141,33 @@ pub enum Command {
         follow: bool,
     },
 
-    /// Create or show config file
+    /// Create or configure config file
     ///
-    /// Creates the config file if it doesn't exist, and shows the config path.
+    /// Creates the config file if it doesn't exist, or runs interactive setup.
     #[command(after_help = "Examples:\n  \
                      klava config\n  \
-                     klava config --create")]
+                     klava config --setup")]
     Config {
-        /// Create config file even if it exists
-        #[arg(short, long, help = "Create config file even if it exists")]
-        create: bool,
+        /// Run interactive configuration setup
+        #[arg(long, help = "Run interactive configuration setup")]
+        setup: bool,
+    },
+
+    /// Manage API providers
+    ///
+    /// Switch between providers or manage provider-specific authentication.
+    #[command(after_help = "Examples:\n  \
+                     klava providers\n  \
+                     klava providers set qwen-free\n  \
+                     klava providers qwen-free login\n  \
+                     klava providers qwen-free status")]
+    Providers {
+        /// Raw provider arguments for custom parsing
+        #[arg(
+            required = false,
+            trailing_var_arg = true,
+            help = "Provider name or subcommands"
+        )]
+        args: Vec<String>,
     },
 }

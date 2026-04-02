@@ -13,6 +13,20 @@ pub enum Error {
     #[error("configuration file error: {0}")]
     Config(#[from] confy::ConfyError),
 
+    /// Configuration validation errors
+    #[error("base URL is required")]
+    MissingBaseUrl,
+
+    #[error("invalid base URL: {0}")]
+    InvalidBaseUrl(String),
+
+    #[error("API key is required for provider '{0}'")]
+    MissingApiKey(String),
+
+    /// Provider authentication errors
+    #[error("provider authentication error: {0}")]
+    Provider(String),
+
     /// Request/response transformation errors
     #[error("transformation error: {0}")]
     Transform(String),
@@ -44,6 +58,19 @@ impl IntoResponse for Error {
             Error::Config(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Configuration file error: {}", err),
+            ),
+            Error::MissingBaseUrl => (StatusCode::BAD_REQUEST, "Base URL is required".to_string()),
+            Error::InvalidBaseUrl(url) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid base URL: {}", url),
+            ),
+            Error::MissingApiKey(provider) => (
+                StatusCode::BAD_REQUEST,
+                format!("API key is required for provider '{}'", provider),
+            ),
+            Error::Provider(msg) => (
+                StatusCode::UNAUTHORIZED,
+                format!("Provider authentication error: {}", msg),
             ),
             Error::Transform(msg) => (StatusCode::BAD_REQUEST, msg),
             Error::Upstream(msg) => (StatusCode::BAD_GATEWAY, msg),

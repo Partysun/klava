@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::error::{Error as KlavaError, Result as KlavaResult};
 use crate::models::{anthropic, openai};
 use serde_json::{Value, json};
@@ -6,7 +5,8 @@ use serde_json::{Value, json};
 /// Transform Anthropic request to OpenAI format
 pub fn anthropic_to_openai(
     req: anthropic::AnthropicRequest,
-    config: &Config,
+    reasoning_model: Option<String>,
+    completion_model: Option<String>,
 ) -> KlavaResult<openai::OpenAIRequest> {
     // Determine model based on thinking parameter
     let has_thinking = req
@@ -16,16 +16,14 @@ pub fn anthropic_to_openai(
         .map(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"))
         .unwrap_or(false);
 
-    // Use configured model or fall back to the model from the request
+    // Use provided model or fall back to the model from the request
     let model = if has_thinking {
-        config
-            .reasoning_model
+        reasoning_model
             .clone()
             .or_else(|| Some(req.model.clone()))
             .unwrap_or_else(|| req.model.clone())
     } else {
-        config
-            .completion_model
+        completion_model
             .clone()
             .or_else(|| Some(req.model.clone()))
             .unwrap_or_else(|| req.model.clone())
@@ -306,22 +304,19 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
 /// Detects reasoning requests by checking reasoning_effort parameter
 pub fn apply_openai_model_override(
     mut req: openai::OpenAIRequest,
-    config: &Config,
+    reasoning_model: Option<String>,
+    completion_model: Option<String>,
 ) -> openai::OpenAIRequest {
     // Check if this is a reasoning request based on reasoning_effort
     let is_reasoning = req.reasoning_effort.as_ref().map_or(false, |effort| {
         !matches!(effort, openai::ReasoningEffort::None)
     });
 
-    // Override model if configured
+    // Override model if provided
     let model = if is_reasoning {
-        config
-            .reasoning_model
-            .clone()
-            .unwrap_or_else(|| req.model.clone())
+        reasoning_model.clone().unwrap_or_else(|| req.model.clone())
     } else {
-        config
-            .completion_model
+        completion_model
             .clone()
             .unwrap_or_else(|| req.model.clone())
     };

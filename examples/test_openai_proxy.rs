@@ -28,7 +28,23 @@ async fn main() -> anyhow::Result<()> {
     configure_logging(true, LogMode::STDOUT);
 
     // Load config from file and env vars (same as main.rs)
-    let mut config = Config::from_config_and_env()?;
+    let persistent = Config::load()?;
+
+    // Create a config with environment variable overrides applied
+    let mut config = Config {
+        port: persistent.port,
+        active_provider: persistent.active_provider.clone(),
+        providers: persistent.providers.clone(),
+        verbose: persistent.verbose,
+    };
+
+    // Validate config and run interactive setup if needed
+    if let Err(e) = config.validate_complete() {
+        eprintln!("Configuration validation failed: {}", e);
+        eprintln!("Please run 'cargo run --bin klava setup' to configure your provider");
+        return Err(anyhow::anyhow!("Configuration error: {}", e));
+    }
+
     config.verbose = true;
 
     let config = Arc::new(config);
@@ -57,9 +73,11 @@ async fn main() -> anyhow::Result<()> {
     );
     println!(
         "Base URL: {}",
-        config.base_url.as_ref().unwrap_or(&"N/A".to_string())
+        config
+            .resolve_base_url()
+            .unwrap_or_else(|| "N/A".to_string())
     );
-    if config.api_key.is_some() {
+    if config.resolve_api_key().is_some() {
         println!("API Key: configured");
     } else {
         println!("API Key: not set");

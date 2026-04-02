@@ -127,7 +127,6 @@ pub fn configure_logging(verbose: bool, mode: LogMode) {
     }
 }
 
-/// Build and run the HTTP proxy server
 pub async fn run_server(
     config: Arc<Config>,
     client: reqwest::Client,
@@ -138,19 +137,28 @@ pub async fn run_server(
 
     tracing::info!("Starting Klava Proxy v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Port: {}", config.port);
-    if let Some(ref url) = config.base_url {
-        tracing::info!("Upstream URL: {}", url);
-    }
-    if let Some(ref model) = config.reasoning_model {
-        tracing::info!("Reasoning Model Override: {}", model);
-    }
-    if let Some(ref model) = config.completion_model {
-        tracing::info!("Completion Model Override: {}", model);
-    }
-    if config.api_key.is_some() {
-        tracing::info!("API Key: configured");
-    } else {
-        tracing::info!("API Key: not set (using unauthenticated endpoint)");
+
+    // Get the active provider config for logging
+    if let Some(active_config) = config.get_active_provider_config() {
+        if let Some(ref url) = config.resolve_base_url() {
+            tracing::info!("Upstream URL: {}", url);
+        }
+
+        if let Some(ref model) = config.resolve_reasoning_model() {
+            tracing::info!("Reasoning Model Override: {}", model);
+        }
+
+        if let Some(ref model) = config.resolve_completion_model() {
+            tracing::info!("Completion Model Override: {}", model);
+        }
+
+        if active_config.api_key.is_some() {
+            tracing::info!("API Key: configured");
+        } else if config.resolve_api_key().is_some() {
+            tracing::info!("API Key: configured (via env var)");
+        } else {
+            tracing::info!("API Key: not set (using unauthenticated endpoint)");
+        }
     }
 
     let addr = format!("0.0.0.0:{}", config.port);

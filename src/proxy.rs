@@ -49,7 +49,11 @@ pub async fn proxy_anthropic(
         );
     }
 
-    let openai_req = anthropic_to_openai(anthropic_req, &config)?;
+    let openai_req = anthropic_to_openai(
+        anthropic_req,
+        config.resolve_reasoning_model(),
+        config.resolve_completion_model(),
+    )?;
     tracing::debug!(
         "Transformed to OpenAI request for model: {}",
         openai_req.model
@@ -62,7 +66,7 @@ pub async fn proxy_anthropic(
         );
     }
 
-    let response = send_request(&client, &config, &openai_req).await?;
+    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
 
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
@@ -102,7 +106,11 @@ pub async fn proxy_openai(
     let openai_req: openai::OpenAIRequest = serde_json::from_value(data)?;
 
     // Override model based on config (reasoning vs completion model)
-    let openai_req = crate::transform::apply_openai_model_override(openai_req, &config);
+    let openai_req = crate::transform::apply_openai_model_override(
+        openai_req,
+        config.resolve_reasoning_model(),
+        config.resolve_completion_model(),
+    );
 
     if config.verbose {
         tracing::trace!(
@@ -111,7 +119,7 @@ pub async fn proxy_openai(
         );
     }
 
-    let response = send_request(&client, &config, &openai_req).await?;
+    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
 
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
@@ -137,6 +145,7 @@ async fn send_request(
     client: &Client,
     config: &Config,
     openai_req: &openai::OpenAIRequest,
+    hook_chain: &HookChain,
 ) -> Result<reqwest::Response> {
     let url = config.chat_completions_url();
     tracing::debug!("Sending request to {} for model: {}", url, openai_req.model);
@@ -146,10 +155,26 @@ async fn send_request(
         .json(openai_req)
         .timeout(Duration::from_secs(300));
 
-    if let Some(api_key) = &config.api_key {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+    // Conditionally add OpenRouter headers if base URL contains "openrouter"
+    if url.contains("openrouter") {
+        req_builder = req_builder
+            .header("X-OpenRouter-Title", "Klava")
+            .header("X-OpenRouter-Categories", "cli-agent-proxy");
     }
 
+    let provider = config.get_active_provider_config().ok_or_else(|| {
+        Error::Internal(format!(
+            "Active provider '{}' not found in configuration",
+            config.active_provider
+        ))
+    })?;
+
+    if let Some(headers) = provider.get_auth_headers(config).await? {
+        req_builder = req_builder.headers(headers);
+    }
+
+    let data: Value = serde_json::to_value(openai_req)?;
+    hook_chain.execute(HookStage::BeforeUpstream, data, config)?;
     req_builder
         .send()
         .await
@@ -198,7 +223,6 @@ async fn handle_non_streaming_anthropic(
     let anthropic_resp = openai_to_anthropic(openai_resp)?;
 
     let data: Value = serde_json::to_value(anthropic_resp)?;
-    let resp = hook_chain.execute(HookStage::BeforeUpstream, data, config)?;
     Ok(Json(resp).into_response())
 }
 
@@ -225,7 +249,6 @@ async fn handle_non_streaming_openai(
     let openai_resp: openai::OpenAIResponse = response.json().await?;
 
     let data: Value = serde_json::to_value(openai_resp)?;
-    let resp = hook_chain.execute(HookStage::BeforeUpstream, data, config)?;
     Ok(Json(resp).into_response())
 }
 
