@@ -9,7 +9,7 @@ steps:
     image: ghcr.io/pyo3/maturin
     commands:
       - pip install uv
-      - maturin build --release --manylinux 2_17 --sdist --out dist
+      - maturin build --release --manylinux 2_17 --out dist
       - uv publish --token $${UV_TOKEN} dist/
     environment:
       UV_TOKEN:
