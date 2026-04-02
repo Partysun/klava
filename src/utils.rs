@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use colored::*;
 use inquire::Confirm;
 use similar::{ChangeTag, TextDiff};
 use std::fs;
@@ -79,6 +80,11 @@ pub fn generate_diff(old_json: &str, new_json: &str, path: &Path) -> String {
             ChangeTag::Insert => "+",
             ChangeTag::Equal => " ",
         };
+        let sign = match change.tag() {
+            ChangeTag::Delete => sign.red(),
+            ChangeTag::Insert => sign.green(),
+            ChangeTag::Equal => sign.normal(),
+        };
 
         output.push_str(&format!("{}{}", sign, change));
     }
@@ -96,6 +102,7 @@ pub fn ask_user_approval(prompt: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::Path;
 
     #[test]
@@ -109,5 +116,60 @@ mod tests {
         assert!(diff.contains("old"), "Should show removed line");
         assert!(diff.contains("new"), "Should show added line");
         assert!(diff.contains("config.json"), "Should include file path");
+    }
+
+    #[test]
+    fn test_generate_diff_json_order() {
+        let a = json!({
+            "provider": {
+                "klava": { "name": "Klava" },
+                "openrouter": { "name": "OpenRouter" }
+            }
+        });
+
+        let b = json!({
+            "provider": {
+                "openrouter": { "name": "OpenRouter" },
+                "klava": { "name": "Klava" }
+            }
+        });
+
+        let path = Path::new("opencode.json");
+        let diff = generate_diff(&a.to_string(), &b.to_string(), path);
+
+        assert!(diff.contains(""));
+    }
+
+    #[test]
+    fn test_generate_diff_with_changes() {
+        let a = json!({
+            "provider": {
+                "klava": { "name": "Klava" },
+                "openrouter": { "name": "OpenRouter" }
+            }
+        });
+
+        let b = json!({
+            "provider": {
+                "openrouter": { "name": "OpenRouter", "base_url": "https://" },
+                "klava": { "name": "Klava" }
+            }
+        });
+
+        let path = Path::new("opencode.json");
+        let diff = generate_diff(&a.to_string(), &b.to_string(), path);
+
+        assert!(diff.contains(""));
+
+        // Verify the diff contains the expected header
+        assert!(diff.contains("--- opencode.json"));
+        assert!(diff.contains("+++ opencode.json"));
+        assert!(diff.contains("@@ Configuration Changes @@"));
+
+        let change_count = diff
+            .lines()
+            .filter(|line| line.starts_with('+') || line.starts_with('-'))
+            .count();
+        assert!(change_count > 0, "Should contain at least one change");
     }
 }

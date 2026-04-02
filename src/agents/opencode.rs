@@ -27,21 +27,34 @@ impl OpencodeRunner {
                 continue;
             }
 
-            if let Some(config_content) = std::fs::read_to_string(&config_path).ok() {
-                if let Ok(config) = serde_json::from_str::<OpenCodeConfig>(&config_content) {
-                    if let Some(klava_provider) = config.provider.get("klava") {
-                        for (name, cfg) in &klava_provider.models {
-                            if let serde_json::Value::Object(cfg_map) = cfg
-                                && Self::is_klava_model(cfg_map)
-                            {
-                                models.push(name.clone());
-                            }
-                        }
-                    }
+            let Ok(config_content) = std::fs::read_to_string(&config_path) else {
+                continue;
+            };
+
+            let Ok(config) = serde_json::from_str::<OpenCodeConfig>(&config_content) else {
+                continue;
+            };
+
+            let mut config_models = Self::extract_klava_models(&config);
+            models.append(&mut config_models);
+        }
+
+        models.sort();
+        models
+    }
+
+    /// Extract klava models from a config
+    fn extract_klava_models(config: &OpenCodeConfig) -> Vec<String> {
+        let mut models = Vec::new();
+        if let Some(klava_provider) = config.provider.get("klava") {
+            for (name, cfg) in &klava_provider.models {
+                if let serde_json::Value::Object(cfg_map) = cfg
+                    && Self::is_klava_model(cfg_map)
+                {
+                    models.push(name.clone());
                 }
             }
         }
-
         models.sort();
         models
     }
@@ -52,13 +65,20 @@ impl OpencodeRunner {
         }
 
         if let Some(serde_json::Value::String(name)) = cfg.get("name") {
-            return name == "klava-smart";
+            return name == "klava";
         }
 
         false
     }
 }
 
+impl Default for OpencodeRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Works on Linux & MacOS
 impl AgentRunner for OpencodeRunner {
     fn name(&self) -> &'static str {
         Self::name_static()
@@ -92,31 +112,25 @@ impl AgentRunner for OpencodeRunner {
         Ok(())
     }
 
-    fn run(
-        &self,
-        args: &[String],
-        _proxy_url: &str,
-    ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send {
-        async move {
-            let mut cmd = TokioCommand::new(self.name());
-            cmd.args(args)
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
+    async fn run(&self, args: &[String], _proxy_url: &str) -> Result<(), anyhow::Error> {
+        let mut cmd = TokioCommand::new(self.name());
+        cmd.args(args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
 
-            let status = cmd
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("Failed to execute opencode: {}", e))?
-                .wait()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to wait for opencode: {}", e))?;
+        let status = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to execute opencode: {}", e))?
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to wait for opencode: {}", e))?;
 
-            if !status.success() {
-                anyhow::bail!("opencode exited with status: {}", status);
-            }
-
-            Ok(())
+        if !status.success() {
+            anyhow::bail!("opencode exited with status: {}", status);
         }
+
+        Ok(())
     }
 
     async fn setup(&self, proxy_url: &str) -> Result<(), anyhow::Error> {
@@ -144,6 +158,7 @@ impl AgentRunner for OpencodeRunner {
         } else {
             serde_json::from_str(&old_config_str).unwrap_or_default()
         };
+        let old_config = config.clone();
 
         // Build proxy URL with /v1 suffix
         let base_url = format!("{}/v1", proxy_url);
@@ -163,10 +178,11 @@ impl AgentRunner for OpencodeRunner {
         provider
             .options
             .entry("baseURL".to_string())
+            .and_modify(|v| *v = serde_json::json!(base_url))
             .or_insert_with(|| serde_json::json!(base_url));
 
-        // Ensure klava-smart model exists with _klava marker
-        let model_entry = if let Some(existing) = provider.models.get("klava-smart") {
+        // Ensure klava model exists with _klava marker
+        let model_entry = if let Some(existing) = provider.models.get("klava") {
             // Update existing entry only if needed
             let mut entry = existing.clone();
             if let serde_json::Value::Object(ref mut map) = entry {
@@ -177,21 +193,16 @@ impl AgentRunner for OpencodeRunner {
         } else {
             // Create new model entry
             serde_json::json!({
-                "name": "klava-smart",
+                "name": "klava",
                 "_klava": true
             })
         };
 
-        provider
-            .models
-            .insert("klava-smart".to_string(), model_entry);
+        provider.models.insert("klava".to_string(), model_entry);
 
-        // Generate new config JSON
         let new_config = serde_json::to_string_pretty(&config)?;
 
-        // Check if there are actual changes
-        if old_config_str.trim() == new_config.trim() {
-            // No changes needed
+        if old_config == config {
             return Ok(());
         }
 
@@ -228,7 +239,7 @@ impl AgentRunner for OpencodeRunner {
 // OpenCodeConfig part
 
 /// OpenCode main configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct OpenCodeConfig {
     #[serde(rename = "$schema", default = "default_schema")]
     pub schema: String,
@@ -247,8 +258,7 @@ fn default_schema() -> String {
     "https://opencode.ai/config.json".to_string()
 }
 
-/// Provider configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderConfig {
     pub npm: String,
     pub name: String,
@@ -271,29 +281,10 @@ impl Default for ProviderConfig {
     }
 }
 
-/// OpenCode state file structure
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct OpenCodeState {
-    #[serde(default)]
-    pub recent: Vec<RecentEntry>,
-
-    #[serde(default)]
-    pub favorite: Vec<serde_json::Value>,
-
-    #[serde(default)]
-    pub variant: HashMap<String, serde_json::Value>,
-}
-
-/// Recent model entry
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentEntry {
-    pub provider_id: String,
-    pub model_id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_is_klava_model() {
@@ -304,19 +295,82 @@ mod tests {
         assert!(OpencodeRunner::is_klava_model(&cfg));
 
         let mut cfg2 = Map::new();
-        cfg2.insert("name".to_string(), json!("klava-smart"));
+        cfg2.insert("name".to_string(), json!("klava"));
         assert!(OpencodeRunner::is_klava_model(&cfg2));
 
         let cfg3 = Map::new();
         assert!(!OpencodeRunner::is_klava_model(&cfg3));
     }
 
-    // this test is only to check how serde default works with external function default_schema()
     #[test]
     fn test_opencode_config() {
         let json_str = "{}"; // Missing "$schema"
         let config_from_json: OpenCodeConfig = serde_json::from_str(json_str).unwrap();
-        println!("{}", config_from_json.schema);
         assert!(default_schema() == config_from_json.schema);
+    }
+
+    #[test]
+    fn test_extract_klava_models() {
+        let config = json!({
+            "provider": {
+                "klava": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Klava",
+                    "models": {
+                        "model1": {
+                            "_klava": true
+                        },
+                        "model2": {
+                            "name": "klava"
+                        },
+                        "invalid": {
+                            "other": "field"
+                        }
+                    }
+                }
+            }
+        });
+        let config: OpenCodeConfig = serde_json::from_value(config).unwrap();
+
+        let models = OpencodeRunner::extract_klava_models(&config);
+        assert_eq!(models, vec!["model1", "model2"]);
+    }
+
+    #[test]
+    fn test_extract_klava_models_empty() {
+        let config = json!({
+            "provider": {
+                "klava": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Klava",
+                    "models": {}
+                }
+            }
+        });
+        let config: OpenCodeConfig = serde_json::from_value(config).unwrap();
+
+        let models = OpencodeRunner::extract_klava_models(&config);
+        assert_eq!(models, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_extract_klava_models_no_klava_provider() {
+        let config = json!({
+            "provider": {
+                "other": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "name": "Other",
+                    "models": {
+                        "model1": {
+                            "_klava": true
+                        }
+                    }
+                }
+            }
+        });
+        let config: OpenCodeConfig = serde_json::from_value(config).unwrap();
+
+        let models = OpencodeRunner::extract_klava_models(&config);
+        assert_eq!(models, Vec::<String>::new());
     }
 }
