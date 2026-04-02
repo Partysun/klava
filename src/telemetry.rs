@@ -11,34 +11,24 @@ pub struct InstallPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct VersionResponse {
-    pub latest_version: String,
-    pub published_at: String,
+struct CratesIoVersion {
+    num: String,
 }
 
-#[cfg(feature = "telemetry")]
-pub async fn check_for_update(current_version: &str) -> Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+#[derive(Debug, Deserialize)]
+struct CratesIoVersionsResponse {
+    versions: Vec<CratesIoVersion>,
+}
 
-    let url = "https://klava.zatsepin.dev/cli/version";
-
-    let response = client.get(url).send().await?;
-
-    if !response.status().is_success() {
-        return Ok(false);
-    }
-
-    let version_data: VersionResponse = response.json().await?;
-
+// Separate the version comparison logic for easier testing
+fn compare_versions(current_version: &str, latest_version: &str) -> bool {
     // Simple semver comparison
     fn parse_version(v: &str) -> Vec<u32> {
         v.split('.').map(|s| s.parse().unwrap_or(0)).collect()
     }
 
     let current = parse_version(current_version);
-    let latest = parse_version(&version_data.latest_version);
+    let latest = parse_version(latest_version);
 
     let comparison = current
         .iter()
@@ -47,12 +37,47 @@ pub async fn check_for_update(current_version: &str) -> Result<bool> {
         .find(|&ord| ord != Ordering::Equal)
         .unwrap_or_else(|| current.len().cmp(&latest.len()));
 
-    Ok(comparison == Ordering::Less)
+    comparison == Ordering::Less
 }
 
-#[cfg(not(feature = "telemetry"))]
-pub async fn check_for_update(_: &str) -> Result<bool> {
-    Ok(false)
+async fn fetch_latest_version_from_crates_io() -> Result<Option<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        // USER AGENT is must have for query request to crate.io
+        .user_agent(format!("klava/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    // Fetch from crates.io API
+    let url = "https://crates.io/api/v1/crates/klava/versions";
+
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(None), // Return None on network request failures
+    };
+
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let versions_data: CratesIoVersionsResponse = match response.json().await {
+        Ok(data) => data,
+        Err(_) => return Ok(None), // Return None on JSON parsing failures
+    };
+
+    // Get the latest version from the list
+    if let Some(latest_version_info) = versions_data.versions.first() {
+        Ok(Some(latest_version_info.num.clone()))
+    } else {
+        Ok(None) // No versions found
+    }
+}
+
+pub async fn check_for_update(current_version: &str) -> Result<bool> {
+    match fetch_latest_version_from_crates_io().await {
+        Ok(Some(latest_version)) => Ok(compare_versions(current_version, &latest_version)),
+        Ok(None) => Ok(false), // No version found or error
+        Err(_) => Ok(false),   // Error occurred
+    }
 }
 
 #[cfg(feature = "telemetry")]
@@ -137,4 +162,32 @@ pub async fn send_install_event(version: &str) -> anyhow::Result<bool> {
 #[cfg(not(feature = "telemetry"))]
 pub async fn send_install_event(_version: &str) -> anyhow::Result<bool> {
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compare_versions_new_version_available() {
+        assert!(compare_versions("0.2.0", "0.3.0"));
+        assert!(compare_versions("0.2.9", "0.3.0"));
+        assert!(compare_versions("0.9.9", "1.0.0"));
+    }
+
+    #[test]
+    fn test_compare_versions_no_update_needed() {
+        assert!(!compare_versions("0.2.0", "0.2.0"));
+        assert!(!compare_versions("0.3.0", "0.2.0"));
+        assert!(!compare_versions("1.0.0", "0.9.9"));
+    }
+
+    #[test]
+    fn test_compare_versions_edge_cases() {
+        assert!(compare_versions("0.0.1", "0.2.0"));
+        assert!(compare_versions("0.2.5", "0.2.6"));
+        assert!(!compare_versions("0.2.0", "0.0.1"));
+        assert!(!compare_versions("0.2.6", "0.2.5"));
+        assert!(!compare_versions("0.2.5", "0.2.5"));
+    }
 }

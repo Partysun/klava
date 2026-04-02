@@ -43,10 +43,14 @@ async fn main() -> anyhow::Result<()> {
     let _ = send_install_event(current_version).await;
 
     // Check for updates
-    if let Ok(update_available) = check_for_update(current_version).await {
-        if update_available {
-            eprintln!("🔄 A new version of klava is available! Check for updates.");
-        }
+    if let Ok(update_available) = check_for_update(current_version).await
+        && update_available
+    {
+        eprintln!(
+            "{}",
+            "A new version of klava is available! Please update using your package manager.\n"
+                .truecolor(255, 151, 0)
+        );
     }
 
     let cli = Cli::parse();
