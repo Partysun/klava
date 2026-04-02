@@ -75,6 +75,16 @@ pub fn logging_hook(data: Value, _config: &Config) -> Result<Value> {
     Ok(data)
 }
 
+/// Hook: Log provider and model information from request data
+pub fn provider_model_logging_hook(data: Value, config: &Config) -> Result<Value> {
+    let model_info = data.get("model").and_then(|val| val.as_str()).unwrap_or("");
+    let provider_info = &config.active_provider;
+
+    tracing::info!("Provider: {}, Model: {}", provider_info, model_info);
+
+    Ok(data)
+}
+
 pub fn calculate_tokens_hook(data: Value, _config: &Config) -> Result<Value> {
     let text = serde_json::to_string(&data).unwrap_or_default();
     let tokens = estimate_token_count(&text);
@@ -106,7 +116,11 @@ pub fn default_chain() -> HookChain {
             calculate_tokens_hook,
         )
         .with_hook(HookStage::BeforeTransform, "logging", logging_hook)
-        .with_hook(HookStage::BeforeUpstream, "logging", logging_hook)
+        .with_hook(
+            HookStage::BeforeUpstream,
+            "provider_model",
+            provider_model_logging_hook,
+        )
         .with_hook(
             HookStage::UpstreamResponse,
             "openai_to_anthropic",

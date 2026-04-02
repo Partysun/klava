@@ -223,6 +223,7 @@ async fn handle_non_streaming_anthropic(
     let anthropic_resp = openai_to_anthropic(openai_resp)?;
 
     let data: Value = serde_json::to_value(anthropic_resp)?;
+    let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
     Ok(Json(resp).into_response())
 }
 
@@ -249,6 +250,7 @@ async fn handle_non_streaming_openai(
     let openai_resp: openai::OpenAIResponse = response.json().await?;
 
     let data: Value = serde_json::to_value(openai_resp)?;
+    let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
     Ok(Json(resp).into_response())
 }
 
