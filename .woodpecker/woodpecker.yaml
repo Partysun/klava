@@ -1,6 +1,7 @@
 labels:
   backend: docker
   platform: linux/amd64
+  node: fern
 
 steps:
   - name: test
