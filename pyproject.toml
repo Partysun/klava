@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "klava"
+version = "0.1.0"
+authors = [
+  { name = "Iurii Zatsepin", email = "support@zatsepin.dev" },
+]
+description = "Klava is a cli for dead-simple usage cli code agents with any providers. Use claude code with your OpenAI-like provider. Make any code agents more secure - filter out any leaking secret keys and crypto keys from your filesystem."
+readme = "README.md"
+keywords = ["anthropic", "openai", "proxy", "claude", "api"]
+license = { file = "LICENSE" }
+classifiers = [
+  "Environment :: Console",
+  "Programming Language :: Rust",
+  "Topic :: Text Processing",
+]
+
+[project.urls]
+Homepage = "https://github.com/Partysun/klava"
+Repository = "https://github.com/Partysun/klava"
+Documentation = "https://github.com/Partysun/klava#readme"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true
+locked = true
