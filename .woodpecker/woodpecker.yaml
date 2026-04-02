@@ -1,0 +1,36 @@
+labels:
+  backend: docker
+  platform: linux/amd64
+
+steps:
+  - name: test
+    image: rust:latest
+    commands:
+      - cargo test
+    when:
+      - event: [push, pull_request]
+        branch: master
+      - event: manual
+
+  - name: build
+    image: ghcr.io/pyo3/maturin
+    commands:
+      - maturin build --release --manylinux 2_17 --sdist --out dist
+    depends_on:
+      - test
+    when:
+      - event: [tag, deployment]
+
+  - name: publish
+    image: ghcr.io/pyo3/maturin
+    commands:
+      - pip install uv
+      - maturin build --release --manylinux 2_17 --sdist --out dist
+      - uv publish --token ${UV_TOKEN} dist/
+    environment:
+      UV_TOKEN:
+        from_secret: uv_token
+    depends_on:
+      - build
+    when:
+      - event: [tag, deployment]
