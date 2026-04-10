@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.1] - 2026-04-11
+
+### Added
+
+- Add port arg to launch command
+
+### Changed
+
+- Updated build script
+
 ## [0.2.0] - 2026-04-10
 
 ### Added
@@ -16,4 +26,3 @@
 - Initial release with Claude Code support
 - Basic proxy functionality
 - Configuration management
-

@@ -15,4 +15,4 @@ run = "hurl --variable host=http://localhost:8085 --test tests.hurl"
 
 [tasks.build-pypi-artifacts]
 description = "Build artifacts for PyPI (manylinux via Docker + native via uv)"
-run = "docker run --rm -v $(pwd):/io ghcr.io/pyo3/maturin build --release --manylinux 2_17 --out dist && uv run maturin build --release --out dist"
+run = "docker run --rm -v $(pwd):/io ghcr.io/pyo3/maturin build --release --manylinux 2_17 --out dist && uv run maturin build --release --out dist && uv run maturin build --release --target aarch64-apple-darwin --out dist"

@@ -72,13 +72,22 @@ pub enum Command {
             help = "Set the active provider (e.g., qwen, openrouter)"
         )]
         provider: Option<String>,
+
+        /// Port to listen on (overrides PORT env var and config)
+        #[arg(
+            short,
+            long,
+            value_name = "PORT",
+            help = "Port to listen on (overrides PORT env var and config)"
+        )]
+        port: Option<u16>,
     },
     /// Start the proxy server
     ///
     /// Starts the Anthropic to OpenAI proxy server that translates API requests.
     #[command(after_help = "Examples:\n  \
                      klava up\n  \
-                     klava up --port 8080\n  \
+                     klava up --port 8085\n  \
                      klava up --foreground\n  \
                      klava up --daemon")]
     Up {

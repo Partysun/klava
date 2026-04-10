@@ -45,11 +45,17 @@ async fn main() -> anyhow::Result<()> {
             agent,
             config: config_flag,
             provider,
+            port,
         } => {
             use inquire::Select;
 
             // Create a mutable config to potentially update
             let mut current_config = config.clone();
+
+            // Handle port override if provided
+            if let Some(cli_port) = port {
+                current_config.port = cli_port;
+            }
 
             // Handle provider switch if provided
             if let Some(provider_name) = provider {
@@ -224,7 +230,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Logs { follow } => handle_logs_command(follow),
+        Command::Logs { follow } => {
+            //FIX:
+            if cli.verbose {
+                tracing::info!(
+                    "{}", "Note: -v flag doesn't affect logs command. Use `klava up -v` to enable verbose server logging.".truecolor(255, 151, 0)
+                );
+            }
+            handle_logs_command(follow)
+        }
         Command::Config { setup } => handle_config_command(setup).await,
         Command::Providers { args } => handle_providers_command(args).await,
     }

@@ -116,6 +116,8 @@ klava logs -f       # Follow logs (like tail -f)
 klava logs --follow # Follow logs (long form)
 ```
 
+Note: The `-v` flag works only with the `klava up` command to enable verbose logging. When used with `klava logs`, it doesn't change the output. To see verbose logs, start the server with `klava up -v` first, then view the logs.
+
 ## Known Limitations
 
 The following Anthropic API features are **not supported** currently (Claude Code and similar tools work without these parameters):
