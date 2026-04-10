@@ -1,106 +1,147 @@
 # klava
 
-High-performance Rust proxy that translates Anthropic API requests to OpenAI-compatible format. Use Claude Code with OpenRouter, native OpenAI, or any OpenAI-compatible endpoint.
+_README file written by hands primarily_
+
+Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem.
 
 ## Features
 
 - **Fast & Lightweight**: Written in Rust with async I/O
-- **Universal**: Works with any OpenAI-compatible API (OpenRouter, Cloud.ru, local LLMs)
+- **Universal**: Works with any OpenAI-compatible API (OpenRouter, Qwen, Cloud.ru, local LLMs)
+- **Security Guardrails**: Filters out leaked secret keys and cryptographic keys from your filesystem before sending requests to LLM APIs
+
+## Installation
+
+You can install klava from [pip](https://pypi.org/), [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html), [mise](https://github.com/jdx/mise)!
+
+```bash
+pip install klava
+cargo install klava --locked
+mise use -g cargo:klava
+```
+
+Or you can build klava from source. You need to install rustup, clone the repository and then
+
+```bash
+cargo install --path . --locked
+```
 
 ### Launch AI Code Agent
 
 The `launch` command starts the proxy server and launches an AI code agent with appropriate environment variables:
 
 ```bash
-# Interactive selection - shows menu to choose agent
 klava launch
-
-# Launch specific agent directly
 klava launch claude
-
-# Launch with verbose logging
-klava launch claude --verbose
+klava launch claude --provider qwen
+klava launch opencode
 ```
+
+Notice: When launching opencode, you need to manually select the "klava" model using the model command in opencode after it starts.
 
 Supported code agents:
 
 | Agent      | Description    | Link                      |
 | ---------- | -------------- | ------------------------- |
 | `claude`   | Claude Code    | <https://code.claude.com> |
-| `opencode` | OpenCode Agent | Coming soon               |
+| `opencode` | OpenCode Agent | <https://opencode.ai/>    |
 
-The launch command automatically:
+### Configuration File Location
 
-- Starts the proxy server in the background
-- Sets necessary environment variables (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, etc.)
-- Enables demo mode for the agent
-- Shuts down the proxy when the agent exits
+To find the config file path on your system, run:
+
+```bash
+klava config
+```
+
+Platform-specific config file locations:
+
+- **Linux**: `~/.config/klava/config.toml`
+- **macOS**: `~/Library/Application Support/klava/config.toml`
+- **Windows**: `%APPDATA%\klava\config.toml`
+
+#### Config file
+
+```toml
+port = 48017
+verbose = false
+active_provider = "qwen"
+
+[[providers]]
+name = "qwen"
+type = "qwen-code"
+
+[[providers]]
+name = "cloudru"
+type = "openai-compatible"
+base_url = "https://foundation-models.api.cloud.ru"
+api_key_name = "CLOUD_RU_KEY"
+reasoning_model = "zai-org/GLM-4.7"
+completion_model = "zai-org/GLM-4.7"
+
+[[providers]]
+name = "openrouter"
+type = "openai-compatible"
+base_url = "https://openrouter.ai/api"
+api_key_name = "OPENROUTER_API_KEY"
+reasoning_model = "z-ai/glm-5.1"
+completion_model = "z-ai/glm-5.1"
+```
+
+Notice: base_url should not include /v1 at the end!
+
+Notice: You can use api_key_name if you have the api_key in your environment,
+if you want you can set api_key in the toml file with the api_key variable.
+
+Notice: The type can be openai-compatible or qwen-code.
+qwen-code uses an authentication flow involving reverse engineering of the Qwen Code application. You can use 1000 free requests per day of the great large model, but with risks due to this being an unofficial implementation of qwen-code.
+
+### Manual Claude Execution
 
 If you run `klava up`, and you want to run claude manually use this command
 
 ```
-ANTHROPIC_BASE_URL=http://localhost:8085 claude
+ANTHROPIC_BASE_URL=http://localhost:48017 claude
 ```
 
-Dont' forget to change port to your PORT of klava proxy server.
+Don't forget to change the port to your klava proxy server port.
+
+### View Proxy Logs
+
+View or follow proxy server logs:
+
+```bash
+klava logs          # View recent logs
+klava logs -f       # Follow logs (like tail -f)
+klava logs --follow # Follow logs (long form)
+```
 
 ## Known Limitations
 
-The following Anthropic API features are **not supported** currently (Claude Code and similar tools working without these parameters):):
-Many of features like images, full list is not ready yet...
-It's a WIP tool.
+The following Anthropic API features are **not supported** currently (Claude Code and similar tools work without these parameters):
+Many features like images are not ready yet...
+It's a work-in-progress tool.
 
 ## Troubleshooting & Known Pitfalls
-
-**Error: `KLAVA_BASE_URL is required`**  
-→ You must set the upstream endpoint URL. Examples:
-
-- OpenRouter: `https://openrouter.ai/api`
-- OpenAI: `https://api.openai.com`
-- Local: `http://localhost:11434`
-
-**Error: `405 Method Not Allowed`**  
-→ Your `KLAVA_BASE_URL` likely ends with `/v1`. Remove it!
 
 - ❌ Wrong: `https://openrouter.ai/api/v1`
 - ✅ Correct: `https://openrouter.ai/api`
 - The proxy automatically adds `/v1/chat/completions`
 
-**Model not found errors**  
-→ Set `REASONING_MODEL` and `COMPLETION_MODEL` to override the models from client requests
-
-## Testing
-
-The project includes integration tests using [Hurl](https://hurl.dev/), a command line tool that can run HTTP requests defined in simple text files.
-
-### Installing Hurl
-
-```bash
-# macOS with Homebrew
-brew install hurl
-
-# Linux
-curl --proto '=https' --tlsv1.2 -sSf https://hurl.dev/install.sh | sh
-
-# Or from releases
-# https://github.com/Orange-OpenSource/hurl/releases
-```
-
-### Running Tests
-
-The `tests.hurl` file contains comprehensive tests for all proxy endpoints:
-
-```bash
-# Run tests against local development server
-hurl --variable host=http://localhost:3000 --test tests.hurl
-
-# Run with mise task (uses localhost:8085)
-mise run test-hurl
-
-# Run without host variable (uses default from hurl file if set)
-hurl --test tests.hurl
-```
-
-## Contributing
+## Roadmap & Contributing
 
 Contributions welcome!
+
+Current vision is:
+
+- Refactoring -> split codebase into many crates like proxy, cli, providers ...)
+- Add more Guardrails
+- Add Token optimization algorithms. Reduce cost is a crucial goal
+- Creating extensions mechanism as first class citizen.
+- Add more providers and agents
+- Add benchmark wars between agents
+- Add remote hand control using Telegram and Mobile
+
+If you like it you can support me:
+
+- Subscribe -> <https://zatsepin.dev/subscribe>

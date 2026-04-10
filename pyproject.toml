@@ -8,7 +8,7 @@ version = "0.2.0"
 authors = [
   { name = "Iurii Zatsepin", email = "support@zatsepin.dev" },
 ]
-description = "Klava is a cli for dead-simple usage cli code agents with any providers. Use claude code with your OpenAI-like provider. Make any code agents more secure - filter out any leaking secret keys and crypto keys from your filesystem."
+description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
 readme = "README.md"
 keywords = ["anthropic", "openai", "proxy", "claude", "api"]
 license = { file = "LICENSE" }

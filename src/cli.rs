@@ -9,7 +9,7 @@ const DEFAULT_PID_FILE: &str = "/tmp/klava.pid";
 #[command(
     name = "klava",
     version,
-    about = "Klava is a cli for dead-simple usage cli code agents with any providers. Use claude code with your OpenAI-like provider. Make any code agents more secure - filter out any leaking secret keys and crypto keys from your filesystem.",
+    about = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem.",
     long_about = "A versatile CLI tool that enables AI code agents to work with any compatible AI provider. \
                   Acts as a universal proxy translating API requests between different formats, \
                   supporting providers like OpenRouter, Qwen, and OpenAI-compatible services."
