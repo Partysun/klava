@@ -13,6 +13,21 @@ sources = [
 description = "Run hurl integration tests against localhost:8085"
 run = "hurl --variable host=http://localhost:8085 --test tests.hurl"
 
+[tasks.build-cross]
+description = "Cross-compile for major platforms (Apple Silicon, Intel Mac, Windows)"
+run = '''
+echo "Building for Apple Silicon..."
+cargo build --target aarch64-apple-darwin --release --quiet &&
+echo "Building for Intel Mac..." &&
+cargo build --target x86_64-apple-darwin --release --quiet &&
+echo "Building for Windows (may require additional setup)..." &&
+cargo build --target x86_64-pc-windows-gnu --release --quiet
+'''
+
+[tasks.build-native]
+description = "Build for current platform"
+run = "cargo build --release"
+
 [tasks.build-pypi-artifacts]
 description = "Build artifacts for PyPI (manylinux via Docker + native via uv)"
-run = "docker run --rm -v $(pwd):/io ghcr.io/pyo3/maturin build --release --manylinux 2_17 --out dist && uv run maturin build --release --out dist && uv run maturin build --release --target aarch64-apple-darwin --out dist"
+run = "docker run --rm -v $(pwd):/io ghcr.io/pyo3/maturin build --release --manylinux 2_17 --out dist && uv run maturin build --release --out dist && uv run maturin build --release --target aarch64-apple-darwin --out dist && uv run maturin build --release --target x86_64-pc-windows-gnu --out dist"

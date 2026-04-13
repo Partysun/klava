@@ -62,7 +62,7 @@ impl Config {
             println!("✓ Created config file at: {}", path.display());
             println!();
         } else {
-            println!("ℹ️Config file already exists at: {}", path.display());
+            println!("Config file already exists at: {}", path.display());
             println!();
         }
 

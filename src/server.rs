@@ -38,6 +38,10 @@ pub fn create_app(
             "/v1/chat/completions",
             axum::routing::post(crate::proxy::proxy_openai),
         )
+        .route(
+            "/v1/responses",
+            axum::routing::post(crate::proxy::proxy_responses),
+        )
         .merge(create_health_router())
         // .layer(axum::middleware::from_fn(
         //     |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {

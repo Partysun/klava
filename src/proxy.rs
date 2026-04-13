@@ -1,9 +1,13 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::hooks::{HookChain, HookStage};
-use crate::models::{anthropic, openai};
-use crate::sse_stream::{sse_openai_to_anthropic_stream, sse_passthrough_stream};
-use crate::transform::{anthropic_to_openai, openai_to_anthropic};
+use crate::models::{anthropic, openai, responses};
+use crate::sse_stream::{
+    sse_openai_to_anthropic_stream, sse_openai_to_responses_stream, sse_passthrough_stream,
+};
+use crate::transform::{
+    anthropic_to_openai, openai_to_anthropic, openai_to_responses, responses_to_openai,
+};
 use axum::{
     Extension, Json,
     body::Body,
@@ -15,6 +19,7 @@ use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,6 +72,13 @@ pub async fn proxy_anthropic(
     }
 
     let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
+
+    if config.verbose {
+        tracing::trace!(
+            "Upstream request sent, received response status: {}",
+            response.status()
+        );
+    }
 
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
@@ -134,6 +146,72 @@ pub async fn proxy_openai(
     Ok(response)
 }
 
+/// Handler for Ollama Responses-compatible requests (/v1/responses)
+/// - Parses Responses request format
+/// - Transforms to OpenAI for upstream
+/// - Transforms response back to Responses format
+pub async fn proxy_responses(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(client): Extension<Client>,
+    Extension(hook_chain): Extension<Arc<HookChain>>,
+    request: Request,
+) -> Result<Response> {
+    let body_bytes = read_body_bytes(request).await?;
+    let responses_req: responses::ResponsesRequest = serde_json::from_slice(&body_bytes)?;
+
+    tracing::debug!(
+        "Detected Responses format request for model: {}",
+        responses_req.model
+    );
+    let is_streaming = responses_req.stream.unwrap_or(false);
+
+    // Run hooks on the original Responses request
+    let data: Value = serde_json::to_value(&responses_req)?;
+    let data = hook_chain.execute(HookStage::RequestReceived, data, &config)?;
+    let responses_req: responses::ResponsesRequest = serde_json::from_value(data)?;
+
+    if config.verbose {
+        tracing::trace!(
+            "Request payload: {}",
+            serde_json::to_string_pretty(&responses_req).unwrap_or_default()
+        );
+    }
+
+    let mut openai_req = responses_to_openai(responses_req)?;
+    tracing::debug!(
+        "Transformed to OpenAI request for model: {}",
+        openai_req.model
+    );
+
+    // Override model based on config (reasoning vs completion model)
+    openai_req = crate::transform::apply_openai_model_override(
+        openai_req,
+        config.resolve_reasoning_model(),
+        config.resolve_completion_model(),
+    );
+
+    if config.verbose {
+        tracing::trace!(
+            "Transformed OpenAI request: {}",
+            serde_json::to_string_pretty(&openai_req).unwrap_or_default()
+        );
+    }
+
+    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
+
+    if !response.status().is_success() {
+        return Err(handle_upstream_error(response).await);
+    }
+
+    let response = if is_streaming {
+        handle_streaming_responses(response, &config).await?
+    } else {
+        handle_non_streaming_responses(response, &hook_chain, &config).await?
+    };
+
+    Ok(response)
+}
+
 async fn read_body_bytes(request: Request) -> Result<bytes::Bytes> {
     axum::body::to_bytes(request.into_body(), 1024 * 1024)
         .await
@@ -150,9 +228,41 @@ async fn send_request(
     let url = config.chat_completions_url();
     tracing::debug!("Sending request to {} for model: {}", url, openai_req.model);
 
+    // Create the request body, potentially modifying it based on the provider
+    let mut request_payload = serde_json::to_value(openai_req)?;
+
+    // Special handling for Qwen models that require specific parameters
+    if url.contains("dashscope") || url.contains("qwen") || openai_req.model.contains("qwen") {
+        // For Qwen models, add enable_thinking: false for non-streaming requests
+        if openai_req.stream.unwrap_or(false) {
+            request_payload["enable_thinking"] = serde_json::Value::Bool(false);
+        } else {
+            // For streaming requests with Qwen, ensure incremental_output is true if thinking is enabled
+            request_payload["incremental_output"] = serde_json::Value::Bool(true);
+        }
+
+        // Check if we need to add a system message for Qwen models
+        if let Some(messages_value) = request_payload["messages"].as_array_mut() {
+            // Check if there's already a system message
+            let has_system_message = messages_value
+                .iter()
+                .any(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("system"));
+
+            if !has_system_message {
+                // Add a default system message
+                let system_message = json!({
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                });
+
+                messages_value.insert(0, system_message);
+            }
+        }
+    }
+
     let mut req_builder = client
         .post(&url)
-        .json(openai_req)
+        .json(&request_payload)
         .timeout(Duration::from_secs(300));
 
     // Conditionally add OpenRouter headers if base URL contains "openrouter"
@@ -173,7 +283,7 @@ async fn send_request(
         req_builder = req_builder.headers(headers);
     }
 
-    let data: Value = serde_json::to_value(openai_req)?;
+    let data: Value = request_payload;
     hook_chain.execute(HookStage::BeforeUpstream, data, config)?;
     req_builder
         .send()
@@ -254,6 +364,19 @@ async fn handle_non_streaming_openai(
     Ok(Json(resp).into_response())
 }
 
+async fn handle_non_streaming_responses(
+    response: reqwest::Response,
+    hook_chain: &HookChain,
+    config: &Config,
+) -> Result<Response> {
+    let openai_resp: openai::OpenAIResponse = response.json().await?;
+    let responses_resp = openai_to_responses(openai_resp)?;
+
+    let data: Value = serde_json::to_value(responses_resp)?;
+    let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
+    Ok(Json(resp).into_response())
+}
+
 async fn handle_streaming_openai(
     response: reqwest::Response,
     _config: &Config,
@@ -265,4 +388,19 @@ async fn handle_streaming_openai(
     });
 
     Ok(build_sse_response(sse_passthrough_stream(stream)))
+}
+
+/// Handle streaming responses for the responses endpoint
+/// Converts OpenAI streaming format to responses format
+async fn handle_streaming_responses(
+    response: reqwest::Response,
+    _config: &Config,
+) -> Result<Response> {
+    let stream = response.bytes_stream().inspect(|chunk| {
+        if let Ok(bytes) = chunk {
+            tracing::trace!("[UPSTREAM] {}", String::from_utf8_lossy(bytes).trim());
+        }
+    });
+
+    Ok(build_sse_response(sse_openai_to_responses_stream(stream)))
 }

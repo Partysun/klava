@@ -376,6 +376,913 @@ pub fn sse_passthrough_stream(
     }
 }
 
+/// Convert OpenAI SSE stream to Responses API SSE stream
+pub fn sse_openai_to_responses_stream(
+    stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
+) -> impl Stream<Item = std::result::Result<Bytes, crate::error::Error>> + Send {
+    async_stream::stream! {
+        tokio::pin!(stream);
+        let mut buffer = String::new();
+
+        // State variables to track the streaming process
+        let mut response_created_sent = false;
+        let mut response_in_progress_sent = false;
+        let mut output_index = 0;
+        let content_index = 0;
+        let mut accumulated_content = String::new();
+        let mut has_content_started = false;
+        let mut response_id = format!("resp_{}", uuid::Uuid::new_v4());
+        let item_id = format!("msg_{}", uuid::Uuid::new_v4());
+
+        // Reasoning/thinking state
+        let mut accumulated_thinking = String::new();
+        let mut reasoning_started = false;
+        let mut reasoning_done = false;
+        let mut reasoning_item_id = String::new();
+        let mut sequence_number = 0;
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    buffer.push_str(&text);
+
+                    // Process complete SSE events (delimited by \n\n)
+                    while let Some(pos) = buffer.find("\n\n") {
+                        let event = buffer[..pos].to_string();
+                        buffer = buffer[pos + 2..].to_string();
+
+                        if event.trim().is_empty() {
+                            continue;
+                        }
+
+                        if event.starts_with("data: ") {
+                            let data_str = event.strip_prefix("data: ").unwrap_or("").trim();
+
+                            if data_str == "[DONE]" {
+                                // Send completion event
+                                let usage = json!({
+                                    "input_tokens": 0,
+                                    "output_tokens": accumulated_content.split_whitespace().count() as i32,
+                                    "total_tokens": accumulated_content.split_whitespace().count() as i32,
+                                    "input_tokens_details": {
+                                        "cached_tokens": 0
+                                    },
+                                    "output_tokens_details": {
+                                        "reasoning_tokens": if !accumulated_thinking.is_empty() { accumulated_thinking.split_whitespace().count() as i32 } else { 0 }
+                                    }
+                                });
+
+                                let output = {
+                                    let mut output_items = Vec::new();
+
+                                    // Add reasoning item if present
+                                    if !accumulated_thinking.is_empty() {
+                                        output_items.push(json!({
+                                            "id": reasoning_item_id,
+                                            "type": "reasoning",
+                                            "summary": [{
+                                                "type": "summary_text",
+                                                "text": accumulated_thinking
+                                            }],
+                                            "encrypted_content": accumulated_thinking
+                                        }));
+                                    }
+
+                                    // Add content item if present
+                                    if !accumulated_content.is_empty() {
+                                        output_items.push(json!({
+                                            "id": item_id,
+                                            "type": "message",
+                                            "status": "completed",
+                                            "role": "assistant",
+                                            "content": [{
+                                                "type": "output_text",
+                                                "text": accumulated_content,
+                                                "annotations": [],
+                                                "logprobs": []
+                                            }]
+                                        }));
+                                    }
+
+                                    output_items
+                                };
+
+                                let completed_event = json!({
+                                    "response": {
+                                        "id": response_id,
+                                        "object": "response",
+                                        "created_at": chrono::Utc::now().timestamp(),
+                                        "completed_at": chrono::Utc::now().timestamp(),
+                                        "status": "completed",
+                                        "model": "unknown", // Will be updated from actual stream
+                                        "output": output,
+                                        "tools": [],
+                                        "tool_choice": "auto",
+                                        "truncation": "disabled",
+                                        "parallel_tool_calls": true,
+                                        "text": {
+                                            "format": {
+                                                "type": "text"
+                                            }
+                                        },
+                                        "top_p": 1.0,
+                                        "presence_penalty": 0.0,
+                                        "frequency_penalty": 0.0,
+                                        "top_logprobs": 0,
+                                        "temperature": 1.0,
+                                        "usage": usage,
+                                        "max_output_tokens": null,
+                                        "max_tool_calls": null,
+                                        "store": false,
+                                        "background": false,
+                                        "service_tier": "default",
+                                        "metadata": {},
+                                        "safety_identifier": null,
+                                        "prompt_cache_key": null,
+                                        "reasoning": null
+                                    },
+                                    "type": "response.completed",
+                                    "sequence_number": sequence_number
+                                });
+                                sequence_number += 1;
+
+                                let sse_done = format!(
+                                    "event: response.completed\n\ndata: {}\n\n",
+                                    serde_json::to_string(&completed_event).unwrap_or_default()
+                                );
+                                yield Ok(Bytes::from(sse_done));
+                                continue;
+                            }
+
+                            // Parse the OpenAI stream chunk
+                            if let Ok(chunk) = serde_json::from_str::<crate::models::openai::StreamChunk>(data_str) {
+                                // Update response_id and model from the chunk
+                                response_id = chunk.id.clone();
+                                let model = &chunk.model;
+
+                                for choice in &chunk.choices {
+                                    let delta = &choice.delta;
+
+                                    // Handle reasoning (thinking)
+                                    if let Some(reasoning) = &delta.reasoning {
+                                        if !reasoning.is_empty() {
+                                            // Start reasoning if not started yet
+                                            if !reasoning_started {
+                                                reasoning_started = true;
+                                                reasoning_item_id = format!("rs_{}", uuid::Uuid::new_v4());
+
+                                                // Send response.created event
+                                                if !response_created_sent {
+                                                    let init_event = json!({
+                                                        "response": {
+                                                            "id": response_id,
+                                                            "object": "response",
+                                                            "created_at": chrono::Utc::now().timestamp(),
+                                                            "completed_at": null,
+                                                            "status": "in_progress",
+                                                            "model": model,
+                                                            "output": [],
+                                                            "tools": [],
+                                                            "tool_choice": "auto",
+                                                            "truncation": "disabled",
+                                                            "parallel_tool_calls": true,
+                                                            "text": {
+                                                                "format": {
+                                                                    "type": "text"
+                                                                }
+                                                            },
+                                                            "top_p": 1.0,
+                                                            "presence_penalty": 0.0,
+                                                            "frequency_penalty": 0.0,
+                                                            "top_logprobs": 0,
+                                                            "temperature": 1.0,
+                                                            "usage": {
+                                                                "input_tokens": 0,
+                                                                "output_tokens": 0,
+                                                                "total_tokens": 0,
+                                                                "input_tokens_details": {
+                                                                    "cached_tokens": 0
+                                                                },
+                                                                "output_tokens_details": {
+                                                                    "reasoning_tokens": 0
+                                                                }
+                                                            },
+                                                            "max_output_tokens": null,
+                                                            "max_tool_calls": null,
+                                                            "store": false,
+                                                            "background": false,
+                                                            "service_tier": "default",
+                                                            "metadata": {},
+                                                            "safety_identifier": null,
+                                                            "prompt_cache_key": null,
+                                                            "reasoning": null
+                                                        },
+                                                        "type": "response.created",
+                                                        "sequence_number": sequence_number
+                                                    });
+                                                    sequence_number += 1;
+
+                                                    let sse_created = format!(
+                                                        "event: response.created\n\ndata: {}\n\n",
+                                                        serde_json::to_string(&init_event).unwrap_or_default()
+                                                    );
+                                                    yield Ok(Bytes::from(sse_created));
+                                                    response_created_sent = true;
+                                                }
+
+                                                // Send response.in_progress event
+                                                if !response_in_progress_sent {
+                                                    let progress_event = json!({
+                                                        "response": {
+                                                            "id": response_id,
+                                                            "object": "response",
+                                                            "created_at": chrono::Utc::now().timestamp(),
+                                                            "completed_at": null,
+                                                            "status": "in_progress",
+                                                            "model": model,
+                                                            "output": [],
+                                                            "tools": [],
+                                                            "tool_choice": "auto",
+                                                            "truncation": "disabled",
+                                                            "parallel_tool_calls": true,
+                                                            "text": {
+                                                                "format": {
+                                                                    "type": "text"
+                                                                }
+                                                            },
+                                                            "top_p": 1.0,
+                                                            "presence_penalty": 0.0,
+                                                            "frequency_penalty": 0.0,
+                                                            "top_logprobs": 0,
+                                                            "temperature": 1.0,
+                                                            "usage": {
+                                                                "input_tokens": 0,
+                                                                "output_tokens": 0,
+                                                                "total_tokens": 0,
+                                                                "input_tokens_details": {
+                                                                    "cached_tokens": 0
+                                                                },
+                                                                "output_tokens_details": {
+                                                                    "reasoning_tokens": 0
+                                                                }
+                                                            },
+                                                            "max_output_tokens": null,
+                                                            "max_tool_calls": null,
+                                                            "store": false,
+                                                            "background": false,
+                                                            "service_tier": "default",
+                                                            "metadata": {},
+                                                            "safety_identifier": null,
+                                                            "prompt_cache_key": null,
+                                                            "reasoning": null
+                                                        },
+                                                        "type": "response.in_progress",
+                                                        "sequence_number": sequence_number
+                                                    });
+                                                    sequence_number += 1;
+
+                                                    let sse_progress = format!(
+                                                        "event: response.in_progress\n\ndata: {}\n\n",
+                                                        serde_json::to_string(&progress_event).unwrap_or_default()
+                                                    );
+                                                    yield Ok(Bytes::from(sse_progress));
+                                                    response_in_progress_sent = true;
+                                                }
+
+                                                // Send output_item.added for reasoning
+                                                let reasoning_item_added_event = json!({
+                                                    "output_index": output_index,
+                                                    "item": {
+                                                        "id": reasoning_item_id,
+                                                        "type": "reasoning",
+                                                        "summary": []
+                                                    },
+                                                    "type": "response.output_item.added",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_reasoning_added = format!(
+                                                    "event: response.output_item.added\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&reasoning_item_added_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_reasoning_added));
+                                            }
+
+                                            // Accumulate thinking
+                                            accumulated_thinking.push_str(reasoning);
+
+                                            // Send reasoning delta
+                                            let safe_reasoning = reasoning.replace('\n', "\\n").replace('\r', "\\r");
+                                            let reasoning_delta_event = json!({
+                                                "item_id": reasoning_item_id,
+                                                "output_index": output_index,
+                                                "summary_index": 0,
+                                                "delta": safe_reasoning,
+                                                "type": "response.reasoning_summary_text.delta",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_reasoning_delta = format!(
+                                                "event: response.reasoning_summary_text.delta\n\ndata: {}\n\n",
+                                                serde_json::to_string(&reasoning_delta_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_reasoning_delta));
+                                        }
+                                    }
+
+                                    // Handle content
+                                    if let Some(content) = &delta.content {
+                                        if !content.is_empty() {
+                                            // If reasoning was started but not completed, finish it first
+                                            if reasoning_started && !reasoning_done {
+                                                reasoning_done = true;
+
+                                                // Send reasoning summary done
+                                                let reasoning_done_event = json!({
+                                                    "item_id": reasoning_item_id,
+                                                    "output_index": output_index,
+                                                    "summary_index": 0,
+                                                    "text": accumulated_thinking,
+                                                    "type": "response.reasoning_summary_text.done",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_reasoning_done = format!(
+                                                    "event: response.reasoning_summary_text.done\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&reasoning_done_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_reasoning_done));
+
+                                                // Send reasoning output item done
+                                                let reasoning_item_done_event = json!({
+                                                    "output_index": output_index,
+                                                    "item": {
+                                                        "id": reasoning_item_id,
+                                                        "type": "reasoning",
+                                                        "summary": [{
+                                                            "type": "summary_text",
+                                                            "text": accumulated_thinking
+                                                        }],
+                                                        "encrypted_content": accumulated_thinking
+                                                    },
+                                                    "type": "response.output_item.done",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_reasoning_item_done = format!(
+                                                    "event: response.output_item.done\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&reasoning_item_done_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_reasoning_item_done));
+
+                                                output_index += 1;
+                                            }
+
+                                            // Send initial events if not sent yet
+                                            if !response_created_sent {
+                                                let init_event = json!({
+                                                    "response": {
+                                                        "id": response_id,
+                                                        "object": "response",
+                                                        "created_at": chrono::Utc::now().timestamp(),
+                                                        "completed_at": null,
+                                                        "status": "in_progress",
+                                                        "model": model,
+                                                        "output": [],
+                                                        "tools": [],
+                                                        "tool_choice": "auto",
+                                                        "truncation": "disabled",
+                                                        "parallel_tool_calls": true,
+                                                        "text": {
+                                                            "format": {
+                                                                "type": "text"
+                                                            }
+                                                        },
+                                                        "top_p": 1.0,
+                                                        "presence_penalty": 0.0,
+                                                        "frequency_penalty": 0.0,
+                                                        "top_logprobs": 0,
+                                                        "temperature": 1.0,
+                                                        "usage": {
+                                                            "input_tokens": 0,
+                                                            "output_tokens": 0,
+                                                            "total_tokens": 0,
+                                                            "input_tokens_details": {
+                                                                "cached_tokens": 0
+                                                            },
+                                                            "output_tokens_details": {
+                                                                "reasoning_tokens": 0
+                                                            }
+                                                        },
+                                                        "max_output_tokens": null,
+                                                        "max_tool_calls": null,
+                                                        "store": false,
+                                                        "background": false,
+                                                        "service_tier": "default",
+                                                        "metadata": {},
+                                                        "safety_identifier": null,
+                                                        "prompt_cache_key": null,
+                                                        "reasoning": null
+                                                    },
+                                                    "type": "response.created",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_created = format!(
+                                                    "event: response.created\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&init_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_created));
+                                                response_created_sent = true;
+                                            }
+
+                                            if !response_in_progress_sent {
+                                                let progress_event = json!({
+                                                    "response": {
+                                                        "id": response_id,
+                                                        "object": "response",
+                                                        "created_at": chrono::Utc::now().timestamp(),
+                                                        "completed_at": null,
+                                                        "status": "in_progress",
+                                                        "model": model,
+                                                        "output": [],
+                                                        "tools": [],
+                                                        "tool_choice": "auto",
+                                                        "truncation": "disabled",
+                                                        "parallel_tool_calls": true,
+                                                        "text": {
+                                                            "format": {
+                                                                "type": "text"
+                                                            }
+                                                        },
+                                                        "top_p": 1.0,
+                                                        "presence_penalty": 0.0,
+                                                        "frequency_penalty": 0.0,
+                                                        "top_logprobs": 0,
+                                                        "temperature": 1.0,
+                                                        "usage": {
+                                                            "input_tokens": 0,
+                                                            "output_tokens": 0,
+                                                            "total_tokens": 0,
+                                                            "input_tokens_details": {
+                                                                "cached_tokens": 0
+                                                            },
+                                                            "output_tokens_details": {
+                                                                "reasoning_tokens": 0
+                                                            }
+                                                        },
+                                                        "max_output_tokens": null,
+                                                        "max_tool_calls": null,
+                                                        "store": false,
+                                                        "background": false,
+                                                        "service_tier": "default",
+                                                        "metadata": {},
+                                                        "safety_identifier": null,
+                                                        "prompt_cache_key": null,
+                                                        "reasoning": null
+                                                    },
+                                                    "type": "response.in_progress",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_progress = format!(
+                                                    "event: response.in_progress\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&progress_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_progress));
+                                                response_in_progress_sent = true;
+                                            }
+
+                                            // Emit content events
+                                            if !has_content_started {
+                                                has_content_started = true;
+
+                                                // response.output_item.added
+                                                let item_added_event = json!({
+                                                    "output_index": output_index,
+                                                    "item": {
+                                                        "id": item_id,
+                                                        "type": "message",
+                                                        "status": "in_progress",
+                                                        "role": "assistant",
+                                                        "content": []
+                                                    },
+                                                    "type": "response.output_item.added",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_item_added = format!(
+                                                    "event: response.output_item.added\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&item_added_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_item_added));
+
+                                                // response.content_part.added
+                                                let part_added_event = json!({
+                                                    "item_id": item_id,
+                                                    "output_index": output_index,
+                                                    "content_index": content_index,
+                                                    "part": {
+                                                        "type": "output_text",
+                                                        "text": "",
+                                                        "annotations": [],
+                                                        "logprobs": []
+                                                    },
+                                                    "type": "response.content_part.added",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_part_added = format!(
+                                                    "event: response.content_part.added\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&part_added_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_part_added));
+                                            }
+
+                                            // response.output_text.delta
+                                            let safe_content = content.replace('\n', "\\n").replace('\r', "\\r");
+                                            let delta_event = json!({
+                                                "item_id": item_id,
+                                                "output_index": output_index,
+                                                "content_index": 0,
+                                                "delta": safe_content,
+                                                "logprobs": [],
+                                                "type": "response.output_text.delta",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_delta = format!(
+                                                "event: response.output_text.delta\n\ndata: {}\n\n",
+                                                serde_json::to_string(&delta_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_delta));
+
+                                            accumulated_content.push_str(content);
+                                        }
+                                    }
+
+                                    // Handle tool calls
+                                    if let Some(tool_calls) = &delta.tool_calls {
+                                        // If reasoning was started but not completed, finish it first
+                                        if reasoning_started && !reasoning_done {
+                                            reasoning_done = true;
+
+                                            // Send reasoning summary done
+                                            let reasoning_done_event = json!({
+                                                "item_id": reasoning_item_id,
+                                                "output_index": output_index,
+                                                "summary_index": 0,
+                                                "text": accumulated_thinking,
+                                                "type": "response.reasoning_summary_text.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_reasoning_done = format!(
+                                                "event: response.reasoning_summary_text.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&reasoning_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_reasoning_done));
+
+                                            // Send reasoning output item done
+                                            let reasoning_item_done_event = json!({
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": reasoning_item_id,
+                                                    "type": "reasoning",
+                                                    "summary": [{
+                                                        "type": "summary_text",
+                                                        "text": accumulated_thinking
+                                                    }],
+                                                    "encrypted_content": accumulated_thinking
+                                                },
+                                                "type": "response.output_item.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_reasoning_item_done = format!(
+                                                "event: response.output_item.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&reasoning_item_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_reasoning_item_done));
+
+                                            output_index += 1;
+                                        }
+
+                                        for tool_call in tool_calls {
+                                            let call_id = tool_call.id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                                            let name = tool_call.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default();
+                                            let arguments = tool_call.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
+
+                                            // response.output_item.added for function call
+                                            let item_added_event = json!({
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": format!("fc_{}", call_id),
+                                                    "type": "function_call",
+                                                    "status": "in_progress",
+                                                    "call_id": call_id,
+                                                    "name": name,
+                                                    "arguments": ""
+                                                },
+                                                "type": "response.output_item.added",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_item_added = format!(
+                                                "event: response.output_item.added\n\ndata: {}\n\n",
+                                                serde_json::to_string(&item_added_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_item_added));
+
+                                            // response.function_call_arguments.delta if present
+                                            if !arguments.is_empty() {
+                                                // Escape any newlines in the arguments to prevent breaking SSE format
+                                                let safe_arguments = arguments.replace('\n', "\\n").replace('\r', "\\r");
+                                                let args_delta_event = json!({
+                                                    "item_id": format!("fc_{}", call_id),
+                                                    "output_index": output_index,
+                                                    "delta": safe_arguments,
+                                                    "type": "response.function_call_arguments.delta",
+                                                    "sequence_number": sequence_number
+                                                });
+                                                sequence_number += 1;
+
+                                                let sse_args_delta = format!(
+                                                    "event: response.function_call_arguments.delta\n\ndata: {}\n\n",
+                                                    serde_json::to_string(&args_delta_event).unwrap_or_default()
+                                                );
+                                                yield Ok(Bytes::from(sse_args_delta));
+                                            }
+
+                                            // response.function_call_arguments.done
+                                            let args_done_event = json!({
+                                                "item_id": format!("fc_{}", call_id),
+                                                "output_index": output_index,
+                                                "arguments": arguments,
+                                                "type": "response.function_call_arguments.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_args_done = format!(
+                                                "event: response.function_call_arguments.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&args_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_args_done));
+
+                                            // response.output_item.done
+                                            let item_done_event = json!({
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": format!("fc_{}", call_id),
+                                                    "type": "function_call",
+                                                    "status": "completed",
+                                                    "call_id": call_id,
+                                                    "name": name,
+                                                    "arguments": arguments
+                                                },
+                                                "type": "response.output_item.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_item_done = format!(
+                                                "event: response.output_item.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&item_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_item_done));
+
+                                            output_index += 1;
+                                        }
+                                    }
+
+                                    // Handle finish reason - send completion events
+                                    if let Some(finish_reason) = &choice.finish_reason {
+                                        // If reasoning was started but not completed, finish it first
+                                        if reasoning_started && !reasoning_done {
+                                            reasoning_done = true;
+
+                                            // Send reasoning summary done
+                                            let reasoning_done_event = json!({
+                                                "item_id": reasoning_item_id,
+                                                "output_index": output_index,
+                                                "summary_index": 0,
+                                                "text": accumulated_thinking,
+                                                "type": "response.reasoning_summary_text.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_reasoning_done = format!(
+                                                "event: response.reasoning_summary_text.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&reasoning_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_reasoning_done));
+
+                                            // Send reasoning output item done
+                                            let reasoning_item_done_event = json!({
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": reasoning_item_id,
+                                                    "type": "reasoning",
+                                                    "summary": [{
+                                                        "type": "summary_text",
+                                                        "text": accumulated_thinking
+                                                    }],
+                                                    "encrypted_content": accumulated_thinking
+                                                },
+                                                "type": "response.output_item.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_reasoning_item_done = format!(
+                                                "event: response.output_item.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&reasoning_item_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_reasoning_item_done));
+
+                                            output_index += 1;
+                                        }
+
+                                        // response.output_text.done (if we had content)
+                                        if !accumulated_content.is_empty() {
+                                            let safe_accumulated_content = accumulated_content.replace('\n', "\\n").replace('\r', "\\r");
+                                            let content_done_event = json!({
+                                                "item_id": item_id,
+                                                "output_index": output_index,
+                                                "content_index": 0,
+                                                "text": safe_accumulated_content,
+                                                "logprobs": [],
+                                                "type": "response.output_text.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_content_done = format!(
+                                                "event: response.output_text.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&content_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_content_done));
+
+                                            // response.content_part.done
+                                            let part_done_event = json!({
+                                                "item_id": item_id,
+                                                "output_index": output_index,
+                                                "content_index": 0,
+                                                "part": {
+                                                    "type": "output_text",
+                                                    "text": safe_accumulated_content,
+                                                    "annotations": [],
+                                                    "logprobs": []
+                                                },
+                                                "type": "response.content_part.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_part_done = format!(
+                                                "event: response.content_part.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&part_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_part_done));
+
+                                            // response.output_item.done
+                                            let item_done_event = json!({
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": item_id,
+                                                    "type": "message",
+                                                    "status": "completed",
+                                                    "role": "assistant",
+                                                    "content": [{
+                                                        "type": "output_text",
+                                                        "text": accumulated_content,
+                                                        "annotations": [],
+                                                        "logprobs": []
+                                                    }]
+                                                },
+                                                "type": "response.output_item.done",
+                                                "sequence_number": sequence_number
+                                            });
+                                            sequence_number += 1;
+
+                                            let sse_item_done = format!(
+                                                "event: response.output_item.done\n\ndata: {}\n\n",
+                                                serde_json::to_string(&item_done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(sse_item_done));
+                                        }
+
+                                        // Final completion event with finish reason
+                                        let usage = json!({
+                                            "input_tokens": 0,
+                                            "output_tokens": accumulated_content.split_whitespace().count() as i32,
+                                            "total_tokens": accumulated_content.split_whitespace().count() as i32,
+                                            "input_tokens_details": {
+                                                "cached_tokens": 0
+                                            },
+                                            "output_tokens_details": {
+                                                "reasoning_tokens": if !accumulated_thinking.is_empty() { accumulated_thinking.split_whitespace().count() as i32 } else { 0 }
+                                            }
+                                        });
+
+                                        let completed_event = json!({
+                                            "response": {
+                                                "id": response_id,
+                                                "object": "response",
+                                                "created_at": chrono::Utc::now().timestamp(),
+                                                "completed_at": chrono::Utc::now().timestamp(),
+                                                "status": "completed",
+                                                "model": model,
+                                                "output": {
+                                                    "id": item_id,
+                                                    "type": "message",
+                                                    "status": "completed",
+                                                    "role": "assistant",
+                                                    "content": [{
+                                                        "type": "output_text",
+                                                        "text": accumulated_content,
+                                                        "annotations": [],
+                                                        "logprobs": []
+                                                    }]
+                                                },
+                                                "tools": [],
+                                                "tool_choice": "auto",
+                                                "truncation": "disabled",
+                                                "parallel_tool_calls": true,
+                                                "text": {
+                                                    "format": {
+                                                        "type": "text"
+                                                    }
+                                                },
+                                                "top_p": 1.0,
+                                                "presence_penalty": 0.0,
+                                                "frequency_penalty": 0.0,
+                                                "top_logprobs": 0,
+                                                "temperature": 1.0,
+                                                "usage": usage,
+                                                "max_output_tokens": null,
+                                                "max_tool_calls": null,
+                                                "store": false,
+                                                "background": false,
+                                                "service_tier": "default",
+                                                "metadata": {},
+                                                "safety_identifier": null,
+                                                "prompt_cache_key": null,
+                                                "reasoning": null
+                                            },
+                                            "type": "response.completed",
+                                            "sequence_number": sequence_number
+                                        });
+                                        sequence_number += 1;
+
+                                        let sse_completed = format!(
+                                            "event: response.completed\n\ndata: {}\n\n",
+                                            serde_json::to_string(&completed_event).unwrap_or_default()
+                                        );
+                                        yield Ok(Bytes::from(sse_completed));
+                                    }
+                                }
+                            } else {
+                                // If parsing fails, log the error but continue processing other chunks
+                                tracing::debug!("Failed to parse OpenAI stream chunk: {}", data_str);
+                            }
+                        }
+
+                        // Forward any other SSE events as-is (but we should handle them properly)
+                        if !event.starts_with("data: [DONE]") && !event.trim().is_empty() {
+                            // Just continue processing
+                        }
+                    }
+                }
+                Err(e) => {
+                    yield Err(crate::error::Error::Upstream(format!("Stream error: {}", e)));
+                    break;
+                }
+            }
+        }
+
+        // Yield any remaining buffer at end of stream
+        if !buffer.trim().is_empty() {
+            yield Ok(Bytes::from(buffer));
+        }
+    }
+}
+
 pub fn sse_openai_to_anthropic_stream(
     stream: impl Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + 'static,
 ) -> impl Stream<Item = std::result::Result<Bytes, crate::error::Error>> + Send {

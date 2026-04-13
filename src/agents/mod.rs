@@ -3,10 +3,16 @@ mod claude;
 #[cfg(feature = "opencode")]
 mod opencode;
 
+#[cfg(feature = "codex")]
+mod codex;
+
 pub use claude::ClaudeRunner;
 
 #[cfg(feature = "opencode")]
 pub use opencode::OpencodeRunner;
+
+#[cfg(feature = "codex")]
+pub use codex::CodexRunner;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -39,6 +45,8 @@ pub enum CodeAgents {
     Claude,
     #[cfg(feature = "opencode")]
     Opencode,
+    #[cfg(feature = "codex")]
+    Codex,
 }
 
 impl CodeAgents {
@@ -47,6 +55,8 @@ impl CodeAgents {
             CodeAgents::Claude => ClaudeRunner::name_static(),
             #[cfg(feature = "opencode")]
             CodeAgents::Opencode => OpencodeRunner::name_static(),
+            #[cfg(feature = "codex")]
+            CodeAgents::Codex => CodexRunner::name_static(),
         }
     }
 
@@ -55,6 +65,8 @@ impl CodeAgents {
             CodeAgents::Claude => "Claude Code (https://code.claude.com)",
             #[cfg(feature = "opencode")]
             CodeAgents::Opencode => "OpenCode Agent",
+            #[cfg(feature = "codex")]
+            CodeAgents::Codex => "Codex Agent",
         }
     }
 
@@ -66,6 +78,12 @@ impl CodeAgents {
             v.push(CodeAgents::Opencode);
             v
         };
+        #[cfg(feature = "codex")]
+        let variants = {
+            let mut v = variants;
+            v.push(CodeAgents::Codex);
+            v
+        };
         variants
     }
 
@@ -74,6 +92,8 @@ impl CodeAgents {
             CodeAgents::Claude => ClaudeRunner::check_installation(),
             #[cfg(feature = "opencode")]
             CodeAgents::Opencode => OpencodeRunner::check_installation(),
+            #[cfg(feature = "codex")]
+            CodeAgents::Codex => CodexRunner::check_installation(),
         }
     }
 
@@ -82,6 +102,8 @@ impl CodeAgents {
             CodeAgents::Claude => ClaudeRunner::new().run(args, proxy_url).await,
             #[cfg(feature = "opencode")]
             CodeAgents::Opencode => OpencodeRunner::new().run(args, proxy_url).await,
+            #[cfg(feature = "codex")]
+            CodeAgents::Codex => CodexRunner::new().run(args, proxy_url).await,
         }
     }
 
@@ -90,6 +112,8 @@ impl CodeAgents {
             CodeAgents::Claude => ClaudeRunner::new().setup(proxy_url).await,
             #[cfg(feature = "opencode")]
             CodeAgents::Opencode => OpencodeRunner::new().setup(proxy_url).await,
+            #[cfg(feature = "codex")]
+            CodeAgents::Codex => CodexRunner::new().setup(proxy_url).await,
         }
     }
 }
