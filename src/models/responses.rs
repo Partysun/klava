@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::json;
 
-/// Ollama Responses API request structure
-/// Based on Ollama's responses.go format
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
@@ -70,6 +69,7 @@ pub enum InputItem {
         #[serde(rename = "encrypted_content")]
         encrypted_content: String,
         #[serde(rename = "summary")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<Vec<ResponsesReasoningSummary>>,
     },
 }
@@ -153,7 +153,7 @@ pub struct ResponsesTool {
     pub name: Option<String>, // Make name optional to handle missing field
     pub description: Option<String>, // nullable but required
     pub strict: Option<bool>, // nullable but required
-    #[serde(default)]
+    #[serde(default = "default_parameters")]
     pub parameters: Value, // nullable but required, with default
 }
 
@@ -263,11 +263,8 @@ pub struct ResponsesOutputTokensDetails {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesUsage {
-    #[serde(rename = "input_tokens")]
     pub input_tokens: i32,
-    #[serde(rename = "output_tokens")]
     pub output_tokens: i32,
-    #[serde(rename = "total_tokens")]
     pub total_tokens: i32,
     #[serde(rename = "input_tokens_details")]
     pub input_tokens_details: ResponsesInputTokensDetails,
@@ -297,4 +294,8 @@ pub struct ResponsesReasoningOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesTextField {
     pub format: ResponsesTextFormat,
+}
+
+fn default_parameters() -> Value {
+    json!({"type": "object", "properties": {}})
 }

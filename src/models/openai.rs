@@ -116,6 +116,7 @@ pub struct Function {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Value::is_null")]
     pub parameters: Value,
 }
 
@@ -168,15 +169,17 @@ pub struct StreamChunk {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StreamChoice {
     pub index: usize,
     pub delta: Delta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -188,7 +191,7 @@ pub struct Delta {
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaToolCall {
     pub index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,7 +203,7 @@ pub struct DeltaToolCall {
     pub function: Option<DeltaFunctionCall>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaFunctionCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

@@ -1,13 +1,12 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::hooks::{HookChain, HookStage};
-use crate::models::{anthropic, openai, responses};
-use crate::sse_stream::{
-    sse_openai_to_anthropic_stream, sse_openai_to_responses_stream, sse_passthrough_stream,
-};
-use crate::transform::{
-    anthropic_to_openai, openai_to_anthropic, openai_to_responses, responses_to_openai,
-};
+use crate::models::{anthropic, openai};
+use crate::responses::ResponsesStreamConverter;
+use crate::responses::responses_to_openai;
+use crate::sse_stream::{sse_openai_to_anthropic_stream, sse_passthrough_stream};
+use crate::stream_converter::UniversalConverter;
+use crate::transform::{anthropic_to_openai, openai_to_anthropic};
 use axum::{
     Extension, Json,
     body::Body,
@@ -141,72 +140,6 @@ pub async fn proxy_openai(
         handle_streaming_openai(response, &config).await?
     } else {
         handle_non_streaming_openai(response, &hook_chain, &config).await?
-    };
-
-    Ok(response)
-}
-
-/// Handler for Ollama Responses-compatible requests (/v1/responses)
-/// - Parses Responses request format
-/// - Transforms to OpenAI for upstream
-/// - Transforms response back to Responses format
-pub async fn proxy_responses(
-    Extension(config): Extension<Arc<Config>>,
-    Extension(client): Extension<Client>,
-    Extension(hook_chain): Extension<Arc<HookChain>>,
-    request: Request,
-) -> Result<Response> {
-    let body_bytes = read_body_bytes(request).await?;
-    let responses_req: responses::ResponsesRequest = serde_json::from_slice(&body_bytes)?;
-
-    tracing::debug!(
-        "Detected Responses format request for model: {}",
-        responses_req.model
-    );
-    let is_streaming = responses_req.stream.unwrap_or(false);
-
-    // Run hooks on the original Responses request
-    let data: Value = serde_json::to_value(&responses_req)?;
-    let data = hook_chain.execute(HookStage::RequestReceived, data, &config)?;
-    let responses_req: responses::ResponsesRequest = serde_json::from_value(data)?;
-
-    if config.verbose {
-        tracing::trace!(
-            "Request payload: {}",
-            serde_json::to_string_pretty(&responses_req).unwrap_or_default()
-        );
-    }
-
-    let mut openai_req = responses_to_openai(responses_req)?;
-    tracing::debug!(
-        "Transformed to OpenAI request for model: {}",
-        openai_req.model
-    );
-
-    // Override model based on config (reasoning vs completion model)
-    openai_req = crate::transform::apply_openai_model_override(
-        openai_req,
-        config.resolve_reasoning_model(),
-        config.resolve_completion_model(),
-    );
-
-    if config.verbose {
-        tracing::trace!(
-            "Transformed OpenAI request: {}",
-            serde_json::to_string_pretty(&openai_req).unwrap_or_default()
-        );
-    }
-
-    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
-
-    if !response.status().is_success() {
-        return Err(handle_upstream_error(response).await);
-    }
-
-    let response = if is_streaming {
-        handle_streaming_responses(response, &config).await?
-    } else {
-        handle_non_streaming_responses(response, &hook_chain, &config).await?
     };
 
     Ok(response)
@@ -364,19 +297,6 @@ async fn handle_non_streaming_openai(
     Ok(Json(resp).into_response())
 }
 
-async fn handle_non_streaming_responses(
-    response: reqwest::Response,
-    hook_chain: &HookChain,
-    config: &Config,
-) -> Result<Response> {
-    let openai_resp: openai::OpenAIResponse = response.json().await?;
-    let responses_resp = openai_to_responses(openai_resp)?;
-
-    let data: Value = serde_json::to_value(responses_resp)?;
-    let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
-    Ok(Json(resp).into_response())
-}
-
 async fn handle_streaming_openai(
     response: reqwest::Response,
     _config: &Config,
@@ -390,17 +310,96 @@ async fn handle_streaming_openai(
     Ok(build_sse_response(sse_passthrough_stream(stream)))
 }
 
-/// Handle streaming responses for the responses endpoint
-/// Converts OpenAI streaming format to responses format
+// ===== Responses API handler =====
+
+/// Handler for Responses API requests (/v1/responses)
+/// - Parses Responses API request format
+/// - Transforms to OpenAI chat completions format
+/// - Sends to upstream as OpenAI
+/// - For streaming: converts OpenAI SSE chunks to Responses API SSE events
+///   using ResponsesStreamConverter via UniversalConverter
+pub async fn proxy_responses(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(client): Extension<Client>,
+    Extension(hook_chain): Extension<Arc<HookChain>>,
+    request: Request,
+) -> Result<Response> {
+    let body_bytes = read_body_bytes(request).await?;
+    let responses_req: crate::models::responses::ResponsesRequest =
+        serde_json::from_slice(&body_bytes)?;
+
+    tracing::debug!(
+        "Detected Responses format request for model: {}",
+        responses_req.model
+    );
+    let is_streaming = responses_req.stream.unwrap_or(false);
+
+    // Run hooks on the original Responses request
+    let data: Value = serde_json::to_value(&responses_req)?;
+    let data = hook_chain.execute(HookStage::RequestReceived, data, &config)?;
+    let responses_req: crate::models::responses::ResponsesRequest = serde_json::from_value(data)?;
+
+    if config.verbose {
+        tracing::trace!(
+            "Request payload: {}",
+            serde_json::to_string_pretty(&responses_req).unwrap_or_default()
+        );
+    }
+
+    let openai_req = responses_to_openai(responses_req)?;
+
+    // Apply model overrides
+    let openai_req = crate::transform::apply_openai_model_override(
+        openai_req,
+        config.resolve_reasoning_model(),
+        config.resolve_completion_model(),
+    );
+
+    tracing::debug!(
+        "Transformed to OpenAI request for model: {}",
+        openai_req.model
+    );
+
+    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
+
+    if !response.status().is_success() {
+        return Err(handle_upstream_error(response).await);
+    }
+
+    let response = if is_streaming {
+        handle_streaming_responses(response, &config).await?
+    } else {
+        // Non-streaming: return error — not yet supported
+        return Err(Error::Transform(
+            "Non-streaming Responses API requests are not yet supported".to_string(),
+        ));
+    };
+
+    Ok(response)
+}
+
+/// Handle streaming response by converting OpenAI SSE to Responses API SSE
 async fn handle_streaming_responses(
     response: reqwest::Response,
     _config: &Config,
 ) -> Result<Response> {
-    let stream = response.bytes_stream().inspect(|chunk| {
-        if let Ok(bytes) = chunk {
-            tracing::trace!("[UPSTREAM] {}", String::from_utf8_lossy(bytes).trim());
-        }
-    });
+    let response_id = format!("resp_{}", uuid::Uuid::new_v4().as_simple());
+    let item_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
+    let model = response
+        .headers()
+        .get("x-model")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
 
-    Ok(build_sse_response(sse_openai_to_responses_stream(stream)))
+    let converter = ResponsesStreamConverter::new(response_id, item_id, model);
+    let universal = UniversalConverter::new(converter);
+
+    let upstream = response
+        .bytes_stream()
+        .map(|result| result.map_err(Error::Http));
+
+    let stream = universal.convert(upstream);
+
+    Ok(build_sse_response(stream))
 }

@@ -425,6 +425,7 @@ mod stream_tests {
                     role: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
             ..Default::default()
         };
@@ -446,6 +447,7 @@ mod stream_tests {
             model: "gpt".to_string(),
             choices: vec![StreamChoice {
                 index: 0,
+                logprobs: None,
                 delta: Delta {
                     content: Some("Hello".to_string()),
                     reasoning: None,
@@ -479,6 +481,7 @@ mod stream_tests {
             model: "gpt".to_string(),
             choices: vec![StreamChoice {
                 index: 0,
+                logprobs: None,
                 delta: Delta {
                     content: Some("test".to_string()),
                     reasoning: None,
