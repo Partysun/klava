@@ -1,0 +1,9 @@
+# For cross-compiling to Apple Silicon (ARM64) Macs
+[target.aarch64-apple-darwin]
+linker = "clang"
+ar = "ar"
+
+# For Windows cross-compilation
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"
