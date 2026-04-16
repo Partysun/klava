@@ -617,6 +617,10 @@ impl ResponsesStreamConverter {
 impl ChatChunkConverter for ResponsesStreamConverter {
     type OutputEvent = ResponsesStreamEvent;
 
+    fn is_completed(&self) -> bool {
+        self.completed
+    }
+
     fn process(&mut self, chunk: &StreamChunk) -> Vec<ResponsesStreamEvent> {
         let mut events = Vec::new();
 
@@ -678,10 +682,6 @@ impl ChatChunkConverter for ResponsesStreamConverter {
     }
 
     fn finalize(&mut self) -> Vec<ResponsesStreamEvent> {
-        if self.completed {
-            return Vec::new();
-        }
-
         let mut events = Vec::new();
 
         // Safety net: close any open phases

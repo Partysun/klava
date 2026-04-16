@@ -191,7 +191,7 @@ pub struct Delta {
     pub reasoning: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct DeltaToolCall {
     pub index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,7 +203,7 @@ pub struct DeltaToolCall {
     pub function: Option<DeltaFunctionCall>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct DeltaFunctionCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,

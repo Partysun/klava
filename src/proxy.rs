@@ -1,12 +1,12 @@
+use crate::anthropic::AnthropicStreamConverter;
+use crate::anthropic::transform::{anthropic_to_openai, openai_to_anthropic};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::hooks::{HookChain, HookStage};
 use crate::models::{anthropic, openai};
 use crate::responses::ResponsesStreamConverter;
 use crate::responses::responses_to_openai;
-use crate::sse_stream::{sse_openai_to_anthropic_stream, sse_passthrough_stream};
-use crate::stream_converter::UniversalConverter;
-use crate::transform::{anthropic_to_openai, openai_to_anthropic};
+use crate::stream_converter::{PassthroughConverter, UniversalConverter};
 use axum::{
     Extension, Json,
     body::Body,
@@ -21,6 +21,31 @@ use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Apply model override based on config for OpenAI requests
+/// Detects reasoning requests by checking reasoning_effort parameter
+fn apply_openai_model_override(
+    mut req: openai::OpenAIRequest,
+    reasoning_model: Option<String>,
+    completion_model: Option<String>,
+) -> openai::OpenAIRequest {
+    // Check if this is a reasoning request based on reasoning_effort
+    let is_reasoning = req.reasoning_effort.as_ref().map_or(false, |effort| {
+        !matches!(effort, openai::ReasoningEffort::None)
+    });
+
+    // Override model if provided
+    let model = if is_reasoning {
+        reasoning_model.clone().unwrap_or_else(|| req.model.clone())
+    } else {
+        completion_model
+            .clone()
+            .unwrap_or_else(|| req.model.clone())
+    };
+
+    req.model = model;
+    req
+}
 
 /// Handler for Anthropic-compatible requests (/v1/messages)
 /// - Parses Anthropic request format
@@ -117,7 +142,7 @@ pub async fn proxy_openai(
     let openai_req: openai::OpenAIRequest = serde_json::from_value(data)?;
 
     // Override model based on config (reasoning vs completion model)
-    let openai_req = crate::transform::apply_openai_model_override(
+    let openai_req = apply_openai_model_override(
         openai_req,
         config.resolve_reasoning_model(),
         config.resolve_completion_model(),
@@ -280,7 +305,11 @@ async fn handle_streaming_anthropic(
         }
     });
 
-    Ok(build_sse_response(sse_openai_to_anthropic_stream(stream)))
+    let upstream = stream.map(|result| result.map_err(Error::Http));
+    let converter = AnthropicStreamConverter::new();
+    let universal = UniversalConverter::new(converter);
+
+    Ok(build_sse_response(universal.convert(upstream)))
 }
 
 // ===== OpenAI-specific handlers =====
@@ -307,7 +336,11 @@ async fn handle_streaming_openai(
         }
     });
 
-    Ok(build_sse_response(sse_passthrough_stream(stream)))
+    let upstream = stream.map(|result| result.map_err(Error::Http));
+    let converter = PassthroughConverter::default();
+    let universal = UniversalConverter::new(converter);
+
+    Ok(build_sse_response(universal.convert(upstream)))
 }
 
 // ===== Responses API handler =====
@@ -349,7 +382,7 @@ pub async fn proxy_responses(
     let openai_req = responses_to_openai(responses_req)?;
 
     // Apply model overrides
-    let openai_req = crate::transform::apply_openai_model_override(
+    let openai_req = apply_openai_model_override(
         openai_req,
         config.resolve_reasoning_model(),
         config.resolve_completion_model(),
