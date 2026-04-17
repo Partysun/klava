@@ -4,7 +4,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example qwen_auth_flow --features qwen-free
+//! cargo run --example qwen_auth_flow --features qwen-code
 //! ```
 
 use klava::qwen_auth::QwenAuth;
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
     println!("Next steps:");
-    println!("  • Use klava proxy server: `cargo run --bin klava --features qwen-free`");
+    println!("  • Use klava proxy server: `cargo run --bin klava --features qwen-code`");
     println!("  • Make API requests to Qwen Code models");
     println!("  • Token will auto-refresh when needed");
     println!();

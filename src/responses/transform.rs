@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::models::responses::ResponsesRequest;
 use crate::models::{openai, responses};
-use crate::transform::clean_schema;
+use crate::utils::clean_schema;
 use serde_json::{Value, json};
 
 /// Transform Responses request to OpenAI format

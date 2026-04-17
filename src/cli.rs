@@ -167,9 +167,9 @@ pub enum Command {
     /// Switch between providers or manage provider-specific authentication.
     #[command(after_help = "Examples:\n  \
                      klava providers\n  \
-                     klava providers set qwen-free\n  \
-                     klava providers qwen-free login\n  \
-                     klava providers qwen-free status")]
+                     klava providers set qwen-code\n  \
+                     klava providers qwen-code login\n  \
+                     klava providers qwen-code status")]
     Providers {
         /// Raw provider arguments for custom parsing
         #[arg(

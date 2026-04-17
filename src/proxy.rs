@@ -2,11 +2,12 @@ use crate::anthropic::AnthropicStreamConverter;
 use crate::anthropic::transform::{anthropic_to_openai, openai_to_anthropic};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::hooks::{HookChain, HookStage};
+use crate::hooks::{HookChain, HookStage, StreamLogger};
 use crate::models::{anthropic, openai};
+use crate::openai_stream::openai_passthrough;
 use crate::responses::ResponsesStreamConverter;
 use crate::responses::responses_to_openai;
-use crate::stream_converter::{PassthroughConverter, UniversalConverter};
+use crate::stream_converter::UniversalConverter;
 use axum::{
     Extension, Json,
     body::Body,
@@ -148,12 +149,12 @@ pub async fn proxy_openai(
         config.resolve_completion_model(),
     );
 
-    if config.verbose {
-        tracing::trace!(
-            "Request payload: {}",
-            serde_json::to_string_pretty(&openai_req).unwrap_or_default()
-        );
-    }
+    // if config.verbose {
+    //     tracing::trace!(
+    //         "Request payload: {}",
+    //         serde_json::to_string_pretty(&openai_req).unwrap_or_default()
+    //     );
+    // }
 
     let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
 
@@ -330,17 +331,31 @@ async fn handle_streaming_openai(
     response: reqwest::Response,
     _config: &Config,
 ) -> Result<Response> {
-    let stream = response.bytes_stream().inspect(|chunk| {
-        if let Ok(bytes) = chunk {
-            tracing::trace!("[UPSTREAM] {}", String::from_utf8_lossy(bytes).trim());
-        }
-    });
+    let stream = response.bytes_stream();
+
+    // Create stream logger
+    let logger = StreamLogger::new()
+        .map_err(|e| Error::Internal(format!("Failed to create stream logger: {}", e)))?;
+    tracing::info!("Logging upstream chunks to: {:?}", logger.filepath());
 
     let upstream = stream.map(|result| result.map_err(Error::Http));
-    let converter = PassthroughConverter::default();
-    let universal = UniversalConverter::new(converter);
 
-    Ok(build_sse_response(universal.convert(upstream)))
+    // Wrap the stream to log each SSE line as it's processed
+    let logged_stream = upstream.map(move |result| {
+        result.and_then(|bytes| {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                if let Err(e) = logger.log_sse_line(line) {
+                    tracing::warn!("Failed to log SSE line: {}", e);
+                }
+            }
+            Ok(bytes)
+        })
+    });
+
+    let stream = openai_passthrough(Box::pin(logged_stream));
+
+    Ok(build_sse_response(stream))
 }
 
 // ===== Responses API handler =====

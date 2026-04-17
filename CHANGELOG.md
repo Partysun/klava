@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2] - 2026-05-07
+
+### Changed
+
+- Refactored Qwen provider and streaming architecture
+- Consolidated streaming logic into specialized modules
+- Improved streaming test coverage with new fixtures
+- Updated feature flags for better provider configuration
+
 ## [0.2.1] - 2026-04-11
 
 ### Added

@@ -13,7 +13,7 @@ pub enum Type {
     #[serde(rename = "openai-compatible")]
     #[serde(alias = "openai")]
     OpenAICompatible,
-    #[cfg(feature = "qwen-free")]
+    #[cfg(feature = "qwen-code")]
     #[serde(rename = "qwen-code")]
     QwenCode,
 }
@@ -28,8 +28,8 @@ impl Type {
     pub fn from_str(name: &str) -> Option<Self> {
         match name {
             "openai-compatible" | "openai" | "default" => Some(Self::OpenAICompatible),
-            #[cfg(feature = "qwen-free")]
-            "qwen-code" | "qwen" | "qwen-free" => Some(Self::QwenCode),
+            #[cfg(feature = "qwen-code")]
+            "qwen-code" | "qwen" => Some(Self::QwenCode),
             _ => None,
         }
     }
@@ -37,7 +37,7 @@ impl Type {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenAICompatible => "openai-compatible",
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             Self::QwenCode => "qwen-code",
         }
     }

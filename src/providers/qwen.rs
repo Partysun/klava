@@ -14,7 +14,7 @@ pub const SUPPORTED_MODELS: &[&str] = &[
 pub async fn setup(_config: &mut Config) -> Result<()> {
     let qwen_auth = QwenAuth::new();
 
-    println!("qwen-free provider uses OAuth authentication.");
+    println!("qwen-code provider uses OAuth authentication.");
     println!("No API key, base URL, or models needed.");
     println!();
     println!("Supported models: {}", SUPPORTED_MODELS.join(", "));

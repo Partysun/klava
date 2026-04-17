@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::hooks::pii_guardrail_hook;
 use crate::models::openai;
-use crate::transform;
 use serde_json::Value;
 use tokenx_rs::estimate_token_count;
 
@@ -71,7 +70,7 @@ impl Default for HookChain {
 /// Saves JSON to temp directory for analysis
 pub fn logging_hook(data: Value, _config: &Config) -> Result<Value> {
     let json = serde_json::to_string_pretty(&data).unwrap_or_default();
-    tracing::trace!("Hook data: {}", json);
+    //FIXME: tracing::trace!("Hook data: {}", json);
     Ok(data)
 }
 
@@ -95,7 +94,7 @@ pub fn calculate_tokens_hook(data: Value, _config: &Config) -> Result<Value> {
 /// Hook: Transform OpenAI response to Anthropic format
 pub fn openai_to_anthropic_hook(data: Value, _config: &Config) -> Result<Value> {
     let openai_resp: openai::OpenAIResponse = serde_json::from_value(data.clone())?;
-    let anthropic_resp = transform::openai_to_anthropic(openai_resp)?;
+    let anthropic_resp = crate::anthropic::openai_to_anthropic(openai_resp)?;
     let result: Value = serde_json::to_value(anthropic_resp)?;
     tracing::trace!(
         "Transformed Anthropic response: {}",
@@ -121,6 +120,11 @@ pub fn default_chain() -> HookChain {
             "provider_model",
             provider_model_logging_hook,
         )
+        // .with_hook(
+        //     HookStage::BeforeUpstream,
+        //     "upstream_stream",
+        //     crate::hooks::log_upstream_stream_hook,
+        // )
         .with_hook(
             HookStage::UpstreamResponse,
             "openai_to_anthropic",

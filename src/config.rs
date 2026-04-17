@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::providers::{Config as ProviderConfig, Type as ProviderType};
+use crate::providers::Config as ProviderConfig;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -19,16 +19,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             port: 48017,
-            active_provider: "qwen".to_string(),
-            providers: vec![ProviderConfig {
-                name: "qwen".to_string(),
-                provider_type: ProviderType::QwenCode,
-                base_url: None,
-                api_key: None,
-                api_key_name: None,
-                reasoning_model: None,
-                completion_model: None,
-            }],
+            active_provider: "".to_string(),
+            providers: vec![],
             verbose: false,
         }
     }
@@ -94,19 +86,22 @@ impl Config {
         let path = Self::get_path();
         let template = r#"# Klava Configuration File
 # Multi-provider configuration
-# Copy uncommented lines to set your preferences
+# Uncomment and configure the provider you want to use
 
-# Currently active provider
-active_provider = "qwen"
+# Currently active provider (uncomment and set your provider name)
+# active_provider = "openai-compatible"
 
-// # List of provider configurations
-// [[providers]]
-// name = "default"
-// type = "openai-compatible"
+# OpenAI-compatible provider (e.g., OpenRouter, OpenAI, DeepSeek)
+# [[providers]]
+# name = "openai-compatible"
+# type = "openai-compatible"
+# base_url = "https://openrouter.ai/api"
+# api_key = "your-api-key-here"
 
-[[providers]]
-name = "qwen"
-type = "qwen-code"
+# Qwen Code provider (Mimic as qwen-code, you need to have qwen-code paid plan)
+# [[providers]]
+# name = "qwen"
+# type = "qwen-code"
 
 # Port to listen on (default: 48017)
 # Can also be set via PORT env var
@@ -195,12 +190,14 @@ type = "qwen-code"
 
     /// Validate configuration is complete for running
     pub fn validate_complete(&self) -> Result<()> {
+        // If active provider is empty, tell user to run setup
+        if self.active_provider.is_empty() {
+            return Err(Error::ActiveProviderNotSetup);
+        }
+
         // Find the active provider config
         let active_provider_config = self.get_active_provider_config().ok_or_else(|| {
-            Error::Internal(format!(
-                "Active provider '{}' not found",
-                self.active_provider
-            ))
+            Error::MissingBaseUrl // Treat missing provider config as needing setup
         })?;
 
         tracing::debug!("{:?}", self);
@@ -261,14 +258,13 @@ type = "qwen-code"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Type as ProviderType;
 
     #[test]
-    fn test_config_default_creates_default_provider() {
+    fn test_config_default_creates_empty_providers() {
         let config = Config::default();
-        assert_eq!(config.active_provider, "qwen");
-        assert_eq!(config.providers.len(), 1);
-        assert_eq!(config.providers[0].name, "qwen");
-        assert_eq!(config.providers[0].provider_type, ProviderType::QwenCode);
+        assert_eq!(config.active_provider, "");
+        assert_eq!(config.providers.len(), 0);
     }
 
     #[test]

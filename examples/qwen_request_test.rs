@@ -4,7 +4,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo run --example qwen_request_test --features qwen-free
+//! cargo run --example qwen_request_test --features qwen-code
 //! ```
 
 use futures::StreamExt;
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !qwen_auth.is_authenticated() {
         println!("❌ Not authenticated. Please run the auth flow first:");
-        println!("   cargo run --example qwen_auth_flow --features qwen-free\n");
+        println!("   cargo run --example qwen_auth_flow --features qwen-code\n");
         return Ok(());
     }
 
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 println!("❌ Failed to refresh token: {}\n", e);
                 println!(
-                    "   Please run: cargo run --example qwen_auth_flow --features qwen-free\n"
+                    "   Please run: cargo run --example qwen_auth_flow --features qwen-code\n"
                 );
                 return Ok(());
             }

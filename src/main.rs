@@ -420,37 +420,37 @@ async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
 
     match subcommand.as_deref() {
         Some("login") => {
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             {
                 let force =
                     flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
                 handle_qwen_login(force).await?;
             }
-            #[cfg(not(feature = "qwen-free"))]
+            #[cfg(not(feature = "qwen-code"))]
             {
-                anyhow::bail!("qwen-free feature is not enabled");
+                anyhow::bail!("qwen-code feature is not enabled");
             }
         }
         Some("logout") => {
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             {
                 let force =
                     flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
                 handle_qwen_logout(force).await?;
             }
-            #[cfg(not(feature = "qwen-free"))]
+            #[cfg(not(feature = "qwen-code"))]
             {
-                anyhow::bail!("qwen-free feature is not enabled");
+                anyhow::bail!("qwen-code feature is not enabled");
             }
         }
         Some("status") => {
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             {
                 handle_qwen_status().await?;
             }
-            #[cfg(not(feature = "qwen-free"))]
+            #[cfg(not(feature = "qwen-code"))]
             {
-                anyhow::bail!("qwen-free feature is not enabled");
+                anyhow::bail!("qwen-code feature is not enabled");
             }
         }
         Some("set") | None => {
@@ -552,7 +552,7 @@ async fn handle_qwen_provider_switch(provider_name: &str) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    #[cfg(feature = "qwen-free")]
+    #[cfg(feature = "qwen-code")]
     {
         use klava::providers::setup_qwen;
 
@@ -567,7 +567,7 @@ async fn handle_qwen_provider_switch(provider_name: &str) -> anyhow::Result<()> 
 }
 
 /// Handle qwen provider switch (no-op when feature not enabled)
-#[cfg(not(feature = "qwen-free"))]
+#[cfg(not(feature = "qwen-code"))]
 async fn handle_qwen_provider_switch(_provider_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
@@ -626,7 +626,7 @@ fn parse_provider_args(
     Ok((provider_name, subcommand, flags))
 }
 
-#[cfg(feature = "qwen-free")]
+#[cfg(feature = "qwen-code")]
 async fn handle_qwen_login(force: bool) -> anyhow::Result<()> {
     use klava::qwen_auth::QwenAuth;
 
@@ -653,7 +653,7 @@ async fn handle_qwen_login(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "qwen-free")]
+#[cfg(feature = "qwen-code")]
 async fn handle_qwen_logout(force: bool) -> anyhow::Result<()> {
     use klava::qwen_auth::QwenAuth;
 
@@ -675,7 +675,7 @@ async fn handle_qwen_logout(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "qwen-free")]
+#[cfg(feature = "qwen-code")]
 async fn handle_qwen_status() -> anyhow::Result<()> {
     use klava::qwen_auth::QwenAuth;
 

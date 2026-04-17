@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use anyhow::anyhow;
-use inquire::Text;
+use inquire::{Select, Text};
 use klava::config::Config;
 use klava::error::Error;
 use klava::providers::setup_qwen;
@@ -20,6 +20,11 @@ impl InteractiveSetup {
     }
 
     pub async fn run(&mut self) -> Result<Config> {
+        // If no active provider is configured, ask user to choose one first
+        if self.config.active_provider.is_empty() {
+            self.select_provider()?;
+        }
+
         let provider_name = self.config.active_provider.as_str();
 
         // Find the active provider config
@@ -51,9 +56,52 @@ impl InteractiveSetup {
         Ok(self.config.clone())
     }
 
-    /// Setup for qwen-free provider - just tell user to login
+    /// Setup for qwen-code provider - just tell user to login
     async fn setup_qwen_free(&mut self) -> Result<()> {
         setup_qwen(&mut self.config).await?;
+
+        Ok(())
+    }
+
+    /// Prompt user to select a provider when none is configured
+    fn select_provider(&mut self) -> Result<()> {
+        println!("\nNo provider configured.");
+        println!();
+
+        let options: Vec<String> =
+            vec!["OpenAI-compatible (OpenRouter, OpenAI, DeepSeek, etc.)".to_string()];
+
+        let selected = Select::new("Select a provider to configure:", options)
+            .prompt()
+            .map_err(|e| anyhow!("Failed to select provider: {}", e))?;
+
+        let (provider_name, provider_type) = if selected.contains("OpenAI") {
+            (
+                "openai-compatible".to_string(),
+                klava::providers::Type::OpenAICompatible,
+            )
+        } else {
+            ("qwen".to_string(), klava::providers::Type::QwenCode)
+        };
+
+        // Set as active provider and add to providers list
+        self.config.active_provider = provider_name.clone();
+
+        use klava::providers::Config as ProviderConfig;
+        let provider_config = ProviderConfig {
+            name: provider_name.clone(),
+            provider_type,
+            base_url: None,
+            api_key: None,
+            api_key_name: None,
+            reasoning_model: None,
+            completion_model: None,
+        };
+
+        self.config.providers.push(provider_config);
+        self.config.save()?;
+
+        println!();
 
         Ok(())
     }
@@ -223,7 +271,7 @@ pub async fn build_config_interactive() -> Result<Config> {
     // Validate the loaded config directly
     if let Err(e) = persistent.validate_complete() {
         match e {
-            Error::MissingBaseUrl | Error::MissingApiKey(_) => {
+            Error::ActiveProviderNotSetup | Error::MissingBaseUrl | Error::MissingApiKey(_) => {
                 let mut setup = InteractiveSetup::new(persistent);
                 return setup.run().await;
             }

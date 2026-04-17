@@ -152,9 +152,16 @@ pub struct ChoiceMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default = "default_tokens")]
     pub prompt_tokens: u32,
+    #[serde(default = "default_tokens")]
     pub completion_tokens: u32,
+    #[serde(default = "default_tokens")]
     pub total_tokens: u32,
+}
+
+fn default_tokens() -> u32 {
+    0
 }
 
 /// Streaming chunk structure

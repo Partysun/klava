@@ -23,6 +23,9 @@ pub enum Error {
     #[error("API key is required for provider '{0}'")]
     MissingApiKey(String),
 
+    #[error("no active provider configured - run 'klava config --setup'")]
+    ActiveProviderNotSetup,
+
     /// Provider authentication errors
     #[error("provider authentication error: {0}")]
     Provider(String),
@@ -67,6 +70,10 @@ impl IntoResponse for Error {
             Error::MissingApiKey(provider) => (
                 StatusCode::BAD_REQUEST,
                 format!("API key is required for provider '{}'", provider),
+            ),
+            Error::ActiveProviderNotSetup => (
+                StatusCode::BAD_REQUEST,
+                "No active provider configured - run 'klava config --setup'".to_string(),
             ),
             Error::Provider(msg) => (
                 StatusCode::UNAUTHORIZED,

@@ -1,6 +1,6 @@
 [package]
 name = "klava"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
@@ -73,27 +73,27 @@ inquire = { version = "0.9.4", default-features = false, features = ["console", 
 pii = "0.1.0"
 tokenx-rs = "0.1.0"
 
-# Optional dependencies for qwen-free feature
+# Optional dependencies for qwen-code feature
 sha2 = { version = "0.11", optional = true }
 base64 = { version = "0.22", optional = true }
 rand = { version = "0.10", optional = true }
 
 # Optional feature flags
 [features]
-default = ["qwen-free", "opencode", "codex"]
+default = ["qwen-code", "opencode", "codex"]
 opencode = []
 codex = []
 telemetry = []
-qwen-free = ["dep:sha2", "dep:base64", "dep:rand"]
+qwen-code = ["dep:sha2", "dep:base64", "dep:rand"]
 
-# Examples using qwen-free feature
+# Examples using qwen-code feature
 [[example]]
 name = "qwen_auth_flow"
-required-features = ["qwen-free"]
+required-features = ["qwen-code"]
 
 [[example]]
 name = "qwen_request_test"
-required-features = ["qwen-free"]
+required-features = ["qwen-code"]
 
 [profile.release]
 opt-level = "z"        # Optimize for size

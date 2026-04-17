@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use colored::*;
 use inquire::Confirm;
+use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::io::Write;
@@ -97,6 +98,29 @@ pub fn ask_user_approval(prompt: &str) -> Result<bool> {
     let answer = Confirm::new(prompt).with_default(false).prompt()?;
 
     Ok(answer)
+}
+
+/// Clean JSON schema by removing unsupported formats
+pub fn clean_schema(mut schema: Value) -> Value {
+    if let Some(obj) = schema.as_object_mut() {
+        // Remove "format": "uri"
+        if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
+            obj.remove("format");
+        }
+
+        // Recursively clean nested schemas
+        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
+            for (_, value) in properties.iter_mut() {
+                *value = clean_schema(value.clone());
+            }
+        }
+
+        if let Some(items) = obj.get_mut("items") {
+            *items = clean_schema(items.clone());
+        }
+    }
+
+    schema
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::models::{anthropic, openai};
+use crate::utils::clean_schema;
 use serde_json::{Value, json};
 
 /// Transform Anthropic request to OpenAI format
@@ -199,29 +200,6 @@ fn convert_message(msg: anthropic::Message) -> Result<Vec<openai::Message>> {
     }
 
     Ok(result)
-}
-
-/// Clean JSON schema by removing unsupported formats
-pub fn clean_schema(mut schema: Value) -> Value {
-    if let Some(obj) = schema.as_object_mut() {
-        // Remove "format": "uri"
-        if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
-            obj.remove("format");
-        }
-
-        // Recursively clean nested schemas
-        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
-            }
-        }
-
-        if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema(items.clone());
-        }
-    }
-
-    schema
 }
 
 /// Transform OpenAI response to Anthropic format

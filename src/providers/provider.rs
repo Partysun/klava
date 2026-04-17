@@ -12,7 +12,7 @@ impl ProvidersConfig {
             ProviderType::OpenAICompatible => {
                 "OpenAI-compatible APIs (OpenRouter, OpenAI, local LLMs)"
             }
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => "Qwen Code (Free*) with OAuth authentication",
         }
     }
@@ -30,7 +30,7 @@ impl ProvidersConfig {
     /// Base URL
     pub fn base_url(&self) -> Option<String> {
         match self.provider_type {
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
             _ => None,
         }
@@ -39,7 +39,7 @@ impl ProvidersConfig {
     /// Reasoning model
     pub fn reasoning_model(&self) -> Option<String> {
         match self.provider_type {
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("qwen3-coder-plus".to_string()),
             _ => self.reasoning_model.clone(),
         }
@@ -48,7 +48,7 @@ impl ProvidersConfig {
     /// Completion model
     pub fn completion_model(&self) -> Option<String> {
         match self.provider_type {
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("qwen3-coder-plus".to_string()),
             _ => self.completion_model.clone(),
         }
@@ -69,7 +69,7 @@ impl ProvidersConfig {
                 );
                 Ok(Some(headers))
             }
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => {
                 let mut qwen_auth = crate::qwen_auth::QwenAuth::new();
                 qwen_auth
@@ -104,7 +104,7 @@ impl ProvidersConfig {
                     return Err(Error::MissingApiKey(self.name.to_string()));
                 }
             }
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => {
                 // Qwen uses OAuth, no config validation needed
             }
@@ -116,7 +116,7 @@ impl ProvidersConfig {
     pub fn resolve_base_url(&self) -> Option<String> {
         match self.provider_type {
             ProviderType::OpenAICompatible => self.base_url.clone(),
-            #[cfg(feature = "qwen-free")]
+            #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
         }
     }

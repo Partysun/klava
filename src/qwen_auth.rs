@@ -1,7 +1,7 @@
 //! Qwen Code OAuth authentication module
 //!
 //! Handles OAuth 2.0 Device Authorization Grant flow for Qwen Code service.
-//! This module is only available when the `qwen-free` feature is enabled.
+//! This module is only available when the `qwen-code` feature is enabled.
 
 use base64::prelude::*;
 use chrono::{DateTime, Duration, Utc};
