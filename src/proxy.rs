@@ -2,7 +2,7 @@ use crate::anthropic::AnthropicStreamConverter;
 use crate::anthropic::transform::{anthropic_to_openai, openai_to_anthropic};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::hooks::{HookChain, HookStage, StreamLogger};
+use crate::hooks::{HookChain, HookStage};
 use crate::models::{anthropic, openai};
 use crate::openai_stream::openai_passthrough;
 use crate::responses::ResponsesStreamConverter;
@@ -332,28 +332,8 @@ async fn handle_streaming_openai(
     _config: &Config,
 ) -> Result<Response> {
     let stream = response.bytes_stream();
-
-    // Create stream logger
-    let logger = StreamLogger::new()
-        .map_err(|e| Error::Internal(format!("Failed to create stream logger: {}", e)))?;
-    tracing::info!("Logging upstream chunks to: {:?}", logger.filepath());
-
     let upstream = stream.map(|result| result.map_err(Error::Http));
-
-    // Wrap the stream to log each SSE line as it's processed
-    let logged_stream = upstream.map(move |result| {
-        result.and_then(|bytes| {
-            let text = String::from_utf8_lossy(&bytes);
-            for line in text.lines() {
-                if let Err(e) = logger.log_sse_line(line) {
-                    tracing::warn!("Failed to log SSE line: {}", e);
-                }
-            }
-            Ok(bytes)
-        })
-    });
-
-    let stream = openai_passthrough(Box::pin(logged_stream));
+    let stream = openai_passthrough(Box::pin(upstream));
 
     Ok(build_sse_response(stream))
 }

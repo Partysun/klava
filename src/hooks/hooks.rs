@@ -70,7 +70,7 @@ impl Default for HookChain {
 /// Saves JSON to temp directory for analysis
 pub fn logging_hook(data: Value, _config: &Config) -> Result<Value> {
     let json = serde_json::to_string_pretty(&data).unwrap_or_default();
-    //FIXME: tracing::trace!("Hook data: {}", json);
+    tracing::trace!("Hook data: {}", json);
     Ok(data)
 }
 

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "klava"
-version = "0.2.2"
+version = "0.2.3"
 authors = [
   { name = "Iurii Zatsepin", email = "support@zatsepin.dev" },
 ]
