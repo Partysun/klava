@@ -39,9 +39,10 @@ impl AgentRunner for ClaudeRunner {
             // Set environment variables for Claude
             command
                 .env("ANTHROPIC_BASE_URL", proxy_url)
-                .env("ANTHROPIC_AUTH_TOKEN", "")
+                .env("ANTHROPIC_AUTH_TOKEN", "klava")
                 .env("ANTHROPIC_API_KEY", "")
                 .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+                .env("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
                 .env("IS_DEMO", "1");
 
             let mut child = command
