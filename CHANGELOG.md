@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.4] - 2026-05-13
+
+### Fixes
+
+- New claude version works
+
 ## [0.2.2] - 2026-05-07
 
 ### Changed

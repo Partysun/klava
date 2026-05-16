@@ -1,6 +1,6 @@
 [package]
 name = "klava"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
@@ -18,13 +18,23 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "signal", "process"] }
+tokio = { version = "1.42", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "process",
+] }
 
 # Web framework
 axum = { version = "0.8.8", features = ["http2"] }
 
 # HTTP client
-reqwest = { version = "0.13.2", features = ["json", "stream", "rustls", "form"], default-features = false }
+reqwest = { version = "0.13.2", features = [
+  "json",
+  "stream",
+  "rustls",
+  "form",
+], default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -69,7 +79,10 @@ confy = "2.0.0"
 which = "8.0.2"
 chrono = { version = "0.4", features = ["serde"] }
 
-inquire = { version = "0.9.4", default-features = false, features = ["console", "macros"] }
+inquire = { version = "0.9.4", default-features = false, features = [
+  "console",
+  "macros",
+] }
 pii = "0.1.0"
 tokenx-rs = "0.1.0"
 
@@ -96,8 +109,8 @@ name = "qwen_request_test"
 required-features = ["qwen-code"]
 
 [profile.release]
-opt-level = "z"        # Optimize for size
-lto = true             # Enable Link Time Optimization
-codegen-units = 1      # Better optimization
-strip = true           # Strip symbols for smaller binary
-panic = "abort"        # Smaller binary
+opt-level = "z"   # Optimize for size
+lto = true        # Enable Link Time Optimization
+codegen-units = 1 # Better optimization
+strip = true      # Strip symbols for smaller binary
+panic = "abort"   # Smaller binary
