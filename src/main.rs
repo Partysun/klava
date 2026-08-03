@@ -241,6 +241,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Config { setup } => handle_config_command(setup).await,
         Command::Providers { args } => handle_providers_command(args).await,
+        Command::Check { provider, model } => {
+            if let Some(provider_name) = provider {
+                // Check specific provider
+                let target_config = config
+                    .clone();
+                klava::diagnostic::run_tests(&target_config, Some(&provider_name), model.as_deref()).await;
+            } else {
+                // Check active provider
+                klava::diagnostic::run_tests(&config, None, model.as_deref()).await;
+            }
+            Ok(())
+        }
     }
 }
 

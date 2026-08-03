@@ -179,4 +179,21 @@ pub enum Command {
         )]
         args: Vec<String>,
     },
+
+    /// Check configuration and provider connectivity
+    ///
+    /// Sends a small, cheap test request to your configured LLM API
+    /// to verify everything is working.
+    #[command(after_help = "Examples:\n  \
+                     klava check\n  \
+                     klava check --provider openrouter")]
+    Check {
+        /// Provider to check (defaults to active provider)
+        #[arg(long, value_name = "PROVIDER", help = "Provider to check")]
+        provider: Option<String>,
+
+        /// Model to use for the check
+        #[arg(short, long, value_name = "MODEL", help = "Model to check with")]
+        model: Option<String>,
+    },
 }

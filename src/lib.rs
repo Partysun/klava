@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod anthropic;
 pub mod config;
+pub mod diagnostic;
 pub mod error;
 pub mod hooks;
 pub mod models;

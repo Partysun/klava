@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.8] - 2026-08-03
+
+### Added
+
+- New `check` CLI command (`klava check`) to test provider connectivity and API responses
+
 ## [0.2.7] - 2026-08-03
 
 ### Fixed
