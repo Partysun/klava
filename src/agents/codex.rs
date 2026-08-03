@@ -6,6 +6,9 @@ use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 use which::which;
 
+/// Klava profile name for Codex
+const KLAVA_PROFILE_NAME: &str = "klava";
+
 /// Codex Configuration Example
 ///
 /// Below is an example of the config.toml structure that Codex uses.
@@ -51,22 +54,25 @@ impl CodexRunner {
         Self
     }
 
+    fn profile_config_path(&self) -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|home| home.join(".codex").join(format!("{}.config.toml", KLAVA_PROFILE_NAME)))
+    }
+
+    fn root_config_path(&self) -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|home| home.join(".codex").join("config.toml"))
+    }
+
     /// Get list of currently configured models
     pub fn model(&self) -> Vec<String> {
         let mut models = Vec::new();
 
-        for config_path in self.paths() {
-            // Only read from config.toml, skip other files
-            if config_path.file_name().and_then(|n| n.to_str()) != Some("config.toml") {
-                continue;
-            }
-
-            let Ok(config_content) = std::fs::read_to_string(&config_path) else {
-                continue;
+        if let Some(profile_path) = self.profile_config_path() {
+            let Ok(config_content) = std::fs::read_to_string(&profile_path) else {
+                return models;
             };
 
             let Ok(config) = toml::from_str::<CodexConfig>(&config_content) else {
-                continue;
+                return models;
             };
 
             models.push(config.model.clone());
@@ -90,9 +96,13 @@ impl AgentRunner for CodexRunner {
     fn paths(&self) -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
 
-        if let Some(home) = dirs::home_dir() {
-            let config_path = home.join(".codex").join("config.toml");
-            // Always include config path for setup
+        // Profile config (new format)
+        if let Some(profile_path) = self.profile_config_path() {
+            paths.push(profile_path);
+        }
+
+        // Root config
+        if let Some(config_path) = self.root_config_path() {
             paths.push(config_path);
         }
 
@@ -108,10 +118,16 @@ impl AgentRunner for CodexRunner {
         Ok(())
     }
 
-    async fn run(&self, args: &[String], _proxy_url: &str) -> Result<(), anyhow::Error> {
+    async fn run(&self, args: &[String], proxy_url: &str) -> Result<(), anyhow::Error> {
+        // Ensure the profile config exists before running
+        self.ensure_profile_config(proxy_url).await?;
+
+        // Clean up legacy profile config from main config.toml
+        self.cleanup_legacy_config().await?;
+
         let mut cmd = TokioCommand::new(self.name());
-        // Codex without profile will runned with defaul openai cloud profile
-        cmd.arg("--profile").arg("klava");
+        // Use --profile to select the klava profile
+        cmd.arg("--profile").arg(KLAVA_PROFILE_NAME);
 
         cmd.args(args)
             .stdin(Stdio::inherit())
@@ -133,18 +149,78 @@ impl AgentRunner for CodexRunner {
     }
 
     async fn setup(&self, proxy_url: &str) -> Result<(), anyhow::Error> {
-        let config_path = self
-            .paths()
-            .into_iter()
-            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("config.toml"))
+        self.ensure_profile_config(proxy_url).await
+    }
+}
+
+impl CodexRunner {
+    /// Clean up legacy profile configuration from main config.toml
+    async fn cleanup_legacy_config(&self) -> Result<(), anyhow::Error> {
+        let root_config_path = self.root_config_path()
             .ok_or_else(|| anyhow::anyhow!("Could not find config.toml config path"))?;
 
-        // Ensure directory exists
-        tokio::fs::create_dir_all(config_path.parent().unwrap()).await?;
+        if !root_config_path.exists() {
+            return Ok(());
+        }
 
-        // Read existing config or create new
-        let old_config_str = if config_path.exists() {
-            tokio::fs::read_to_string(&config_path)
+        let content = match tokio::fs::read_to_string(&root_config_path).await {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+
+        let mut updated = content.clone();
+        let mut changed = false;
+
+        // Remove legacy `profile = "klava"` line
+        if let Some(line_start) = find_line_start(&content, &format!("profile = \"{}\"", KLAVA_PROFILE_NAME)) {
+            if let Some(line_end) = content[line_start..].find('\n') {
+                let line_end = line_start + line_end + 1;
+                updated = format!("{}{}", &updated[..line_start], &updated[line_end..]);
+                changed = true;
+            }
+        }
+
+        // Remove legacy `[profiles.klava]` section
+        let profile_header = format!("[profiles.{}]", KLAVA_PROFILE_NAME);
+        if let Some(section_start) = updated.find(&profile_header) {
+            if let Some(next_section_start) = find_next_section(&updated, section_start + profile_header.len()) {
+                updated = format!("{}{}", &updated[..section_start], &updated[next_section_start..]);
+            } else {
+                updated = updated[..section_start].to_string();
+            }
+            changed = true;
+        }
+
+        if changed && updated.trim() != content.trim() {
+            updated = updated.trim().to_string();
+            if !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+
+            // Validate the updated config is valid TOML
+            if toml::from_str::<toml::Value>(&updated).is_ok() {
+                write_with_backup(&root_config_path, updated.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("Failed to update config.toml: {}", e))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Ensure profile config exists and is up to date
+    async fn ensure_profile_config(&self, proxy_url: &str) -> Result<(), anyhow::Error> {
+        let profile_path = self.profile_config_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not find profile config path"))?;
+        let base_url = format!("{}/v1", proxy_url);
+
+        // Ensure directory exists
+        if let Some(parent) = profile_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Read existing profile config or create new
+        let old_config_str = if profile_path.exists() {
+            tokio::fs::read_to_string(&profile_path)
                 .await
                 .unwrap_or_default()
         } else {
@@ -158,21 +234,23 @@ impl AgentRunner for CodexRunner {
         };
         let old_config = config.clone();
 
-        let base_url = format!("{}/v1", proxy_url);
-
         self.configure_provider(&mut config, &base_url);
-        self.configure_profile(&mut config);
+        // Don't add profiles to the profile config itself - that's the legacy format
+        // The profile config explicitly sets the model and provider at root level
+        config.model = default_model_value();
+        config.model_provider_id = default_model_provider();
+        config.analytics = AnalyticsConfig::default();
 
         let new_config = toml::to_string_pretty(&config)?;
 
-        if old_config == config {
+        if old_config == config && !old_config_str.is_empty() {
             return Ok(());
         }
 
         // Show diff and ask for approval
         if !old_config_str.is_empty() {
-            let diff = generate_diff(&old_config_str, &new_config, &config_path);
-            println!("\nProposed changes to config.toml:");
+            let diff = generate_diff(&old_config_str, &new_config, &profile_path);
+            println!("\nProposed changes to {}:", profile_path.display());
             println!("{}", diff);
 
             if !ask_user_approval("Do you want to apply these changes?")? {
@@ -180,7 +258,7 @@ impl AgentRunner for CodexRunner {
                 return Ok(());
             }
         } else {
-            println!("\nNew configuration will be created:");
+            println!("\nNew profile configuration will be created at {}:", profile_path.display());
             println!("{}", new_config);
 
             if !ask_user_approval("Do you want to create this configuration?")? {
@@ -189,23 +267,22 @@ impl AgentRunner for CodexRunner {
             }
         }
 
-        // Write config with backup
-        write_with_backup(&config_path, new_config.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to write config.toml: {}", e))?;
+        // Write profile config with backup
+        write_with_backup(&profile_path, new_config.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Failed to write profile config: {}", e))?;
 
-        println!("✓ Configuration updated successfully");
+        println!("✓ Profile configuration updated successfully");
+        println!("  Profile config: {}", profile_path.display());
 
         Ok(())
     }
-}
 
-impl CodexRunner {
     fn configure_provider(&self, config: &mut CodexConfig, proxy_url: &str) {
         let base_url = proxy_url.to_string();
 
         let provider = config
             .model_providers
-            .entry("klava".to_string())
+            .entry(KLAVA_PROFILE_NAME.to_string())
             .or_insert_with(|| ProviderConfig {
                 name: "Klava Proxy".to_string(),
                 base_url: None,
@@ -225,26 +302,28 @@ impl CodexRunner {
 
         provider.base_url = Some(base_url.clone());
 
-        config.model_provider_id = "klava".to_string();
+        config.model_provider_id = KLAVA_PROFILE_NAME.to_string();
         if config.model.is_empty() || config.model == "klava" {
-            config.model = "klava".to_string();
+            config.model = KLAVA_PROFILE_NAME.to_string();
         }
 
         // Add analytics configuration as requested
         config.analytics.enabled = false;
     }
+}
 
-    fn configure_profile(&self, config: &mut CodexConfig) {
-        let profile = config.profiles.entry("klava".to_string()).or_default();
+/// Find the start index of a line containing the given text
+fn find_line_start(content: &str, text: &str) -> Option<usize> {
+    content.find(text).map(|idx| {
+        let before = &content[..idx];
+        before.rfind('\n').map(|n| n + 1).unwrap_or(0)
+    })
+}
 
-        // Set the profile to use the klava model provider
-        profile.model_provider = Some("klava".to_string());
-
-        // Set a default model for the profile if not already set
-        if profile.model.is_none() {
-            profile.model = Some("klava".to_string());
-        }
-    }
+/// Find the start of the next section (line starting with [) after the given position
+fn find_next_section(content: &str, after: usize) -> Option<usize> {
+    let search_area = &content[after..];
+    search_area.find("\n[").map(|idx| after + idx + 1)
 }
 
 // CodexConfig structures

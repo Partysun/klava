@@ -1,6 +1,13 @@
 # Changelog
 
-## [0.2.6] - 2026-08-03
+## [0.2.7] - 2026-08-03
+
+### Fixed
+
+- Fixed Codex agent configuration to support Codex CLI versions >= 0.134.0
+- Profile config now written to `~/.codex/klava.config.toml` instead of modifying `~/.codex/config.toml`
+- Legacy `[profiles.klava]` table in `config.toml` is automatically cleaned up on run
+- Updated agent launch to use correct `--profile klava` flag with separate profile file
 
 ### Added
 

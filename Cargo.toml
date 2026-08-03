@@ -1,6 +1,6 @@
 [package]
 name = "klava"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
