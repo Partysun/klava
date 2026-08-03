@@ -1,0 +1,1 @@
+{"choices":[{"delta":{"content":"hello"},"finish_reason":null,"index":0,"logprobs":null}],"created":123,"id":"chatcmpl-test","object":"chat.completion.chunk"}

@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::models::{anthropic, openai};
 use crate::utils::clean_schema;
+use crate::utils::{anthropic_to_openai_id, openai_to_anthropic_id, openai_to_tool_id};
 use serde_json::{Value, json};
 
 /// Transform Anthropic request to OpenAI format
@@ -136,7 +137,7 @@ fn convert_message(msg: anthropic::Message) -> Result<Vec<openai::Message>> {
                     }
                     anthropic::ContentBlock::ToolUse { id, name, input } => {
                         tool_calls.push(openai::ToolCall {
-                            id,
+                            id: anthropic_to_openai_id(&id),
                             call_type: "function".to_string(),
                             function: openai::FunctionCall {
                                 name,
@@ -156,7 +157,7 @@ fn convert_message(msg: anthropic::Message) -> Result<Vec<openai::Message>> {
                             role: "tool".to_string(),
                             content: Some(openai::MessageContent::Text(text)),
                             tool_calls: None,
-                            tool_call_id: Some(tool_use_id),
+                            tool_call_id: Some(anthropic_to_openai_id(&tool_use_id)),
                             name: None,
                         });
                     }
@@ -229,26 +230,37 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
 
             content.push(anthropic::ResponseContent::ToolUse {
                 content_type: "tool_use".to_string(),
-                id: tool_call.id.clone(),
+                id: openai_to_tool_id(&tool_call.id),
                 name: tool_call.function.name.clone(),
                 input,
             });
         }
     }
 
-    let stop_reason = choice
-        .finish_reason
-        .as_ref()
-        .map(|r| match r.as_str() {
-            "tool_calls" => "tool_use",
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            _ => "end_turn",
-        })
-        .map(String::from);
+    // Guarantee at least one content block — Anthropic rejects an empty
+    // `content` array on successful responses, and a length-truncated
+    // response from a no-text model can otherwise produce [].
+    if content.is_empty() {
+        content.push(anthropic::ResponseContent::Text {
+            content_type: "text".to_string(),
+            text: String::new(),
+        });
+    }
+
+    // Map OpenAI finish_reason onto Anthropic stop_reason. OpenAI can
+    // legitimately omit finish_reason on a successful response; Anthropic
+    // treats stop_reason as required, so default to `end_turn`.
+    let stop_reason = Some(
+        choice
+            .finish_reason
+            .as_deref()
+            .map(map_finish_reason_to_stop_reason)
+            .unwrap_or("end_turn"),
+    )
+    .map(String::from);
 
     Ok(anthropic::AnthropicResponse {
-        id: resp.id,
+        id: openai_to_anthropic_id(&resp.id),
         response_type: "message".to_string(),
         role: "assistant".to_string(),
         content,
@@ -260,6 +272,17 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
             output_tokens: resp.usage.completion_tokens,
         },
     })
+}
+
+/// Map an OpenAI `finish_reason` string to an Anthropic `stop_reason` string.
+fn map_finish_reason_to_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "tool_calls" => "tool_use",
+        "stop" => "end_turn",
+        "length" => "max_tokens",
+        "content_filter" => "end_turn",
+        _ => "end_turn",
+    }
 }
 
 /// Map OpenAI finish reason to Anthropic stop reason

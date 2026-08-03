@@ -1,5 +1,9 @@
 use crate::models::openai::{DeltaToolCall, StreamChunk};
 use crate::stream_converter::ChatChunkConverter;
+use crate::utils::{
+    new_anthropic_message_id, openai_to_anthropic_id as to_anthropic_id,
+    openai_to_tool_id as to_tool_id,
+};
 use serde_json::{Value, json};
 
 /// Event produced by the stream converter
@@ -81,7 +85,12 @@ impl AnthropicStreamConverter {
         if matches!(self.state, ConverterState::Initial) {
             // Initialize from first chunk
             if self.message_id.is_none() {
-                self.message_id = Some(chunk.id.clone());
+                self.message_id = Some(to_anthropic_id(&chunk.id));
+                // Fall back to a freshly minted id if upstream gave us
+                // something we couldn't sanitize (e.g. an unknown prefix).
+                if !self.message_id.as_ref().unwrap().starts_with("msg_") {
+                    self.message_id = Some(new_anthropic_message_id());
+                }
             }
             if self.model.is_none() {
                 self.model = Some(chunk.model.clone());
@@ -237,7 +246,14 @@ impl AnthropicStreamConverter {
 
         // New tool call starting (has id)
         if tc.id.is_some() {
-            let id = tc.id.clone().unwrap();
+            // The Anthropic Messages API requires tool_use ids to start with
+            // `toolu_`. Upstream OpenAI-format chunks carry `call_...` ids;
+            // rewrite the prefix so Claude Code (newer SDKs) accepts the
+            // emitted `content_block_start`. The same string also flows back
+            // to the next request as `tool_use_id` on `tool_result` blocks,
+            // and `anthropic_to_openai` reverses the prefix back to `call_`.
+            let raw_id = tc.id.clone().unwrap();
+            let id = to_tool_id(&raw_id);
             let name = tc
                 .function
                 .as_ref()

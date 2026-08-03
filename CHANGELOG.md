@@ -1,9 +1,10 @@
 # Changelog
 
-## [0.2.4] - 2026-05-13
+## [0.2.5] - 2026-08-03
 
 ### Fixes
 
+- Fix of claude launcher new version
 - New claude version works
 
 ## [0.2.2] - 2026-05-07
