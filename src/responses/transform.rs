@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::models::responses::ResponsesRequest;
 use crate::models::{openai, responses};
-use crate::utils::clean_schema;
+use crate::utils::{clean_schema, openai_to_call_id};
 use serde_json::{Value, json};
 
 /// Transform Responses request to OpenAI format
@@ -188,6 +188,7 @@ pub fn responses_to_openai(req: ResponsesRequest) -> Result<openai::OpenAIReques
         tools,
         tool_choice: None,
         reasoning_effort: None, // Don't map reasoning effort directly, as many providers don't support it
+        extra: json!({}),
     })
 }
 
@@ -228,35 +229,17 @@ pub fn openai_to_responses(resp: openai::OpenAIResponse) -> Result<responses::Re
         for tool_call in tool_calls {
             let args: Value =
                 serde_json::from_str(&tool_call.function.arguments).unwrap_or_else(|_| json!({}));
+            // Upstream vLLM/CloudRu/Qwen emit `chatcmpl-tool-…` ids; the
+            // Responses API expects `call_…`.
+            let call_id = openai_to_call_id(&tool_call.id);
 
             output_items.push(responses::ResponsesOutputItem {
-                id: tool_call.id.clone(),
+                id: call_id.clone(),
                 item_type: "function_call".to_string(),
                 status: Some("completed".to_string()),
                 role: Some(choice.message.role.clone()),
                 content: None,
-                call_id: Some(tool_call.id.clone()),
-                name: Some(tool_call.function.name.clone()),
-                arguments: Some(serde_json::to_string(&args).unwrap_or_default()),
-                summary: None,
-                encrypted_content: None,
-            });
-        }
-    }
-
-    // Add tool calls if present
-    if let Some(tool_calls) = &choice.message.tool_calls {
-        for tool_call in tool_calls {
-            let args: Value =
-                serde_json::from_str(&tool_call.function.arguments).unwrap_or_else(|_| json!({}));
-
-            output_items.push(responses::ResponsesOutputItem {
-                id: tool_call.id.clone(),
-                item_type: "function_call".to_string(),
-                status: Some("completed".to_string()),
-                role: Some(choice.message.role.clone()),
-                content: None,
-                call_id: Some(tool_call.id.clone()),
+                call_id: Some(call_id),
                 name: Some(tool_call.function.name.clone()),
                 arguments: Some(serde_json::to_string(&args).unwrap_or_default()),
                 summary: None,
@@ -662,5 +645,62 @@ mod tests {
         } else {
             panic!("Expected content to be present");
         }
+    }
+
+    /// Regression: non-streaming /v1/responses conversion must emit BOTH the
+    /// message item and the function_call item, and normalize a
+    /// vLLM/CloudRu-style `chatcmpl-tool-…` id to the Responses `call_…` form.
+    #[test]
+    fn openai_to_responses_normalizes_tool_ids_and_keeps_text() {
+        let resp = openai::OpenAIResponse {
+            id: "chatcmpl-abc".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4".to_string(),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Let me check".to_string()),
+                    tool_calls: Some(vec![openai::ToolCall {
+                        id: "chatcmpl-tool-b8ce01f013736044".to_string(),
+                        call_type: "function".to_string(),
+                        function: openai::FunctionCall {
+                            name: "bash".to_string(),
+                            arguments: r#"{"command":"ls"}"#.to_string(),
+                        },
+                    }]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            },
+            system_fingerprint: None,
+        };
+
+        let responses_resp = openai_to_responses(resp).unwrap();
+
+        let types: Vec<&str> = responses_resp
+            .output
+            .iter()
+            .map(|o| o.item_type.as_str())
+            .collect();
+        assert!(types.contains(&"message"), "missing message item: {types:?}");
+        assert!(
+            types.contains(&"function_call"),
+            "missing function_call item: {types:?}"
+        );
+
+        let fc = responses_resp
+            .output
+            .iter()
+            .find(|o| o.item_type == "function_call")
+            .unwrap();
+        assert_eq!(fc.call_id.as_deref(), Some("call_b8ce01f013736044"));
+        assert_eq!(fc.name.as_deref(), Some("bash"));
+        assert_eq!(fc.arguments.as_deref(), Some(r#"{"command":"ls"}"#));
     }
 }

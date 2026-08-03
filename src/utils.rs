@@ -93,6 +93,26 @@ pub fn openai_to_tool_id(id: &str) -> String {
     }
 }
 
+/// Convert an upstream OpenAI-format tool_call id into the canonical OpenAI
+/// `call_…` form used by the Responses API.
+///
+/// The Responses API uses `call_…` ids on `function_call`/`function_call_output`
+/// items; vLLM/CloudRu/Qwen upstreams instead emit `chatcmpl-tool-…`. Rewriting
+/// the prefix keeps Codex on the standard format while the id round-trips back
+/// unchanged (Codex echoes it as `tool_call_id` and OpenAI-compatible providers
+/// accept any opaque string).
+///
+/// - `chatcmpl-tool-…`      → `call_…`
+/// - `call_…`               → returned unchanged
+/// - anything else          → passed through verbatim
+pub fn openai_to_call_id(id: &str) -> String {
+    if let Some(rest) = id.strip_prefix("chatcmpl-tool-") {
+        format!("{}{}", OPENAI_TOOL_PREFIX, sanitize_id_suffix(rest))
+    } else {
+        id.to_string()
+    }
+}
+
 /// Strip characters that would break an SSE/JSON identifier or a downstream
 /// HTTP header. Keeps alphanumerics plus `_` and `-`.
 fn sanitize_id_suffix(s: &str) -> String {
@@ -338,6 +358,21 @@ mod tests {
     #[test]
     fn test_openai_to_tool_id_passthrough_for_unknown() {
         assert_eq!(openai_to_tool_id("foo_bar"), "foo_bar");
+    }
+
+    #[test]
+    fn test_openai_to_call_id_chatcmpl_tool_prefix() {
+        assert_eq!(openai_to_call_id("chatcmpl-tool-b8ce01f013736044"), "call_b8ce01f013736044");
+    }
+
+    #[test]
+    fn test_openai_to_call_id_passthrough_for_call() {
+        assert_eq!(openai_to_call_id("call_abc123"), "call_abc123");
+    }
+
+    #[test]
+    fn test_openai_to_call_id_passthrough_for_unknown() {
+        assert_eq!(openai_to_call_id("foo_bar"), "foo_bar");
     }
 
     #[test]

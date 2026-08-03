@@ -1,5 +1,6 @@
 use crate::models::openai::{DeltaToolCall, StreamChunk};
 use crate::stream_converter::ChatChunkConverter;
+use crate::utils::openai_to_call_id;
 use serde_json::{Value, json};
 
 /// Event produced by the stream converter
@@ -363,7 +364,11 @@ impl ResponsesStreamConverter {
         // New tool call starting (has id)
         if tc.id.is_some() {
             let item_id = format!("fc_{}", uuid::Uuid::new_v4().as_simple());
-            let call_id = tc.id.clone().unwrap();
+            // Upstream vLLM/CloudRu/Qwen emit `chatcmpl-tool-…` ids; the
+            // Responses API expects `call_…`, so normalize here. Codex echoes
+            // this id back as function_call_output.call_id and upstream
+            // providers accept any opaque string, so no reverse rewrite needed.
+            let call_id = openai_to_call_id(tc.id.as_deref().unwrap());
             let name = tc
                 .function
                 .as_ref()
@@ -569,18 +574,7 @@ impl ResponsesStreamConverter {
             }));
         }
 
-        if !self.tool_calls.is_empty() {
-            for tc in &self.tool_calls {
-                output.push(json!({
-                    "id": &tc.item_id,
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": &tc.id,
-                    "name": &tc.name,
-                    "arguments": &tc.arguments
-                }));
-            }
-        } else if !self.text_acc.is_empty() {
+        if !self.text_acc.is_empty() {
             output.push(json!({
                 "id": &self.item_id,
                 "type": "message",
@@ -593,6 +587,19 @@ impl ResponsesStreamConverter {
                     "logprobs": []
                 }]
             }));
+        }
+
+        if !self.tool_calls.is_empty() {
+            for tc in &self.tool_calls {
+                output.push(json!({
+                    "id": &tc.item_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": &tc.id,
+                    "name": &tc.name,
+                    "arguments": &tc.arguments
+                }));
+            }
         }
 
         let usage = chunk.usage.as_ref().map(|u| {
@@ -1296,5 +1303,97 @@ mod tests {
             done.unwrap().data["item"]["status"].as_str(),
             Some("completed")
         );
+    }
+
+    /// Regression: a turn with BOTH text and a tool call must include both the
+    /// message item and the function_call item in the final `response.completed`
+    /// output. Previously the `else if` branch dropped the text message whenever
+    /// tool calls were present, so Codex's final response was missing the spoken
+    /// text that had already been streamed.
+    #[test]
+    fn test_response_completed_includes_text_and_tool_call() {
+        let mut conv = ResponsesStreamConverter::new("resp_123", "msg_456", "gpt-4");
+
+        // Text chunk
+        conv.process(&make_chunk(
+            "c",
+            Delta {
+                role: Some("assistant".to_string()),
+                content: Some("Let me check".to_string()),
+                tool_calls: None,
+                reasoning: None,
+            },
+            None,
+            None,
+        ));
+
+        // Tool call chunk with a vLLM/CloudRu-style `chatcmpl-tool-…` id
+        let tool_events = conv.process(&make_chunk(
+            "c",
+            Delta {
+                role: None,
+                content: None,
+                tool_calls: Some(vec![DeltaToolCall {
+                    index: 0,
+                    id: Some("chatcmpl-tool-b8ce01f013736044".to_string()),
+                    call_type: Some("function".to_string()),
+                    function: Some(DeltaFunctionCall {
+                        name: Some("bash".to_string()),
+                        arguments: Some(r#"{"command":"ls"}"#.to_string()),
+                    }),
+                }]),
+                reasoning: None,
+            },
+            None,
+            None,
+        ));
+
+        // The emitted function_call item must carry a normalized `call_…` id
+        let added = tool_events.iter().find(|e| {
+            e.event == "response.output_item.added"
+                && e.data["item"]["type"].as_str() == Some("function_call")
+        });
+        assert!(
+            added.is_some(),
+            "expected function_call output_item.added event"
+        );
+        assert_eq!(
+            added.unwrap().data["item"]["call_id"].as_str(),
+            Some("call_b8ce01f013736044")
+        );
+
+        // Completion chunk — triggers finish phases and response.completed
+        let events = conv.process(&make_chunk(
+            "c",
+            Delta::default(),
+            Some("tool_calls".to_string()),
+            Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            }),
+        ));
+
+        let completed = events
+            .iter()
+            .find(|e| e.event == "response.completed")
+            .expect("expected response.completed event");
+
+        let output = completed.data["response"]["output"].as_array().unwrap();
+        let types: Vec<&str> = output
+            .iter()
+            .map(|o| o["type"].as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            types.contains(&"message"),
+            "response.completed output missing message item: {types:?}"
+        );
+        assert!(
+            types.contains(&"function_call"),
+            "response.completed output missing function_call item: {types:?}"
+        );
+
+        let fc = output.iter().find(|o| o["type"] == "function_call").unwrap();
+        assert_eq!(fc["call_id"].as_str(), Some("call_b8ce01f013736044"));
     }
 }

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "klava"
-version = "0.2.5"
+version = "0.2.6"
 authors = [{ name = "Iurii Zatsepin", email = "support@zatsepin.dev" }]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
 readme = "README.md"

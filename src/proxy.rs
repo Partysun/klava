@@ -6,7 +6,7 @@ use crate::hooks::{HookChain, HookStage};
 use crate::models::{anthropic, openai};
 use crate::openai_stream::openai_passthrough;
 use crate::responses::ResponsesStreamConverter;
-use crate::responses::responses_to_openai;
+use crate::responses::{openai_to_responses, responses_to_openai};
 use crate::stream_converter::UniversalConverter;
 use axum::{
     Extension, Json,
@@ -190,13 +190,13 @@ async fn send_request(
     // Create the request body, potentially modifying it based on the provider
     let mut request_payload = serde_json::to_value(openai_req)?;
 
-    // Special handling for Qwen models that require specific parameters
+    // Special handling for Qwen models that require specific parameters.
+    // Thinking stays enabled (these are reasoning models) — we only set
+    // incremental_output so reasoning/content streams as SSE deltas.
+    // `incremental_output` is meaningless for non-streaming requests, so it is
+    // only applied when streaming.
     if url.contains("dashscope") || url.contains("qwen") || openai_req.model.contains("qwen") {
-        // For Qwen models, add enable_thinking: false for non-streaming requests
         if openai_req.stream.unwrap_or(false) {
-            request_payload["enable_thinking"] = serde_json::Value::Bool(false);
-        } else {
-            // For streaming requests with Qwen, ensure incremental_output is true if thinking is enabled
             request_payload["incremental_output"] = serde_json::Value::Bool(true);
         }
 
@@ -340,6 +340,19 @@ async fn handle_streaming_openai(
 
 // ===== Responses API handler =====
 
+async fn handle_non_streaming_responses(
+    response: reqwest::Response,
+    hook_chain: &HookChain,
+    config: &Config,
+) -> Result<Response> {
+    let openai_resp: openai::OpenAIResponse = response.json().await?;
+    let responses_resp = openai_to_responses(openai_resp)?;
+
+    let data: Value = serde_json::to_value(responses_resp)?;
+    let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
+    Ok(Json(resp).into_response())
+}
+
 /// Handler for Responses API requests (/v1/responses)
 /// - Parses Responses API request format
 /// - Transforms to OpenAI chat completions format
@@ -395,12 +408,9 @@ pub async fn proxy_responses(
     }
 
     let response = if is_streaming {
-        handle_streaming_responses(response, &config).await?
+        handle_streaming_responses(response, openai_req.model).await?
     } else {
-        // Non-streaming: return error — not yet supported
-        return Err(Error::Transform(
-            "Non-streaming Responses API requests are not yet supported".to_string(),
-        ));
+        handle_non_streaming_responses(response, &hook_chain, &config).await?
     };
 
     Ok(response)
@@ -409,16 +419,10 @@ pub async fn proxy_responses(
 /// Handle streaming response by converting OpenAI SSE to Responses API SSE
 async fn handle_streaming_responses(
     response: reqwest::Response,
-    _config: &Config,
+    model: String,
 ) -> Result<Response> {
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().as_simple());
     let item_id = format!("msg_{}", uuid::Uuid::new_v4().as_simple());
-    let model = response
-        .headers()
-        .get("x-model")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
 
     let converter = ResponsesStreamConverter::new(response_id, item_id, model);
     let universal = UniversalConverter::new(converter);

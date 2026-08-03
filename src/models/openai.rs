@@ -55,6 +55,11 @@ pub struct OpenAIRequest {
     pub tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Passthrough for any request field we don't model explicitly
+    /// (e.g. `stream_options`, `parallel_tool_calls`, `metadata`,
+    /// `max_completion_tokens`). Kept out of every serialization if empty.
+    #[serde(default, flatten)]
+    pub extra: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,4 +221,42 @@ pub struct DeltaFunctionCall {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn openai_request_round_trips_unknown_fields() {
+        let req: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream_options": {"include_usage": true},
+            "parallel_tool_calls": false,
+            "metadata": {"session": "abc"},
+            "max_completion_tokens": 500
+        }))
+        .unwrap();
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["stream_options"]["include_usage"], json!(true));
+        assert_eq!(out["parallel_tool_calls"], json!(false));
+        assert_eq!(out["metadata"]["session"], json!("abc"));
+        assert_eq!(out["max_completion_tokens"], json!(500));
+    }
+
+    #[test]
+    fn openai_request_extra_is_empty_object_when_absent() {
+        let req: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert!(!out.as_object().unwrap().contains_key("extra"));
+        assert!(req.extra.is_object() && req.extra.as_object().unwrap().is_empty());
+    }
 }

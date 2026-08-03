@@ -103,6 +103,7 @@ pub fn anthropic_to_openai(
         tools,
         tool_choice: None,
         reasoning_effort: None,
+        extra: json!({}),
     })
 }
 

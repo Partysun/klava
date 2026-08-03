@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.6] - 2026-08-03
+
+### Added
+
+- Passthrough `extra` field on `OpenAIRequest` to forward unknown provider params (`stream_options`, `parallel_tool_calls`, `metadata`, `max_completion_tokens`, etc.)
+- `openai_to_call_id()` utility to normalize vLLM/CloudRu/Qwen `chatcmpl-tool-…` tool-call ids into the standard Responses API `call_…` format
+- Non-streaming handler for `/v1/responses` endpoint (`handle_non_streaming_responses`)
+
+### Changed
+
+- Qwen streaming requests now only set `incremental_output: true` without forcing `enable_thinking: false`
+- Streaming Responses API converter takes model directly from the request instead of the `x-model` header
+- `response.completed` output now includes both text message and function_call items when both are present (previously text was dropped)
+
+### Fixed
+
+- Tool-call id normalization for non-streaming `/v1/responses` responses (vLLM/CloudRu/Qwen `chatcmpl-tool-…` → `call_…`)
+- Removed duplicate function_call aggregation in `openai_to_responses` transform
+
 ## [0.2.5] - 2026-08-03
 
 ### Fixes
