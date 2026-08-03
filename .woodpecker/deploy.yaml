@@ -10,7 +10,8 @@ steps:
     commands:
       - pip install uv
       - maturin build --release --manylinux 2_17 --out dist
-      - uv publish --token $${UV_TOKEN} dist/
+      - ls -l dist/ && ls -l
+      - uv publish --token $${UV_TOKEN} dist/*
     environment:
       UV_TOKEN:
         from_secret: uv_token
