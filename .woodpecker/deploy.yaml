@@ -2,6 +2,7 @@ when:
   - event: [deployment, tag]
 
 labels:
+  backend: docker
   platform: linux/amd64
 
 steps:
