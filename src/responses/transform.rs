@@ -143,28 +143,16 @@ pub fn responses_to_openai(req: ResponsesRequest) -> Result<openai::OpenAIReques
         Some(
             req.tools
                 .into_iter()
-                .filter_map(|t| {
-                    // Only include tools with "function" type for compatibility with most providers
-                    // Some providers don't support other types like "web_search"
-                    if t.tool_type == "function" {
-                        Some(openai::Tool {
-                            tool_type: t.tool_type,
-                            function: openai::Function {
-                                name: t.name.unwrap_or_else(|| "unnamed_tool".to_string()),
-                                description: t.description,
-                                parameters: clean_schema(t.parameters),
-                            },
-                        })
-                    } else {
-                        // For non-function tools, map them to function type for broader compatibility
-                        Some(openai::Tool {
-                            tool_type: "function".to_string(), // Map all tools to function type for compatibility
-                            function: openai::Function {
-                                name: t.name.unwrap_or_else(|| "unnamed_tool".to_string()),
-                                description: t.description,
-                                parameters: clean_schema(t.parameters),
-                            },
-                        })
+                .map(|t| {
+                    // Map all tools to "function" type for compatibility.
+                    // Some providers don't support other types like "web_search".
+                    openai::Tool {
+                        tool_type: "function".to_string(),
+                        function: openai::Function {
+                            name: t.name.unwrap_or_else(|| "unnamed_tool".to_string()),
+                            description: t.description,
+                            parameters: clean_schema(t.parameters),
+                        },
                     }
                 })
                 .collect(),
@@ -688,7 +676,10 @@ mod tests {
             .iter()
             .map(|o| o.item_type.as_str())
             .collect();
-        assert!(types.contains(&"message"), "missing message item: {types:?}");
+        assert!(
+            types.contains(&"message"),
+            "missing message item: {types:?}"
+        );
         assert!(
             types.contains(&"function_call"),
             "missing function_call item: {types:?}"

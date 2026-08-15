@@ -55,7 +55,10 @@ impl CodexRunner {
     }
 
     fn profile_config_path(&self) -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|home| home.join(".codex").join(format!("{}.config.toml", KLAVA_PROFILE_NAME)))
+        dirs::home_dir().map(|home| {
+            home.join(".codex")
+                .join(format!("{}.config.toml", KLAVA_PROFILE_NAME))
+        })
     }
 
     fn root_config_path(&self) -> Option<std::path::PathBuf> {
@@ -156,7 +159,8 @@ impl AgentRunner for CodexRunner {
 impl CodexRunner {
     /// Clean up legacy profile configuration from main config.toml
     async fn cleanup_legacy_config(&self) -> Result<(), anyhow::Error> {
-        let root_config_path = self.root_config_path()
+        let root_config_path = self
+            .root_config_path()
             .ok_or_else(|| anyhow::anyhow!("Could not find config.toml config path"))?;
 
         if !root_config_path.exists() {
@@ -172,19 +176,25 @@ impl CodexRunner {
         let mut changed = false;
 
         // Remove legacy `profile = "klava"` line
-        if let Some(line_start) = find_line_start(&content, &format!("profile = \"{}\"", KLAVA_PROFILE_NAME)) {
-            if let Some(line_end) = content[line_start..].find('\n') {
+        if let Some(line_start) =
+            find_line_start(&content, &format!("profile = \"{}\"", KLAVA_PROFILE_NAME))
+            && let Some(line_end) = content[line_start..].find('\n') {
                 let line_end = line_start + line_end + 1;
                 updated = format!("{}{}", &updated[..line_start], &updated[line_end..]);
                 changed = true;
             }
-        }
 
         // Remove legacy `[profiles.klava]` section
         let profile_header = format!("[profiles.{}]", KLAVA_PROFILE_NAME);
         if let Some(section_start) = updated.find(&profile_header) {
-            if let Some(next_section_start) = find_next_section(&updated, section_start + profile_header.len()) {
-                updated = format!("{}{}", &updated[..section_start], &updated[next_section_start..]);
+            if let Some(next_section_start) =
+                find_next_section(&updated, section_start + profile_header.len())
+            {
+                updated = format!(
+                    "{}{}",
+                    &updated[..section_start],
+                    &updated[next_section_start..]
+                );
             } else {
                 updated = updated[..section_start].to_string();
             }
@@ -209,7 +219,8 @@ impl CodexRunner {
 
     /// Ensure profile config exists and is up to date
     async fn ensure_profile_config(&self, proxy_url: &str) -> Result<(), anyhow::Error> {
-        let profile_path = self.profile_config_path()
+        let profile_path = self
+            .profile_config_path()
             .ok_or_else(|| anyhow::anyhow!("Could not find profile config path"))?;
         let base_url = format!("{}/v1", proxy_url);
 
@@ -258,7 +269,10 @@ impl CodexRunner {
                 return Ok(());
             }
         } else {
-            println!("\nNew profile configuration will be created at {}:", profile_path.display());
+            println!(
+                "\nNew profile configuration will be created at {}:",
+                profile_path.display()
+            );
             println!("{}", new_config);
 
             if !ask_user_approval("Do you want to create this configuration?")? {
@@ -365,6 +379,7 @@ pub struct AnalyticsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
 pub struct ProfileConfig {
     #[serde(default)]
     pub model: Option<String>,
@@ -400,28 +415,6 @@ pub struct ProfileConfig {
     pub features: Option<HashMap<String, bool>>,
 }
 
-impl Default for ProfileConfig {
-    fn default() -> Self {
-        Self {
-            model: None,
-            model_provider: None,
-            approval_policy: None,
-            sandbox_mode: None,
-            service_tier: None,
-            oss_provider: None,
-            model_reasoning_effort: None,
-            plan_mode_reasoning_effort: None,
-            model_reasoning_summary: None,
-            model_verbosity: None,
-            personality: None,
-            chatgpt_base_url: None,
-            model_catalog_json: None,
-            model_instructions_file: None,
-            experimental_compact_prompt_file: None,
-            features: None,
-        }
-    }
-}
 
 fn default_model_value() -> String {
     "klava".to_string()

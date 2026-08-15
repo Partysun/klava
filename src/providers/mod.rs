@@ -9,23 +9,20 @@ use serde::{Deserialize, Serialize};
 
 /// Provider type enum for configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Default)]
 pub enum Type {
     #[serde(rename = "openai-compatible")]
     #[serde(alias = "openai")]
+    #[default]
     OpenAICompatible,
     #[cfg(feature = "qwen-code")]
     #[serde(rename = "qwen-code")]
     QwenCode,
 }
 
-impl Default for Type {
-    fn default() -> Self {
-        Self::OpenAICompatible
-    }
-}
 
 impl Type {
-    pub fn from_str(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name {
             "openai-compatible" | "openai" | "default" => Some(Self::OpenAICompatible),
             #[cfg(feature = "qwen-code")]

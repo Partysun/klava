@@ -362,7 +362,10 @@ mod tests {
 
     #[test]
     fn test_openai_to_call_id_chatcmpl_tool_prefix() {
-        assert_eq!(openai_to_call_id("chatcmpl-tool-b8ce01f013736044"), "call_b8ce01f013736044");
+        assert_eq!(
+            openai_to_call_id("chatcmpl-tool-b8ce01f013736044"),
+            "call_b8ce01f013736044"
+        );
     }
 
     #[test]

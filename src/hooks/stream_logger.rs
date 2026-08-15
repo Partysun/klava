@@ -11,20 +11,20 @@ pub fn log_upstream_stream_hook(data: Value, _config: &Config) -> Result<Value> 
     log_jsonl(data)
 }
 
-/// Log JSON values to a JSONL file in the tests/fixtures directory
+/// Log JSON values to a JSONL file in the system temp directory
 /// This is the core logging function used by the hook
 pub fn log_jsonl(data: Value) -> Result<Value> {
-    let fixtures_dir = PathBuf::from("tests/fixtures");
+    let log_dir = std::env::temp_dir().join("klava_jsonl");
 
-    if !fixtures_dir.exists() {
-        std::fs::create_dir_all(&fixtures_dir).map_err(|e| {
-            crate::error::Error::Internal(format!("Failed to create fixtures directory: {}", e))
+    if !log_dir.exists() {
+        std::fs::create_dir_all(&log_dir).map_err(|e| {
+            crate::error::Error::Internal(format!("Failed to create log directory: {}", e))
         })?;
     }
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let filename = format!("upstream_stream_{}.jsonl", timestamp);
-    let filepath = fixtures_dir.join(filename);
+    let filepath = log_dir.join(filename);
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -56,11 +56,11 @@ pub struct StreamLogger {
 
 impl StreamLogger {
     pub fn new() -> std::io::Result<Self> {
-        let fixtures_dir = PathBuf::from("tests/fixtures");
-        std::fs::create_dir_all(&fixtures_dir)?;
+        let log_dir = std::env::temp_dir().join("klava_jsonl");
+        std::fs::create_dir_all(&log_dir)?;
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let filename = format!("upstream_stream_{}.jsonl", timestamp);
-        let filepath = fixtures_dir.join(filename);
+        let filepath = log_dir.join(filename);
         Ok(Self { filepath })
     }
 
@@ -83,8 +83,8 @@ impl StreamLogger {
             return Ok(());
         }
 
-        if trimmed.starts_with("data: ") {
-            let json_part = trimmed[6..].trim();
+        if let Some(json_part) = trimmed.strip_prefix("data: ") {
+            let json_part = json_part.trim();
 
             if json_part == "[DONE]" {
                 return Ok(());
@@ -125,5 +125,15 @@ mod tests {
         let result = log_upstream_stream_hook(data, &config);
 
         assert!(result.is_ok());
+
+        // Clean up the jsonl file created by the hook
+        let log_dir = std::env::temp_dir().join("klava_jsonl");
+        if let Ok(entries) = std::fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 }

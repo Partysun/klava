@@ -643,21 +643,19 @@ impl ChatChunkConverter for ResponsesStreamConverter {
             let delta = &choice.delta;
 
             // 1. Reasoning (must complete before other content)
-            if let Some(ref reasoning) = delta.reasoning {
-                if !reasoning.is_empty() {
+            if let Some(ref reasoning) = delta.reasoning
+                && !reasoning.is_empty() {
                     events.extend(self.process_reasoning_delta(reasoning));
                 }
-            }
 
             // 2. Content text
-            if let Some(ref content) = delta.content {
-                if !content.is_empty() {
+            if let Some(ref content) = delta.content
+                && !content.is_empty() {
                     // Finish reasoning first
                     events.extend(self.finish_reasoning());
 
                     events.extend(self.process_content_delta(content));
                 }
-            }
 
             // 3. Tool calls
             if let Some(ref tool_calls) = delta.tool_calls {
@@ -1393,7 +1391,10 @@ mod tests {
             "response.completed output missing function_call item: {types:?}"
         );
 
-        let fc = output.iter().find(|o| o["type"] == "function_call").unwrap();
+        let fc = output
+            .iter()
+            .find(|o| o["type"] == "function_call")
+            .unwrap();
         assert_eq!(fc["call_id"].as_str(), Some("call_b8ce01f013736044"));
     }
 }

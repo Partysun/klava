@@ -59,7 +59,7 @@ pub fn stop_daemon(pid_file: &Path) -> Result<()> {
             return Ok(());
         }
 
-        return Err(anyhow::anyhow!("Failed to stop daemon (PID: {})", pid));
+        Err(anyhow::anyhow!("Failed to stop daemon (PID: {})", pid))
     }
 
     #[cfg(not(unix))]

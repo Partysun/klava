@@ -31,7 +31,7 @@ fn apply_openai_model_override(
     completion_model: Option<String>,
 ) -> openai::OpenAIRequest {
     // Check if this is a reasoning request based on reasoning_effort
-    let is_reasoning = req.reasoning_effort.as_ref().map_or(false, |effort| {
+    let is_reasoning = req.reasoning_effort.as_ref().is_some_and(|effort| {
         !matches!(effort, openai::ReasoningEffort::None)
     });
 

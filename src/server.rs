@@ -1,4 +1,4 @@
-use crate::{config::Config, hooks::hooks::HookChain};
+use crate::{config::Config, hooks::chain::HookChain};
 use axum::{Extension, Router, routing::get};
 use reqwest::Client;
 use std::sync::Arc;
@@ -131,12 +131,34 @@ pub fn configure_logging(verbose: bool, mode: LogMode) {
     }
 }
 
+/// Bind a TCP listener to the requested port, trying subsequent ports (+1)
+/// if the requested one is already in use.
+///
+/// Returns the listener and the port it was actually bound to.
+pub async fn bind_listener(start_port: u16) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let mut port = start_port;
+    loop {
+        match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(listener) => {
+                let bound_port = listener.local_addr()?.port();
+                return Ok((listener, bound_port));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port < u16::MAX => {
+                tracing::warn!("Port {} is already in use, trying port {}", port, port + 1);
+                port += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub async fn run_server(
     config: Arc<Config>,
     client: reqwest::Client,
     hook_chain: Arc<HookChain>,
     log_mode: LogMode,
-) -> anyhow::Result<()> {
+    port_tx: Option<tokio::sync::oneshot::Sender<u16>>,
+) -> anyhow::Result<u16> {
     configure_logging(config.verbose, log_mode);
 
     tracing::info!("Starting Klava Proxy v{}", env!("CARGO_PKG_VERSION"));
@@ -165,15 +187,42 @@ pub async fn run_server(
         }
     }
 
-    let addr = format!("0.0.0.0:{}", config.port);
     let cors = create_cors_layer();
+    let (listener, port) = bind_listener(config.port).await?;
     let app = create_app(config, client, cors, hook_chain);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    tracing::info!("Listening on {}", addr);
+    if let Some(tx) = port_tx {
+        let _ = tx.send(port);
+    }
+
+    tracing::info!("Listening on 0.0.0.0:{}", port);
     tracing::info!("Proxy is live!");
 
     axum::serve(listener, app).await?;
 
-    Ok(())
+    Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_listener_uses_requested_port_when_free() {
+        let (listener, port) = bind_listener(0).await.unwrap();
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        assert_ne!(port, 0);
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn bind_listener_skips_occupied_port() {
+        let occupied = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+
+        let (listener, port) = bind_listener(occupied_port).await.unwrap();
+        assert_eq!(port, occupied_port + 1);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        drop(listener);
+    }
 }

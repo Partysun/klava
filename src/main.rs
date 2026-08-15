@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = agent.setup(&proxy_url).await {
                     return Err(Error::Internal(format!(
                         "Failed to setup {}: {}",
-                        &agent.name(),
+                        agent.name(),
                         e
                     ))
                     .into());
@@ -142,28 +142,38 @@ async fn main() -> anyhow::Result<()> {
 
             agent.check_installation()?;
 
-            // TODO: localhost must be a hostname in feature
-            // Set environment variables and launch Claude CLI using async agent.run()
-            let proxy_url = format!("http://localhost:{}", current_config.port);
-
-            if let Err(e) = agent.setup(&proxy_url).await {
-                return Err(
-                    Error::Internal(format!("Failed to setup {}: {}", &agent.name(), e)).into(),
-                );
-            }
-
             //TODO: we need to have an option to start agent without proxy server
-            // Start proxy server first
+            // Start proxy server first and report the port it bound to
             let config_clone = current_config.clone();
+            let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
             let server_handle = tokio::spawn(async move {
                 let config = Arc::new(config_clone);
                 let client = build_http_client()?;
 
-                server::run_server(config, client, hook_chain, server::LogMode::SILENT).await
+                server::run_server(
+                    config,
+                    client,
+                    hook_chain,
+                    server::LogMode::SILENT,
+                    Some(port_tx),
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
             });
 
-            // Wait briefly for server to start
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            // Wait for the proxy server to report the port it bound to
+            let proxy_port = tokio::time::timeout(tokio::time::Duration::from_secs(10), port_rx)
+                .await
+                .map_err(|_| anyhow::anyhow!("Proxy server failed to start in time"))?
+                .map_err(|_| anyhow::anyhow!("Proxy server failed to start"))?;
+
+            let proxy_url = format!("http://localhost:{}", proxy_port);
+
+            if let Err(e) = agent.setup(&proxy_url).await {
+                return Err(
+                    Error::Internal(format!("Failed to setup {}: {}", agent.name(), e)).into(),
+                );
+            }
 
             tracing::info!(
                 "🚀 Launching {} with proxy server at {}",
@@ -222,13 +232,17 @@ async fn main() -> anyhow::Result<()> {
             // Build and run the server
             let client = build_http_client()?;
 
-            server::run_server(
+            let port = server::run_server(
                 config,
                 client,
                 hook_chain,
                 server::LogMode::STDOUT | server::LogMode::FILE,
+                None,
             )
-            .await
+            .await?;
+
+            tracing::info!("Proxy is running on port {}", port);
+            Ok(())
         }
         Command::Logs { follow } => {
             //FIX:
@@ -244,9 +258,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Check { provider, model } => {
             if let Some(provider_name) = provider {
                 // Check specific provider
-                let target_config = config
-                    .clone();
-                klava::diagnostic::run_tests(&target_config, Some(&provider_name), model.as_deref()).await;
+                let target_config = config.clone();
+                klava::diagnostic::run_tests(
+                    &target_config,
+                    Some(&provider_name),
+                    model.as_deref(),
+                )
+                .await;
             } else {
                 // Check active provider
                 klava::diagnostic::run_tests(&config, None, model.as_deref()).await;

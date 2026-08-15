@@ -4,6 +4,12 @@ use which::which;
 
 pub struct ClaudeRunner;
 
+impl Default for ClaudeRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeRunner {
     pub const fn name_static() -> &'static str {
         "claude"
@@ -28,37 +34,31 @@ impl AgentRunner for ClaudeRunner {
         Ok(())
     }
 
-    fn run(
-        &self,
-        _args: &[String],
-        proxy_url: &str,
-    ) -> impl std::future::Future<Output = Result<(), anyhow::Error>> + Send {
-        async move {
-            let mut command = TokioCommand::new(self.name());
+    async fn run(&self, _args: &[String], proxy_url: &str) -> Result<(), anyhow::Error> {
+        let mut command = TokioCommand::new(self.name());
 
-            // Set environment variables for Claude
-            command
-                .env("ANTHROPIC_BASE_URL", proxy_url)
-                .env("ANTHROPIC_AUTH_TOKEN", "klava")
-                .env("ANTHROPIC_API_KEY", "")
-                .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-                .env("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
-                .env("IS_DEMO", "1");
+        // Set environment variables for Claude
+        command
+            .env("ANTHROPIC_BASE_URL", proxy_url)
+            .env("ANTHROPIC_AUTH_TOKEN", "klava")
+            .env("ANTHROPIC_API_KEY", "")
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("CLAUDE_CODE_ATTRIBUTION_HEADER", "0")
+            .env("IS_DEMO", "1");
 
-            let mut child = command
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("Failed to launch Claude CLI: {}", e))?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to launch Claude CLI: {}", e))?;
 
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to wait for Claude CLI: {}", e))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to wait for Claude CLI: {}", e))?;
 
-            if !status.success() {
-                anyhow::bail!("Claude CLI exited with status: {:?}", status.code());
-            }
-
-            Ok(())
+        if !status.success() {
+            anyhow::bail!("Claude CLI exited with status: {:?}", status.code());
         }
+
+        Ok(())
     }
 }

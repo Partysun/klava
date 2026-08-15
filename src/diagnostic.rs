@@ -8,8 +8,8 @@ use crate::providers::Config as ProviderConfig;
 use crate::{error::Error, models::openai};
 use colored::*;
 use reqwest::Client;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use std::time::Duration;
 
 /// Result of a diagnostic test
@@ -36,22 +36,23 @@ pub struct CheckResult {
 impl TestResult {
     pub fn print_summary(&self) {
         // Compact header
-        let status = if self.success { 
-            "✓".green() 
-        } else { 
-            "✗".red() 
+        let status = if self.success {
+            "✓".green()
+        } else {
+            "✗".red()
         };
-        println!("{} {} ({}) → {} → {}ms", 
-            status,
-            self.provider,
-            self.model,
-            self.url,
-            self.latency_ms
+        println!(
+            "{} {} ({}) → {} → {}ms",
+            status, self.provider, self.model, self.url, self.latency_ms
         );
-        
+
         // Checks inline
         for check in &self.checks {
-            let symbol = if check.passed { "✓".green() } else { "✗".red() };
+            let symbol = if check.passed {
+                "✓".green()
+            } else {
+                "✗".red()
+            };
             println!("  {} {}", symbol, check.message);
         }
 
@@ -137,23 +138,28 @@ pub async fn test_provider(
 
     let test_req = openai::OpenAIRequest {
         model: test_model,
-        messages: vec![openai::Message {
-            role: "developer".to_string(),
-            content: Some(openai::MessageContent::Text("You are a helpful assistant. You ONLY respond with the exact word the user asks for. No explanations.".to_string())),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        }, openai::Message {
-            role: "user".to_string(),
-            content: Some(openai::MessageContent::Text("Output only this word: verification".to_string())),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        }],
-        max_tokens: Some(10),
+        messages: vec![
+            openai::Message {
+                role: "system".to_string(),
+                content: Some(openai::MessageContent::Text(
+                    "Reply with exactly one word, nothing else.".to_string(),
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+            openai::Message {
+                role: "user".to_string(),
+                content: Some(openai::MessageContent::Text("verification".to_string())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            },
+        ],
+        max_tokens: Some(20),
         temperature: Some(0.0),
         top_p: None,
-        stop: Some(vec!["\n".to_string()]),
+        stop: None,
         stream: Some(false),
         tools: None,
         tool_choice: None,
@@ -161,14 +167,45 @@ pub async fn test_provider(
         extra: json!({}),
     };
 
-    // Send request
+    // Build request payload (same transformations as proxy.rs)
+    let mut request_payload = serde_json::to_value(&test_req)?;
+
+    // Qwen-specific payload modifications (mirror proxy.rs logic)
+    if url.contains("dashscope")
+        || url.contains("qwen")
+        || result.model.to_lowercase().contains("qwen")
+    {
+        if test_req.stream.unwrap_or(false) {
+            request_payload["incremental_output"] = serde_json::Value::Bool(true);
+        }
+        if let Some(messages) = request_payload["messages"].as_array_mut() {
+            let has_system = messages
+                .iter()
+                .any(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("system"));
+            if !has_system {
+                messages.insert(
+                    0,
+                    json!({"role": "system", "content": "You are a helpful assistant."}),
+                );
+            }
+        }
+    }
+
+    // Send request (mirroring proxy.rs logic)
     let mut req_builder = client
         .post(&url)
-        .json(&test_req)
+        .json(&request_payload)
         .timeout(Duration::from_secs(30));
 
     if let Some(headers) = auth_headers {
         req_builder = req_builder.headers(headers);
+    }
+
+    // OpenRouter-specific headers (mirror proxy.rs)
+    if url.contains("openrouter") {
+        req_builder = req_builder
+            .header("X-OpenRouter-Title", "Klava")
+            .header("X-OpenRouter-Categories", "cli-agent-proxy");
     }
 
     let response = req_builder
@@ -188,19 +225,27 @@ pub async fn test_provider(
 
     // Check if response contains an error field even with 200 status
     if let Some(error) = body.get("error") {
-        let error_msg = error.get("message")
+        let error_msg = error
+            .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown API error");
-        let error_type = error.get("type")
+        let error_type = error
+            .get("type")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown_error");
-        
+
         result.checks.push(CheckResult {
             name: "API Response".to_string(),
             passed: false,
-            message: format!("{{\"error\": \"{}\", \"type\": \"{}\"}}", error_msg, error_type),
+            message: format!(
+                "{{\"error\": \"{}\", \"type\": \"{}\"}}",
+                error_msg, error_type
+            ),
         });
-        result.error = Some(format!("API returned error: {} (type: {})", error_msg, error_type));
+        result.error = Some(format!(
+            "API returned error: {} (type: {})",
+            error_msg, error_type
+        ));
         return Ok(result);
     }
 
@@ -210,7 +255,11 @@ pub async fn test_provider(
             passed: false,
             message: format!("HTTP {}", status),
         });
-        result.error = Some(format!("HTTP {}: {}", status, serde_json::to_string_pretty(&body).unwrap_or_default()));
+        result.error = Some(format!(
+            "HTTP {}: {}",
+            status,
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        ));
         return Ok(result);
     }
 
@@ -222,7 +271,10 @@ pub async fn test_provider(
             passed: false,
             message: "No choices in response".to_string(),
         });
-        result.error = Some(format!("Response: {}", serde_json::to_string_pretty(&body).unwrap_or_default()));
+        result.error = Some(format!(
+            "Response: {}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        ));
         return Ok(result);
     }
 
@@ -233,7 +285,11 @@ pub async fn test_provider(
 
     match content {
         Some(text) => {
-            let cleaned = text.trim().replace("\n", " ").replace("\r", "").to_lowercase();
+            let cleaned = text
+                .trim()
+                .replace("\n", " ")
+                .replace("\r", "")
+                .to_lowercase();
             let trimmed = cleaned.trim();
             if trimmed.is_empty() {
                 // Content is whitespace only
@@ -242,7 +298,10 @@ pub async fn test_provider(
                     passed: false,
                     message: "Empty content (whitespace only)".to_string(),
                 });
-                result.error = Some(format!("Response: {}", serde_json::to_string_pretty(&body).unwrap_or_default()));
+                result.error = Some(format!(
+                    "Response: {}",
+                    serde_json::to_string_pretty(&body).unwrap_or_default()
+                ));
             } else if !trimmed.contains("verification") && !trimmed.contains("verif") {
                 // Response doesn't contain "ok" which we asked for
                 result.checks.push(CheckResult {
@@ -261,7 +320,10 @@ pub async fn test_provider(
                 result.checks.push(CheckResult {
                     name: "API Response".to_string(),
                     passed: true,
-                    message: format!("Got response: \"{}\"", result.response_preview.chars().take(50).collect::<String>()),
+                    message: format!(
+                        "Got response: \"{}\"",
+                        result.response_preview.chars().take(50).collect::<String>()
+                    ),
                 });
                 result.success = true;
             }
@@ -272,7 +334,10 @@ pub async fn test_provider(
                 passed: false,
                 message: "No message content in response".to_string(),
             });
-            result.error = Some(format!("Response: {}", serde_json::to_string_pretty(&body).unwrap_or_default()));
+            result.error = Some(format!(
+                "Response: {}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            ));
         }
     }
 
@@ -287,11 +352,7 @@ pub async fn run_tests(config: &Config, provider_name: Option<&str>, model: Opti
         .expect("Failed to build HTTP client");
 
     let providers_to_test: Vec<_> = if let Some(name) = provider_name {
-        config
-            .providers
-            .iter()
-            .filter(|p| p.name == name)
-            .collect()
+        config.providers.iter().filter(|p| p.name == name).collect()
     } else {
         config.providers.iter().collect()
     };

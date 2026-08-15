@@ -54,18 +54,25 @@ impl ProvidersConfig {
         }
     }
 
-    /// Auth headers
-    pub async fn get_auth_headers(&self, config: &Config) -> Result<Option<HeaderMap>> {
+    /// Auth headers for a specific provider config
+    pub async fn get_auth_headers_for(&self, _config: &Config) -> Result<Option<HeaderMap>> {
         match self.provider_type {
             ProviderType::OpenAICompatible => {
-                let api_key = config
-                    .resolve_api_key()
-                    .ok_or_else(|| Error::MissingApiKey("default".to_string()))?;
+                let api_key = self
+                    .api_key
+                    .clone()
+                    .filter(|k| !k.is_empty())
+                    .or_else(|| {
+                        self.api_key_name
+                            .as_ref()
+                            .and_then(|name| std::env::var(name).ok())
+                    })
+                    .ok_or_else(|| Error::MissingApiKey(self.name.to_string()))?;
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
                     HeaderValue::from_str(&format!("Bearer {}", api_key))
-                        .map_err(|_| Error::MissingApiKey("default".to_string()))?,
+                        .map_err(|_| Error::MissingApiKey(self.name.to_string()))?,
                 );
                 Ok(Some(headers))
             }
@@ -79,6 +86,11 @@ impl ProvidersConfig {
                     .map_err(|e| Error::Provider(format!("Qwen auth failed: {}", e)))
             }
         }
+    }
+
+    /// Auth headers ( delegates to get_auth_headers_for for backward compat )
+    pub async fn get_auth_headers(&self, config: &Config) -> Result<Option<HeaderMap>> {
+        self.get_auth_headers_for(config).await
     }
 
     /// Validate config

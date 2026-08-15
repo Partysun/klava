@@ -222,8 +222,7 @@ impl OpenaiConverter {
             let trimmed_args = args.trim_start();
 
             // Continuation fragment starting with comma - skip comma and append delta
-            if trimmed_args.starts_with(',') {
-                let delta = &trimmed_args[1..];
+            if let Some(delta) = trimmed_args.strip_prefix(',') {
                 accumulated.push_str(delta);
                 return Some(self.with_args(tc, delta));
             }
@@ -416,8 +415,8 @@ impl OpenaiConverter {
         let mut fixes = Vec::new();
 
         // Fix 1: Period instead of closing brace - replace trailing period with }
-        if trimmed.ends_with('.') {
-            fixes.push(format!("{}}}", &trimmed[..trimmed.len() - 1]));
+        if let Some(rest) = trimmed.strip_suffix('.') {
+            fixes.push(format!("{}}}", rest));
         }
 
         // Fix 2: Append closing brace
@@ -425,7 +424,7 @@ impl OpenaiConverter {
 
         // Fix 3: Replace trailing punctuation with }
         let last_char = trimmed.chars().last();
-        if last_char.map_or(false, |c| c == '.' || c == ',' || c == ':') {
+        if last_char.is_some_and(|c| c == '.' || c == ',' || c == ':') {
             fixes.push(format!("{}}}", &trimmed[..trimmed.len() - 1]));
         }
 

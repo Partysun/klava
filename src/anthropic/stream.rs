@@ -44,6 +44,12 @@ pub struct AnthropicStreamConverter {
     completed: bool,
 }
 
+impl Default for AnthropicStreamConverter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AnthropicStreamConverter {
     pub fn new() -> Self {
         Self {
@@ -455,21 +461,19 @@ impl ChatChunkConverter for AnthropicStreamConverter {
             let delta = &choice.delta;
 
             //. Reasoning (must complete before other content)
-            if let Some(reasoning) = &delta.reasoning {
-                if !reasoning.is_empty() {
+            if let Some(reasoning) = &delta.reasoning
+                && !reasoning.is_empty() {
                     events.extend(self.process_reasoning_delta(reasoning));
                 }
-            }
 
             //. Content text
-            if let Some(content) = &delta.content {
-                if !content.is_empty() {
+            if let Some(content) = &delta.content
+                && !content.is_empty() {
                     // Finish reasoning first
                     events.extend(self.finish_reasoning());
 
                     events.extend(self.process_content_delta(content));
                 }
-            }
 
             //. Tool calls
             if let Some(tool_calls) = &delta.tool_calls {

@@ -214,14 +214,13 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
     let mut content = Vec::new();
 
     // Add text content if present
-    if let Some(text) = &choice.message.content {
-        if !text.is_empty() {
+    if let Some(text) = &choice.message.content
+        && !text.is_empty() {
             content.push(anthropic::ResponseContent::Text {
                 content_type: "text".to_string(),
                 text: text.clone(),
             });
         }
-    }
 
     // Add tool calls if present
     if let Some(tool_calls) = &choice.message.tool_calls {
@@ -251,14 +250,11 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
     // Map OpenAI finish_reason onto Anthropic stop_reason. OpenAI can
     // legitimately omit finish_reason on a successful response; Anthropic
     // treats stop_reason as required, so default to `end_turn`.
-    let stop_reason = Some(
-        choice
+    let stop_reason = Some(String::from(choice
             .finish_reason
             .as_deref()
             .map(map_finish_reason_to_stop_reason)
-            .unwrap_or("end_turn"),
-    )
-    .map(String::from);
+            .unwrap_or("end_turn")));
 
     Ok(anthropic::AnthropicResponse {
         id: openai_to_anthropic_id(&resp.id),
