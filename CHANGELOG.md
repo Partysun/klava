@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.9] - 2026-08-16
+
+### Added
+
+- When the configured port is busy, `klava up` and `klava launch` now fall back to the next available port (+1)
+
+### Changed
+
+- Renamed `hooks::hooks` module to `hooks::chain`
+- Refactored `diagnostic.rs`, agent (claude/codex) and streaming code, cleaned up clippy warnings
+- Requests now no longer dump JSONL stream logs into `tests/fixtures`
+
 ## [0.2.8] - 2026-08-03
 
 ### Added
