@@ -1,0 +1,23 @@
+when:
+  - event: deployment
+    evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "macos", "publish"]'
+  - event: tag
+    ref: refs/tags/v*
+
+labels:
+  platform: darwin/amd64
+
+steps:
+  # Local macOS agent:
+  # receive from_secret environments.
+  - name: macos-publish
+    image: bash
+    environment:
+      UV_PUBLISH_TOKEN:
+        from_secret: uv_token
+    commands:
+      - cargo install --quiet uv || true
+      - uv tool install --quiet maturin || true
+      - uv tool run maturin build --release --universal2 --out dist
+      - uv publish dist/*
+

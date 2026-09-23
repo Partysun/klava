@@ -4,25 +4,11 @@ rust = "stable"
 [tasks.test-watch]
 description = "Auto-run tests when files change"
 run = "cargo watch -x test"
-sources = [
-    "src/**/*.rs",
-    "tests/**/*.rs"
-]
+sources = ["src/**/*.rs", "tests/**/*.rs"]
 
 [tasks.test-hurl]
 description = "Run hurl integration tests against localhost:8085"
 run = "hurl --variable host=http://localhost:8085 --test tests.hurl"
-
-[tasks.build-cross]
-description = "Cross-compile for major platforms (Apple Silicon, Intel Mac, Windows)"
-run = '''
-echo "Building for Apple Silicon..."
-cargo build --target aarch64-apple-darwin --release --quiet &&
-echo "Building for Intel Mac..." &&
-cargo build --target x86_64-apple-darwin --release --quiet &&
-echo "Building for Windows (may require additional setup)..." &&
-cargo build --target x86_64-pc-windows-gnu --release --quiet
-'''
 
 [tasks.build-native]
 description = "Build for current platform"
