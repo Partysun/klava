@@ -1,9 +1,19 @@
 # Changelog
 
-## [0.2.10] - 2026-09-23
+## [0.2.11] - 2026-09-23
+
+### Added
+
+- Per-provider `chat_completions_path` config field for providers that expose the endpoint at a nested path (e.g. Immerse's `/v1/endpoints/generate/chat/completions`); defaults to `/v1/chat/completions`; `klava check` uses the same URL logic
 
 ### Fixed
 
+- `klava check` now probes each provider's **own** `base_url`/`chat_completions_path` instead of always checking against the active provider; a missing base URL is reported as an error instead of panicking
+- `klava check` now accepts reasoning-only responses (OpenRouter/DeepSeek/Qwen thinking models often return `content: null` when the output budget goes to chain-of-thought) and uses a larger `max_tokens` probe; any non-empty answer is valid when the HTTP status is good
+
+## [0.2.10] - 2026-09-23
+
+### Fixed
 - Codex (`/v1/responses`) requests now select the configured reasoning model when `reasoning.effort` is set (previously the model override never fired on the Responses path)
 - Non-streaming responses: provider `reasoning_content` (GLM/Qwen/CloudRu chain-of-thought) is now mapped to Anthropic `thinking` blocks and Responses API `reasoning` items; usage details (`thinking_tokens`, cached tokens) are propagated to both formats
 - Anthropic `tool_result` blocks with `is_error: true` now prefix the content with `Error:` (OpenAI tool messages have no error flag); string tool results are no longer quoted as JSON
