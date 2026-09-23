@@ -26,26 +26,44 @@ use std::time::Duration;
 /// Apply model override based on config for OpenAI requests
 /// Detects reasoning requests by checking reasoning_effort parameter
 fn apply_openai_model_override(
-    mut req: openai::OpenAIRequest,
+    req: openai::OpenAIRequest,
     reasoning_model: Option<String>,
     completion_model: Option<String>,
 ) -> openai::OpenAIRequest {
     // Check if this is a reasoning request based on reasoning_effort
-    let is_reasoning = req.reasoning_effort.as_ref().is_some_and(|effort| {
-        !matches!(effort, openai::ReasoningEffort::None)
-    });
+    let is_reasoning = req
+        .reasoning_effort
+        .as_ref()
+        .is_some_and(|effort| !matches!(effort, openai::ReasoningEffort::None));
 
-    // Override model if provided
+    apply_model_override(req, is_reasoning, reasoning_model, completion_model)
+}
+
+/// Pick the configured reasoning vs completion model for a request.
+fn apply_model_override(
+    mut req: openai::OpenAIRequest,
+    is_reasoning: bool,
+    reasoning_model: Option<String>,
+    completion_model: Option<String>,
+) -> openai::OpenAIRequest {
     let model = if is_reasoning {
-        reasoning_model.clone().unwrap_or_else(|| req.model.clone())
+        reasoning_model.unwrap_or_else(|| req.model.clone())
     } else {
-        completion_model
-            .clone()
-            .unwrap_or_else(|| req.model.clone())
+        completion_model.unwrap_or_else(|| req.model.clone())
     };
 
     req.model = model;
     req
+}
+
+/// Whether a Responses request asks for reasoning. Codex sends
+/// `reasoning: {"effort": ...}`; any explicit effort above the default
+/// (`none`/`minimal`) selects the configured reasoning model.
+fn responses_request_is_reasoning(req: &crate::models::responses::ResponsesRequest) -> bool {
+    req.reasoning
+        .as_ref()
+        .and_then(|r| r.effort.as_deref())
+        .is_some_and(|e| !matches!(e, "none" | "minimal"))
 }
 
 /// Handler for Anthropic-compatible requests (/v1/messages)
@@ -344,9 +362,10 @@ async fn handle_non_streaming_responses(
     response: reqwest::Response,
     hook_chain: &HookChain,
     config: &Config,
+    req: Option<crate::models::responses::ResponsesRequest>,
 ) -> Result<Response> {
     let openai_resp: openai::OpenAIResponse = response.json().await?;
-    let responses_resp = openai_to_responses(openai_resp)?;
+    let responses_resp = openai_to_responses(openai_resp, req.as_ref())?;
 
     let data: Value = serde_json::to_value(responses_resp)?;
     let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
@@ -387,11 +406,18 @@ pub async fn proxy_responses(
         );
     }
 
-    let openai_req = responses_to_openai(responses_req)?;
+    // Detect reasoning requests from the Responses `reasoning.effort` field.
+    // The transformed OpenAI request keeps `reasoning_effort` unset (many
+    // OpenAI-compatible providers reject the field), so the decision is made
+    // here instead of inside `apply_openai_model_override`.
+    let is_reasoning = responses_request_is_reasoning(&responses_req);
+
+    let openai_req = responses_to_openai(responses_req.clone())?;
 
     // Apply model overrides
-    let openai_req = apply_openai_model_override(
+    let openai_req = apply_model_override(
         openai_req,
+        is_reasoning,
         config.resolve_reasoning_model(),
         config.resolve_completion_model(),
     );
@@ -410,7 +436,7 @@ pub async fn proxy_responses(
     let response = if is_streaming {
         handle_streaming_responses(response, openai_req.model).await?
     } else {
-        handle_non_streaming_responses(response, &hook_chain, &config).await?
+        handle_non_streaming_responses(response, &hook_chain, &config, Some(responses_req)).await?
     };
 
     Ok(response)
@@ -434,4 +460,86 @@ async fn handle_streaming_responses(
     let stream = universal.convert(upstream);
 
     Ok(build_sse_response(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::responses::{ResponsesInput, ResponsesReasoning, ResponsesRequest};
+
+    fn responses_req_with_effort(effort: Option<&str>) -> ResponsesRequest {
+        ResponsesRequest {
+            model: "gpt-4".to_string(),
+            background: false,
+            conversation: None,
+            include: vec![],
+            input: ResponsesInput::Text("hi".to_string()),
+            instructions: None,
+            max_output_tokens: None,
+            reasoning: effort.map(|e| ResponsesReasoning {
+                effort: Some(e.to_string()),
+                generate_summary: None,
+                summary: None,
+            }),
+            temperature: None,
+            text: None,
+            top_p: None,
+            truncation: None,
+            tools: vec![],
+            stream: None,
+            extra: json!({}),
+        }
+    }
+
+    #[test]
+    fn responses_request_reasoning_detection() {
+        assert!(responses_request_is_reasoning(&responses_req_with_effort(
+            Some("high")
+        )));
+        assert!(responses_request_is_reasoning(&responses_req_with_effort(
+            Some("low")
+        )));
+        assert!(!responses_request_is_reasoning(&responses_req_with_effort(
+            Some("none")
+        )));
+        assert!(!responses_request_is_reasoning(&responses_req_with_effort(
+            Some("minimal")
+        )));
+        assert!(!responses_request_is_reasoning(&responses_req_with_effort(
+            None
+        )));
+    }
+
+    #[test]
+    fn apply_model_override_selects_by_flag() {
+        let req = openai::OpenAIRequest {
+            model: "default".to_string(),
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: json!({}),
+        };
+
+        let reasoning = apply_model_override(
+            req.clone(),
+            true,
+            Some("thinking-model".to_string()),
+            Some("chat-model".to_string()),
+        );
+        assert_eq!(reasoning.model, "thinking-model");
+
+        let completion = apply_model_override(
+            req,
+            false,
+            Some("thinking-model".to_string()),
+            Some("chat-model".to_string()),
+        );
+        assert_eq!(completion.model, "chat-model");
+    }
 }

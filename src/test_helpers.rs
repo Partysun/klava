@@ -89,7 +89,9 @@ pub fn make_done_chunk(id: &str) -> String {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
-        }),
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
+}),
     })
     .unwrap()
 }

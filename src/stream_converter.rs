@@ -804,7 +804,9 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 167,
                 total_tokens: 177,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         };
 
         let import_event = make_sse_event(&serde_json::to_string(&empty_choices).unwrap());

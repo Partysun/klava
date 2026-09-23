@@ -925,7 +925,9 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         // output_text.done, content_part.done, output_item.done, response.completed
@@ -1143,7 +1145,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         // Find the output_item.done event
@@ -1189,7 +1193,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         let completed = events.iter().find(|e| e.event == "response.completed");
@@ -1285,7 +1291,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         // Now output_item.done for function_call should have status "completed"
@@ -1369,7 +1377,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         let completed = events

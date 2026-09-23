@@ -150,10 +150,24 @@ fn convert_message(msg: anthropic::Message) -> Result<Vec<openai::Message>> {
                     anthropic::ContentBlock::ToolResult {
                         tool_use_id,
                         content,
+                        is_error,
                         ..
                     } => {
-                        // Tool results become separate messages with role "tool"
-                        let text = serde_json::to_string(&content).map_err(Error::Serialization)?;
+                        // Tool results become separate messages with role "tool".
+                        // String content is passed through as-is; structured
+                        // content is JSON-serialized.
+                        let mut text = match content {
+                            Value::String(s) => s,
+                            other => serde_json::to_string(&other).map_err(Error::Serialization)?,
+                        };
+
+                        // OpenAI tool messages have no error flag; litellm marks
+                        // failed tool executions by prefixing the content.
+                        if is_error == Some(true) && !text.is_empty() && !text.starts_with("Error:")
+                        {
+                            text = format!("Error: {}", text);
+                        }
+
                         result.push(openai::Message {
                             role: "tool".to_string(),
                             content: Some(openai::MessageContent::Text(text)),
@@ -213,14 +227,27 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
 
     let mut content = Vec::new();
 
+    // Add reasoning content first — Anthropic requires thinking blocks to
+    // precede text/tool_use blocks. Qwen/GLM/DeepSeek return chain-of-thought
+    // as `reasoning_content` on the assistant message (non-streaming only).
+    if let Some(reasoning) = &choice.message.reasoning_content
+        && !reasoning.is_empty()
+    {
+        content.push(anthropic::ResponseContent::Thinking {
+            content_type: "thinking".to_string(),
+            thinking: reasoning.clone(),
+        });
+    }
+
     // Add text content if present
     if let Some(text) = &choice.message.content
-        && !text.is_empty() {
-            content.push(anthropic::ResponseContent::Text {
-                content_type: "text".to_string(),
-                text: text.clone(),
-            });
-        }
+        && !text.is_empty()
+    {
+        content.push(anthropic::ResponseContent::Text {
+            content_type: "text".to_string(),
+            text: text.clone(),
+        });
+    }
 
     // Add tool calls if present
     if let Some(tool_calls) = &choice.message.tool_calls {
@@ -250,11 +277,13 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
     // Map OpenAI finish_reason onto Anthropic stop_reason. OpenAI can
     // legitimately omit finish_reason on a successful response; Anthropic
     // treats stop_reason as required, so default to `end_turn`.
-    let stop_reason = Some(String::from(choice
+    let stop_reason = Some(String::from(
+        choice
             .finish_reason
             .as_deref()
             .map(map_finish_reason_to_stop_reason)
-            .unwrap_or("end_turn")));
+            .unwrap_or("end_turn"),
+    ));
 
     Ok(anthropic::AnthropicResponse {
         id: openai_to_anthropic_id(&resp.id),
@@ -267,6 +296,17 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
         usage: anthropic::Usage {
             input_tokens: resp.usage.prompt_tokens,
             output_tokens: resp.usage.completion_tokens,
+            input_tokens_details: resp.usage.prompt_tokens_details.as_ref().map(|d| {
+                json!({
+                    "cache_read_input_tokens": d.cached_tokens,
+                    "cache_creation_input_tokens": 0,
+                })
+            }),
+            output_tokens_details: resp.usage.completion_tokens_details.as_ref().map(|d| {
+                json!({
+                    "thinking_tokens": d.reasoning_tokens,
+                })
+            }),
         },
     })
 }
@@ -342,5 +382,146 @@ mod tests {
             Some("end_turn".to_string())
         );
         assert_eq!(map_stop_reason(None), None);
+    }
+
+    #[test]
+    fn openai_to_anthropic_maps_reasoning_content_to_thinking_block() {
+        let resp = openai::OpenAIResponse {
+            id: "chatcmpl-abc".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "zai-org/GLM-4.7".to_string(),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("The answer".to_string()),
+                    tool_calls: None,
+                    reasoning_content: Some("Let me think...".to_string()),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                prompt_tokens_details: Some(openai::PromptTokensDetails { cached_tokens: 7 }),
+                completion_tokens_details: Some(openai::CompletionTokensDetails {
+                    reasoning_tokens: 3,
+                }),
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic_resp = openai_to_anthropic(resp).unwrap();
+
+        // Thinking block must precede text block.
+        assert_eq!(anthropic_resp.content.len(), 2);
+        match &anthropic_resp.content[0] {
+            anthropic::ResponseContent::Thinking { thinking, .. } => {
+                assert_eq!(thinking, "Let me think...");
+            }
+            other => panic!("expected thinking block first, got {other:?}"),
+        }
+        match &anthropic_resp.content[1] {
+            anthropic::ResponseContent::Text { text, .. } => assert_eq!(text, "The answer"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+
+        assert_eq!(anthropic_resp.usage.input_tokens, 10);
+        assert_eq!(anthropic_resp.usage.output_tokens, 5);
+        let output_details = anthropic_resp.usage.output_tokens_details.as_ref().unwrap();
+        assert_eq!(output_details["thinking_tokens"], 3);
+        let input_details = anthropic_resp.usage.input_tokens_details.as_ref().unwrap();
+        assert_eq!(input_details["cache_read_input_tokens"], 7);
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_result_string_content_and_error_flag() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![
+                anthropic::Message {
+                    role: "assistant".to_string(),
+                    content: anthropic::MessageContent::Blocks(vec![
+                        anthropic::ContentBlock::ToolUse {
+                            id: "toolu_abc".to_string(),
+                            name: "bash".to_string(),
+                            input: json!({"cmd": "ls"}),
+                        },
+                    ]),
+                },
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Blocks(vec![
+                        anthropic::ContentBlock::ToolResult {
+                            tool_use_id: "toolu_abc".to_string(),
+                            content: json!("ls output"),
+                            is_error: Some(true),
+                        },
+                    ]),
+                },
+            ],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let openai_req = anthropic_to_openai(req, None, None).unwrap();
+
+        // assistant (tool_calls) + tool message
+        assert_eq!(openai_req.messages.len(), 2);
+        let tool_msg = &openai_req.messages[1];
+        assert_eq!(tool_msg.role, "tool");
+        // String content is unquoted and error flag becomes a prefix.
+        match &tool_msg.content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "Error: ls output");
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_abc"));
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_result_structured_content_serialized() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Blocks(vec![
+                    anthropic::ContentBlock::ToolResult {
+                        tool_use_id: "toolu_xyz".to_string(),
+                        content: json!([{"type": "text", "text": "ok"}]),
+                        is_error: None,
+                    },
+                ]),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let openai_req = anthropic_to_openai(req, None, None).unwrap();
+        match &openai_req.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert!(text.contains("ok"), "got: {text}");
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
     }
 }

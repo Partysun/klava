@@ -150,6 +150,10 @@ pub enum ResponseContent {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<Value>,
 }
 
 /// Streaming event types

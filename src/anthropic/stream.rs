@@ -723,7 +723,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         // Should have content_block_stop, message_delta, message_stop
@@ -812,7 +814,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            }),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+}),
         ));
 
         assert!(conv.is_completed());

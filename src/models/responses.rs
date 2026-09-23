@@ -30,6 +30,12 @@ pub struct ResponsesRequest {
     pub tools: Vec<ResponsesTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>, // optional, default is false
+    /// Passthrough for request fields we don't model explicitly
+    /// (`tool_choice`, `parallel_tool_calls`, `store`, `metadata`,
+    /// `previous_response_id`, `user`, ...). Echoed back on the response
+    /// by `openai_to_responses`. Kept out of serialization when empty.
+    #[serde(default, flatten)]
+    pub extra: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -180,9 +180,15 @@ pub fn responses_to_openai(req: ResponsesRequest) -> Result<openai::OpenAIReques
     })
 }
 
-// TODO: NOT FINISHED & TESTED METHOD
-/// Transform OpenAI response to Responses format
-pub fn openai_to_responses(resp: openai::OpenAIResponse) -> Result<responses::ResponsesResponse> {
+/// Transform OpenAI response to Responses format.
+///
+/// `req` (optional) is the original Responses request; its parameters are
+/// echoed back on the response so Codex sees a coherent object
+/// (tools, temperature, truncation, ...).
+pub fn openai_to_responses(
+    resp: openai::OpenAIResponse,
+    req: Option<&responses::ResponsesRequest>,
+) -> Result<responses::ResponsesResponse> {
     let choice = resp
         .choices
         .first()
@@ -190,6 +196,29 @@ pub fn openai_to_responses(resp: openai::OpenAIResponse) -> Result<responses::Re
 
     // Create output items based on the OpenAI response
     let mut output_items = Vec::new();
+
+    // Add reasoning item first. Qwen/GLM/CloudRu return chain-of-thought as
+    // `reasoning_content` on the assistant message (non-streaming only).
+    if let Some(reasoning) = &choice.message.reasoning_content
+        && !reasoning.is_empty()
+    {
+        let item_id = format!("rs_{}", uuid::Uuid::new_v4().as_simple());
+        output_items.push(responses::ResponsesOutputItem {
+            id: item_id.clone(),
+            item_type: "reasoning".to_string(),
+            status: Some("completed".to_string()),
+            role: None,
+            content: None,
+            call_id: None,
+            name: None,
+            arguments: None,
+            summary: Some(vec![responses::ResponsesReasoningSummary {
+                summary_type: "summary_text".to_string(),
+                text: reasoning.clone(),
+            }]),
+            encrypted_content: Some(reasoning.clone()),
+        });
+    }
 
     // Add the main message content if present
     if let Some(content) = &choice.message.content {
@@ -236,25 +265,110 @@ pub fn openai_to_responses(resp: openai::OpenAIResponse) -> Result<responses::Re
         }
     }
 
+    // Responses API ids are `resp_…`; normalize upstream `chatcmpl-…` ids.
+    let id = if resp.id.starts_with("resp_") {
+        resp.id.clone()
+    } else {
+        format!("resp_{}", resp.id)
+    };
+
+    // Echo request parameters where the upstream response doesn't carry them.
+    let (
+        tools,
+        tool_choice,
+        truncation,
+        parallel_tool_calls,
+        temperature,
+        top_p,
+        max_output_tokens,
+        instructions,
+        previous_response_id,
+        store,
+        metadata,
+        service_tier,
+    ) = match req {
+        Some(req) => (
+            req.tools.clone(),
+            req.extra
+                .get("tool_choice")
+                .cloned()
+                .unwrap_or_else(|| json!("auto")),
+            req.truncation
+                .clone()
+                .unwrap_or_else(|| "disabled".to_string()),
+            req.extra
+                .get("parallel_tool_calls")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            req.temperature.unwrap_or(1.0),
+            req.top_p.unwrap_or(1.0),
+            req.max_output_tokens,
+            req.instructions.clone(),
+            req.extra
+                .get("previous_response_id")
+                .and_then(Value::as_str)
+                .map(String::from),
+            req.extra
+                .get("store")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            req.extra
+                .get("metadata")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            req.extra
+                .get("service_tier")
+                .and_then(Value::as_str)
+                .map(String::from),
+        ),
+        None => (
+            vec![],
+            json!("auto"),
+            "disabled".to_string(),
+            true,
+            1.0,
+            1.0,
+            None,
+            None,
+            None,
+            false,
+            json!({}),
+            None,
+        ),
+    };
+
     // Generate current timestamp as i64 (Unix timestamp)
     let now = chrono::Utc::now().timestamp();
 
+    let cached_tokens = resp
+        .usage
+        .prompt_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
+    let reasoning_tokens = resp
+        .usage
+        .completion_tokens_details
+        .as_ref()
+        .map(|d| d.reasoning_tokens)
+        .unwrap_or(0);
+
     Ok(responses::ResponsesResponse {
-        id: resp.id,
+        id,
         response_object: "response".to_string(),
         created_at: now,
         completed_at: Some(now), // Set completed_at to the same time for now
         status: "completed".to_string(),
         incomplete_details: None,
         model: resp.model,
-        previous_response_id: None,
-        instructions: None,
+        previous_response_id,
+        instructions,
         output: output_items,
         error: None,
-        tools: vec![],          // We could populate this if needed
-        tool_choice: json!({}), // Default empty object
-        truncation: "disabled".to_string(),
-        parallel_tool_calls: false,
+        tools,
+        tool_choice,
+        truncation,
+        parallel_tool_calls,
         text: responses::ResponsesTextField {
             format: responses::ResponsesTextFormat {
                 format_type: "text".to_string(),
@@ -263,29 +377,29 @@ pub fn openai_to_responses(resp: openai::OpenAIResponse) -> Result<responses::Re
                 strict: None,
             },
         },
-        top_p: 1.0,
+        top_p,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
         top_logprobs: 0,
-        temperature: 1.0,
+        temperature,
         reasoning: None,
         usage: responses::ResponsesUsage {
             input_tokens: resp.usage.prompt_tokens as i32,
             output_tokens: resp.usage.completion_tokens as i32,
             total_tokens: resp.usage.total_tokens as i32,
             input_tokens_details: responses::ResponsesInputTokensDetails {
-                cached_tokens: 0, // Could be populated if cache info is available
+                cached_tokens: cached_tokens as i32,
             },
             output_tokens_details: responses::ResponsesOutputTokensDetails {
-                reasoning_tokens: 0, // Could be populated if reasoning info is available
+                reasoning_tokens: reasoning_tokens as i32,
             },
         },
-        max_output_tokens_field: None,
+        max_output_tokens_field: max_output_tokens,
         max_tool_calls: None,
-        store: false,
+        store,
         background: false,
-        service_tier: "default".to_string(),
-        metadata: json!({}),
+        service_tier: service_tier.unwrap_or_else(|| "default".to_string()),
+        metadata,
         safety_identifier: None,
         prompt_cache_key: None,
     })
@@ -576,6 +690,7 @@ mod tests {
             truncation: None,
             tools: vec![],
             stream: Some(false),
+            extra: json!({}),
         };
 
         let result = responses_to_openai(responses_req);
@@ -615,6 +730,7 @@ mod tests {
             truncation: None,
             tools: vec![],
             stream: Some(false),
+            extra: json!({}),
         };
 
         let result = responses_to_openai(responses_req);
@@ -658,6 +774,7 @@ mod tests {
                             arguments: r#"{"command":"ls"}"#.to_string(),
                         },
                     }]),
+                    reasoning_content: None,
                 },
                 finish_reason: Some("tool_calls".to_string()),
             }],
@@ -665,11 +782,13 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             },
             system_fingerprint: None,
         };
 
-        let responses_resp = openai_to_responses(resp).unwrap();
+        let responses_resp = openai_to_responses(resp, None).unwrap();
 
         let types: Vec<&str> = responses_resp
             .output
@@ -693,5 +812,165 @@ mod tests {
         assert_eq!(fc.call_id.as_deref(), Some("call_b8ce01f013736044"));
         assert_eq!(fc.name.as_deref(), Some("bash"));
         assert_eq!(fc.arguments.as_deref(), Some(r#"{"command":"ls"}"#));
+    }
+
+    /// Non-streaming /v1/responses must surface provider `reasoning_content`
+    /// as a `reasoning` output item and map usage token details.
+    #[test]
+    fn openai_to_responses_maps_reasoning_content_and_usage_details() {
+        let resp = openai::OpenAIResponse {
+            id: "chatcmpl-abc".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "zai-org/GLM-4.7".to_string(),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Final answer".to_string()),
+                    tool_calls: None,
+                    reasoning_content: Some("Let me think...".to_string()),
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                prompt_tokens_details: Some(openai::PromptTokensDetails { cached_tokens: 7 }),
+                completion_tokens_details: Some(openai::CompletionTokensDetails {
+                    reasoning_tokens: 3,
+                }),
+            },
+            system_fingerprint: None,
+        };
+
+        let responses_resp = openai_to_responses(resp, None).unwrap();
+
+        // reasoning item must come first, then the message item
+        let output = responses_resp.output;
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].item_type, "reasoning");
+        assert_eq!(
+            output[0].summary.as_ref().unwrap()[0].text,
+            "Let me think..."
+        );
+
+        assert_eq!(output[1].item_type, "message");
+        assert_eq!(output[1].content.as_ref().unwrap()[0].text, "Final answer");
+
+        // Usage details mapped from the upstream response
+        assert_eq!(responses_resp.usage.input_tokens_details.cached_tokens, 7);
+        assert_eq!(
+            responses_resp.usage.output_tokens_details.reasoning_tokens,
+            3
+        );
+
+        // Upstream chatcmpl- id normalized to resp_ prefix
+        assert!(responses_resp.id.starts_with("resp_"));
+    }
+
+    /// Non-streaming /v1/responses should echo the original request's
+    /// parameters so Codex sees a coherent response object.
+    #[test]
+    fn openai_to_responses_echoes_request_params() {
+        let resp = openai::OpenAIResponse {
+            id: "resp_orig".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4".to_string(),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Hi".to_string()),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            },
+            system_fingerprint: None,
+        };
+
+        let req = responses::ResponsesRequest {
+            model: "gpt-4".to_string(),
+            background: false,
+            conversation: None,
+            include: vec![],
+            input: responses::ResponsesInput::Text("Hi".to_string()),
+            instructions: Some("Be nice".to_string()),
+            max_output_tokens: Some(256),
+            reasoning: None,
+            temperature: Some(0.3),
+            text: None,
+            top_p: Some(0.9),
+            truncation: None,
+            tools: vec![responses::ResponsesTool {
+                tool_type: "function".to_string(),
+                name: Some("get_weather".to_string()),
+                description: Some("Gets weather".to_string()),
+                strict: Some(false),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+            stream: Some(false),
+            extra: json!({
+                "tool_choice": {"type": "function", "name": "get_weather"},
+                "parallel_tool_calls": false,
+                "store": true,
+                "metadata": {"session": "abc"},
+                "previous_response_id": "resp_prev",
+                "service_tier": "flexible",
+            }),
+        };
+
+        let responses_resp = openai_to_responses(resp, Some(&req)).unwrap();
+
+        assert_eq!(responses_resp.id, "resp_orig");
+        assert_eq!(responses_resp.instructions.as_deref(), Some("Be nice"));
+        assert_eq!(responses_resp.temperature, 0.3);
+        assert_eq!(responses_resp.top_p, 0.9);
+        assert_eq!(responses_resp.max_output_tokens_field, Some(256));
+        assert_eq!(responses_resp.tools.len(), 1);
+        assert_eq!(responses_resp.tools[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(responses_resp.tool_choice["name"], json!("get_weather"));
+        assert!(!responses_resp.parallel_tool_calls);
+        assert!(responses_resp.store);
+        assert_eq!(responses_resp.metadata["session"], json!("abc"));
+        assert_eq!(
+            responses_resp.previous_response_id.as_deref(),
+            Some("resp_prev")
+        );
+        assert_eq!(responses_resp.service_tier, "flexible");
+    }
+
+    /// `ResponsesRequest` must round-trip unknown fields via `extra`.
+    #[test]
+    fn responses_request_preserves_unknown_fields() {
+        let req: responses::ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "lookup"},
+            "parallel_tool_calls": true,
+            "store": false,
+            "metadata": {"k": "v"},
+            "user": "u-1"
+        }))
+        .unwrap();
+
+        assert_eq!(req.extra["tool_choice"]["name"], json!("lookup"));
+        assert_eq!(req.extra["parallel_tool_calls"], json!(true));
+        assert_eq!(req.extra["metadata"]["k"], json!("v"));
+        assert_eq!(req.extra["user"], json!("u-1"));
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["tool_choice"]["name"], json!("lookup"));
+        assert!(!out.as_object().unwrap().contains_key("extra"));
     }
 }
