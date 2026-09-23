@@ -47,6 +47,11 @@ pub struct Config {
     #[serde(rename = "type")]
     pub provider_type: Type,
     pub base_url: Option<String>,
+    /// Optional absolute path for the chat completions endpoint, e.g.
+    /// `/v1/endpoints/generate/chat/completions` for providers that route
+    /// through a nested path. Defaults to `/v1/chat/completions` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_completions_path: Option<String>,
     pub api_key: Option<String>,
     pub api_key_name: Option<String>,
     #[serde(alias = "reasoning")]

@@ -132,4 +132,84 @@ impl ProvidersConfig {
             ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
         }
     }
+
+    /// Upstream chat completions URL for THIS provider.
+    ///
+    /// Defaults to `{base_url}/v1/chat/completions`; providers that expose
+    /// the endpoint at a nested path (e.g. Immerse's
+    /// `/v1/endpoints/generate/chat/completions`) can override the path via
+    /// the `chat_completions_path` config field. Returns `None` when the
+    /// provider has no base URL.
+    pub fn chat_completions_url(&self) -> Option<String> {
+        let base_url = self.resolve_base_url()?;
+        let path = self
+            .chat_completions_path
+            .clone()
+            .unwrap_or_else(|| "/v1/chat/completions".to_string());
+        let path = if path.starts_with('/') {
+            path
+        } else {
+            format!("/{}", path)
+        };
+        Some(format!("{}{}", base_url.trim_end_matches('/'), path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::Type as ProviderType;
+
+    fn provider(base_url: &str, path: Option<&str>) -> ProvidersConfig {
+        ProvidersConfig {
+            name: "test".to_string(),
+            provider_type: ProviderType::OpenAICompatible,
+            base_url: Some(base_url.to_string()),
+            chat_completions_path: path.map(String::from),
+            api_key: None,
+            api_key_name: None,
+            reasoning_model: None,
+            completion_model: None,
+        }
+    }
+
+    #[test]
+    fn url_defaults_to_v1_chat_completions() {
+        assert_eq!(
+            provider("https://openrouter.ai/api", None).chat_completions_url(),
+            Some("https://openrouter.ai/api/v1/chat/completions".to_string())
+        );
+    }
+
+    #[test]
+    fn url_uses_custom_path() {
+        assert_eq!(
+            provider(
+                "https://chat.immers.cloud",
+                Some("/v1/endpoints/generate/chat/completions")
+            )
+            .chat_completions_url(),
+            Some(
+                "https://chat.immers.cloud/v1/endpoints/generate/chat/completions".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn url_handles_trailing_slash_and_missing_leading_slash() {
+        assert_eq!(
+            provider("https://blocks.gonka.gg/", Some("v1/chat/completions"))
+                .chat_completions_url(),
+            Some("https://blocks.gonka.gg/v1/chat/completions".to_string())
+        );
+    }
+
+    #[test]
+    fn url_is_none_without_base_url() {
+        let p = ProvidersConfig {
+            base_url: None,
+            ..provider("https://x.example", None)
+        };
+        assert_eq!(p.chat_completions_url(), None);
+    }
 }

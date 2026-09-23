@@ -92,6 +92,7 @@ impl InteractiveSetup {
             name: provider_name.clone(),
             provider_type,
             base_url: None,
+            chat_completions_path: None,
             api_key: None,
             api_key_name: None,
             reasoning_model: None,

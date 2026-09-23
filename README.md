@@ -80,6 +80,15 @@ reasoning_model = "zai-org/GLM-4.7"
 completion_model = "zai-org/GLM-4.7"
 
 [[providers]]
+name = "immerse"
+type = "openai-compatible"
+base_url = "https://chat.immers.cloud"
+api_key_name = "IMMERSE_TOKEN"
+chat_completions_path = "/v1/endpoints/generate/chat/completions"
+reasoning_model = "deepseek-v4-flash-0731"
+completion_model = "deepseek-v4-flash-0731"
+
+[[providers]]
 name = "openrouter"
 type = "openai-compatible"
 base_url = "https://openrouter.ai/api"
@@ -89,6 +98,11 @@ completion_model = "z-ai/glm-5.1"
 ```
 
 Notice: base_url should not include /v1 at the end!
+
+Notice: If your provider exposes the chat completions endpoint at a nested
+path (e.g. `…/v1/endpoints/generate/chat/completions`), set
+`chat_completions_path` to that absolute path. It defaults to
+`/v1/chat/completions` otherwise.
 
 Notice: You can use api_key_name if you have the api_key in your environment,
 if you want you can set api_key in the toml file with the api_key variable.

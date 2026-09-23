@@ -123,10 +123,9 @@ pub async fn test_provider(
     }
 
     // Determine URL and model
-    let base_url = provider_config
-        .resolve_base_url()
-        .ok_or_else(|| Error::MissingBaseUrl)?;
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let url = provider_config
+        .chat_completions_url()
+        .ok_or(Error::MissingBaseUrl)?;
     result.url = url.clone();
 
     let test_model = model
@@ -156,7 +155,10 @@ pub async fn test_provider(
                 name: None,
             },
         ],
-        max_tokens: Some(20),
+        // Keep a headroom budget: thinking models (OpenRouter/DeepSeek/Qwen)
+        // burn tokens on chain-of-thought before producing visible content,
+        // and an exhausted budget returns content: null.
+        max_tokens: Some(256),
         temperature: Some(0.0),
         top_p: None,
         stop: None,
@@ -213,8 +215,6 @@ pub async fn test_provider(
         .await
         .map_err(|e| Error::Upstream(format!("Request failed: {}", e)))?;
 
-    result.latency_ms = start.elapsed().as_millis() as u64;
-
     let status = response.status();
     let body: Value = response
         .json()
@@ -264,75 +264,24 @@ pub async fn test_provider(
     }
 
     // Validate response structure
-    let choices = body.get("choices").and_then(|c| c.as_array());
-    if choices.is_none() || choices.unwrap().is_empty() {
-        result.checks.push(CheckResult {
-            name: "API Response".to_string(),
-            passed: false,
-            message: "No choices in response".to_string(),
-        });
-        result.error = Some(format!(
-            "Response: {}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
-        ));
-        return Ok(result);
-    }
-
-    let content = choices.unwrap()[0]
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str());
-
-    match content {
-        Some(text) => {
-            let cleaned = text
-                .trim()
-                .replace("\n", " ")
-                .replace("\r", "")
-                .to_lowercase();
-            let trimmed = cleaned.trim();
-            if trimmed.is_empty() {
-                // Content is whitespace only
-                result.checks.push(CheckResult {
-                    name: "API Response".to_string(),
-                    passed: false,
-                    message: "Empty content (whitespace only)".to_string(),
-                });
-                result.error = Some(format!(
-                    "Response: {}",
-                    serde_json::to_string_pretty(&body).unwrap_or_default()
-                ));
-            } else if !trimmed.contains("verification") && !trimmed.contains("verif") {
-                // Response doesn't contain "ok" which we asked for
-                result.checks.push(CheckResult {
-                    name: "API Response".to_string(),
-                    passed: false,
-                    message: "Response doesn't match expected output".to_string(),
-                });
-                result.error = Some(format!(
-                    "Expected response to contain 'verification', but got: \"{}\"\n\nThis usually means:\n  - The model doesn't exist\n  - The model is misconfigured\n  - The API is mocking responses\n\nFull response: {}",
-                    trimmed,
-                    serde_json::to_string_pretty(&body).unwrap_or_default()
-                ));
-            } else {
-                // Valid response
-                result.response_preview = trimmed.to_string();
-                result.checks.push(CheckResult {
-                    name: "API Response".to_string(),
-                    passed: true,
-                    message: format!(
-                        "Got response: \"{}\"",
-                        result.response_preview.chars().take(50).collect::<String>()
-                    ),
-                });
-                result.success = true;
-            }
+    match validate_api_response(&body) {
+        Ok(preview) => {
+            result.response_preview = preview.clone();
+            result.checks.push(CheckResult {
+                name: "API Response".to_string(),
+                passed: true,
+                message: format!(
+                    "Got response: \"{}\"",
+                    preview.chars().take(50).collect::<String>()
+                ),
+            });
+            result.success = true;
         }
-        None => {
+        Err(reason) => {
             result.checks.push(CheckResult {
                 name: "API Response".to_string(),
                 passed: false,
-                message: "No message content in response".to_string(),
+                message: reason,
             });
             result.error = Some(format!(
                 "Response: {}",
@@ -342,6 +291,43 @@ pub async fn test_provider(
     }
 
     Ok(result)
+}
+
+/// Validate a chat completions response body.
+///
+/// A response is valid when the model produced *any* non-empty content —
+/// either visible text (`content`) or reasoning output (`reasoning` /
+/// `reasoning_content`, used by thinking models on OpenRouter/DeepSeek/
+/// Qwen when the output budget is consumed by chain-of-thought).
+/// The exact answer is not checked — the model answers freely, and failures
+/// surface as HTTP errors, `error` payloads, or empty/missing content.
+fn validate_api_response(body: &Value) -> Result<String, String> {
+    let choices = body.get("choices").and_then(|c| c.as_array());
+    if choices.is_none() || choices.unwrap().is_empty() {
+        return Err("No choices in response".to_string());
+    }
+
+    let message = choices.unwrap()[0].get("message");
+    if message.is_none() || !message.unwrap().is_object() {
+        return Err("No message in response".to_string());
+    }
+    let message = message.unwrap();
+
+    let candidates = [
+        message.get("content").and_then(Value::as_str),
+        message.get("reasoning").and_then(Value::as_str),
+        message.get("reasoning_content").and_then(Value::as_str),
+    ];
+
+    for text in candidates.into_iter().flatten() {
+        let cleaned = text.trim().replace('\n', " ").replace('\r', "");
+        let preview = cleaned.trim();
+        if !preview.is_empty() {
+            return Ok(preview.to_string());
+        }
+    }
+
+    Err("No message content in response".to_string())
 }
 
 /// Test all providers or a specific one
@@ -380,5 +366,139 @@ pub async fn run_tests(config: &Config, provider_name: Option<&str>, model: Opti
 
     if !all_passed {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response_with_content(content: Option<&str>) -> Value {
+        let mut body = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": []
+        });
+        if let Some(text) = content {
+            body["choices"] = json!([{
+                "index": 0,
+                "message": {"role": "assistant", "content": text}
+            }]);
+        }
+        body
+    }
+
+    fn response_with_reasoning_only(reasoning: &str) -> Value {
+        json!({
+            "id": "gen-1",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning": reasoning,
+                    "reasoning_details": [{"type": "reasoning.text", "text": reasoning}]
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn any_non_empty_answer_is_valid() {
+        assert_eq!(
+            validate_api_response(&response_with_content(Some("This is a test"))).unwrap(),
+            "This is a test"
+        );
+    }
+
+    #[test]
+    fn answer_not_matching_prompt_is_still_valid() {
+        // Regression: previously the answer had to contain the prompt echo
+        // ("verification"), which rejected legitimate model responses.
+        assert_eq!(
+            validate_api_response(&response_with_content(Some("42"))).unwrap(),
+            "42"
+        );
+        assert_eq!(
+            validate_api_response(&response_with_content(Some("Sure, here is a summary."))).unwrap(),
+            "Sure, here is a summary."
+        );
+    }
+
+    #[test]
+    fn multiline_answer_is_normalized_for_preview() {
+        assert_eq!(
+            validate_api_response(&response_with_content(Some("line1\nline2"))).unwrap(),
+            "line1 line2"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_response_is_valid() {
+        // OpenRouter reasoning models return content: null when the output
+        // budget is consumed by chain-of-thought (e.g. max_tokens too low).
+        assert_eq!(
+            validate_api_response(&response_with_reasoning_only(
+                "Okay, the user just said \"Hi.\""
+            ))
+            .unwrap(),
+            "Okay, the user just said \"Hi.\""
+        );
+    }
+
+    #[test]
+    fn deepseek_style_reasoning_content_is_valid() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "Let me think about this..."
+                }
+            }]
+        });
+        assert_eq!(
+            validate_api_response(&body).unwrap(),
+            "Let me think about this..."
+        );
+    }
+
+    #[test]
+    fn visible_content_preferred_over_reasoning() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!",
+                    "reasoning": "Some chain of thought"
+                }
+            }]
+        });
+        assert_eq!(validate_api_response(&body).unwrap(), "Hello!");
+    }
+
+    #[test]
+    fn whitespace_only_content_is_rejected() {
+        assert!(validate_api_response(&response_with_content(Some(" \n "))).is_err());
+    }
+
+    #[test]
+    fn missing_content_is_rejected() {
+        assert!(validate_api_response(&response_with_content(None)).is_err());
+    }
+
+    #[test]
+    fn empty_choices_is_rejected() {
+        assert!(validate_api_response(&json!({"choices": []})).is_err());
+    }
+
+    #[test]
+    fn error_payload_is_rejected_by_caller() {
+        // `validate_api_response` only sees successful-response bodies; the
+        // `error` field is guarded earlier in `test_provider`.
+        let body = json!({"error": {"message": "bad key", "type": "authentication_error"}});
+        assert!(validate_api_response(&body).is_err());
     }
 }

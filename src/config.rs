@@ -247,11 +247,11 @@ impl Config {
         self.save()
     }
 
+    /// Upstream chat completions URL for the active provider.
     pub fn chat_completions_url(&self) -> String {
-        let base_url = self
-            .resolve_base_url() // None means use active provider config
-            .expect("Base URL not configured for active provider");
-        format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
+        self.get_active_provider_config()
+            .and_then(|p| p.chat_completions_url())
+            .expect("Base URL not configured for active provider")
     }
 }
 
@@ -277,6 +277,8 @@ mod tests {
                     name: "test_provider".to_string(),
                     provider_type: ProviderType::OpenAICompatible,
                     base_url: Some("https://test.example.com".to_string()),
+
+                    chat_completions_path: None,
                     api_key: None,
                     api_key_name: None,
                     reasoning_model: Some("alisyao".to_string()),
@@ -286,6 +288,8 @@ mod tests {
                     name: "other_provider".to_string(),
                     provider_type: ProviderType::OpenAICompatible,
                     base_url: Some("https://other.example.com".to_string()),
+
+                    chat_completions_path: None,
                     api_key: None,
                     api_key_name: None,
                     reasoning_model: None,
@@ -313,6 +317,8 @@ mod tests {
                     name: "first_provider".to_string(),
                     provider_type: ProviderType::OpenAICompatible,
                     base_url: Some("https://first.example.com".to_string()),
+
+                    chat_completions_path: None,
                     api_key: None,
                     api_key_name: None,
                     reasoning_model: None,
@@ -322,6 +328,8 @@ mod tests {
                     name: "second_provider".to_string(),
                     provider_type: ProviderType::OpenAICompatible,
                     base_url: Some("https://second.example.com".to_string()),
+
+                    chat_completions_path: None,
                     api_key: None,
                     api_key_name: None,
                     reasoning_model: None,
@@ -352,6 +360,7 @@ mod tests {
                 name: "test".to_string(),
                 provider_type: ProviderType::OpenAICompatible,
                 base_url: Some("https://test.example.com".to_string()),
+                chat_completions_path: None,
                 api_key: Some("test-key".to_string()),
                 api_key_name: None,
                 reasoning_model: Some("test-reasoning-model".to_string()),
@@ -363,5 +372,80 @@ mod tests {
         let active_config = config.get_active_provider_config().unwrap();
         assert_eq!(active_config.name, "test");
         assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn chat_completions_url_defaults_to_v1_chat_completions() {
+        let config = Config {
+            port: 3000,
+            active_provider: "test".to_string(),
+            providers: vec![ProviderConfig {
+                name: "test".to_string(),
+                provider_type: ProviderType::OpenAICompatible,
+                base_url: Some("https://chat.example.com".to_string()),
+                chat_completions_path: None,
+                api_key: None,
+                api_key_name: None,
+                reasoning_model: None,
+                completion_model: None,
+            }],
+            verbose: false,
+        };
+
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://chat.example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_uses_custom_path() {
+        let config = Config {
+            port: 3000,
+            active_provider: "immerse".to_string(),
+            providers: vec![ProviderConfig {
+                name: "immerse".to_string(),
+                provider_type: ProviderType::OpenAICompatible,
+                base_url: Some("https://chat.immers.cloud/".to_string()),
+                chat_completions_path: Some(
+                    "/v1/endpoints/generate/chat/completions".to_string(),
+                ),
+                api_key: None,
+                api_key_name: Some("IMMERSE_TOKEN".to_string()),
+                reasoning_model: Some("deepseek-v4-flash-0731".to_string()),
+                completion_model: Some("deepseek-v4-flash-0731".to_string()),
+            }],
+            verbose: false,
+        };
+
+        // Trailing slash on base_url and custom path are handled.
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://chat.immers.cloud/v1/endpoints/generate/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_accepts_path_without_leading_slash() {
+        let config = Config {
+            port: 3000,
+            active_provider: "custom".to_string(),
+            providers: vec![ProviderConfig {
+                name: "custom".to_string(),
+                provider_type: ProviderType::OpenAICompatible,
+                base_url: Some("http://localhost:11434".to_string()),
+                chat_completions_path: Some("v1/chat/completions".to_string()),
+                api_key: None,
+                api_key_name: None,
+                reasoning_model: None,
+                completion_model: None,
+            }],
+            verbose: false,
+        };
+
+        assert_eq!(
+            config.chat_completions_url(),
+            "http://localhost:11434/v1/chat/completions"
+        );
     }
 }
