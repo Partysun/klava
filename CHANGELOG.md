@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.10] - 2026-09-23
+
+### Fixed
+
+- Codex (`/v1/responses`) requests now select the configured reasoning model when `reasoning.effort` is set (previously the model override never fired on the Responses path)
+- Non-streaming responses: provider `reasoning_content` (GLM/Qwen/CloudRu chain-of-thought) is now mapped to Anthropic `thinking` blocks and Responses API `reasoning` items; usage details (`thinking_tokens`, cached tokens) are propagated to both formats
+- Anthropic `tool_result` blocks with `is_error: true` now prefix the content with `Error:` (OpenAI tool messages have no error flag); string tool results are no longer quoted as JSON
+- Non-streaming `/v1/responses` responses now normalize upstream `chatcmpl-` ids to the standard `resp_` form and echo request parameters (`tools`, `tool_choice`, `temperature`, `top_p`, `truncation`, `parallel_tool_calls`, `store`, `metadata`, `instructions`, `service_tier`, `previous_response_id`)
+
 ## [0.2.9] - 2026-08-16
 
 ### Added
