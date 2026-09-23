@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
         active_provider: persistent.active_provider.clone(),
         providers: persistent.providers.clone(),
         verbose: persistent.verbose,
+        enable_pii: persistent.enable_pii,
+        enable_token_stats: persistent.enable_token_stats,
     };
 
     // Validate config and run interactive setup if needed
@@ -48,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     config.verbose = true;
 
     let config = Arc::new(config);
-    let hook_chain = Arc::new(default_chain());
+    let hook_chain = Arc::new(default_chain(&config));
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()?;

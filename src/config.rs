@@ -9,10 +9,20 @@ pub struct Config {
     pub port: u16,
     #[serde(default)]
     pub verbose: bool,
+    /// Scan request payloads for PII (emails, crypto addresses) and redact them.
+    #[serde(default = "default_enable_pii")]
+    pub enable_pii: bool,
+    /// Log an estimated token count for each request.
+    #[serde(default)]
+    pub enable_token_stats: bool,
     #[serde(default)]
     pub active_provider: String,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+}
+
+fn default_enable_pii() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -22,6 +32,8 @@ impl Default for Config {
             active_provider: "".to_string(),
             providers: vec![],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         }
     }
 }
@@ -109,6 +121,12 @@ impl Config {
 
 # Enable verbose logging (logs full request/response bodies)
 #verbose = false
+
+# Scan request payloads for PII (emails, crypto addresses) and redact them (default: true)
+#enable_pii = true
+
+# Log an estimated token count for each request (default: false)
+#enable_token_stats = false
 "#;
 
         fs::write(&path, template)?;
@@ -297,6 +315,8 @@ mod tests {
                 },
             ],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         };
 
         let active_config = config.get_active_provider_config().unwrap();
@@ -337,6 +357,8 @@ mod tests {
                 },
             ],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         };
 
         let provider_config = config.get_provider_config("second_provider").unwrap();
@@ -367,6 +389,8 @@ mod tests {
                 completion_model: Some("test-completion-model".to_string()),
             }],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         };
 
         let active_config = config.get_active_provider_config().unwrap();
@@ -390,6 +414,8 @@ mod tests {
                 completion_model: None,
             }],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         };
 
         assert_eq!(
@@ -416,6 +442,8 @@ mod tests {
                 completion_model: Some("deepseek-v4-flash-0731".to_string()),
             }],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         };
 
         // Trailing slash on base_url and custom path are handled.
@@ -441,6 +469,8 @@ mod tests {
                 completion_model: None,
             }],
             verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
         };
 
         assert_eq!(

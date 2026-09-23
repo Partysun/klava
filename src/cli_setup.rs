@@ -287,6 +287,8 @@ pub async fn build_config_interactive() -> Result<Config> {
         active_provider: persistent.active_provider.clone(),
         providers: persistent.providers.clone(),
         verbose: persistent.verbose,
+        enable_pii: persistent.enable_pii,
+        enable_token_stats: persistent.enable_token_stats,
     };
 
     Ok(resolved_config)

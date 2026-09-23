@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = cli_setup::build_config_interactive().await?;
 
-    let hook_chain = Arc::new(default_chain());
+    let hook_chain = Arc::new(default_chain(&config));
 
     match cli.command {
         Command::Launch {

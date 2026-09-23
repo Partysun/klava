@@ -69,8 +69,10 @@ impl Default for HookChain {
 /// Hook: Log the data at current stage (for debugging)
 /// Saves JSON to temp directory for analysis
 pub fn logging_hook(data: Value, _config: &Config) -> Result<Value> {
-    let json = serde_json::to_string_pretty(&data).unwrap_or_default();
-    tracing::trace!("Hook data: {}", json);
+    tracing::trace!(
+        "Hook data: {}",
+        serde_json::to_string_pretty(&data).unwrap_or_default()
+    );
     Ok(data)
 }
 
@@ -103,17 +105,28 @@ pub fn openai_to_anthropic_hook(data: Value, _config: &Config) -> Result<Value> 
     Ok(result)
 }
 
-/// Default hook chain with logging at all stages
-/// This creates a chain with logging hooks at appropriate stages
-pub fn default_chain() -> HookChain {
-    HookChain::new()
-        .with_hook(HookStage::RequestReceived, "logging", logging_hook)
-        .with_hook(HookStage::RequestReceived, "pii", pii_guardrail_hook)
-        .with_hook(
+/// Default hook chain with logging at all stages.
+///
+/// Heavy hooks (PII scan, token estimation) are registered only when the
+/// corresponding config option is enabled, keeping the default hot path
+/// lightweight — the PII analyzer is expensive on large payloads.
+pub fn default_chain(config: &Config) -> HookChain {
+    let mut chain = HookChain::new()
+        .with_hook(HookStage::RequestReceived, "logging", logging_hook);
+
+    if config.enable_pii {
+        chain = chain.with_hook(HookStage::RequestReceived, "pii", pii_guardrail_hook);
+    }
+
+    if config.enable_token_stats {
+        chain = chain.with_hook(
             HookStage::RequestReceived,
             "calculate_tokens",
             calculate_tokens_hook,
-        )
+        );
+    }
+
+    chain
         .with_hook(HookStage::BeforeTransform, "logging", logging_hook)
         .with_hook(
             HookStage::BeforeUpstream,
@@ -225,5 +238,36 @@ mod tests {
 
         let result = chain.execute(HookStage::RequestReceived, data, &config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_default_chain_gates_pii_and_token_stats() {
+        let enabled = Config::default();
+        assert!(enabled.enable_pii);
+        assert!(!enabled.enable_token_stats);
+
+        let chain = default_chain(&enabled);
+        let has_hook = |stage: HookStage, name: &str| {
+            chain.hooks.iter().any(|(s, n, _)| *s == stage && *n == name)
+        };
+
+        assert!(has_hook(HookStage::RequestReceived, "pii"));
+        assert!(!has_hook(HookStage::RequestReceived, "calculate_tokens"));
+
+        let disabled = Config {
+            port: 48017,
+            verbose: false,
+            enable_pii: false,
+            enable_token_stats: true,
+            active_provider: "".to_string(),
+            providers: vec![],
+        };
+        let chain = default_chain(&disabled);
+        let has_hook = |stage: HookStage, name: &str| {
+            chain.hooks.iter().any(|(s, n, _)| *s == stage && *n == name)
+        };
+
+        assert!(!has_hook(HookStage::RequestReceived, "pii"));
+        assert!(has_hook(HookStage::RequestReceived, "calculate_tokens"));
     }
 }
