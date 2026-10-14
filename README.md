@@ -35,9 +35,12 @@ klava launch
 klava launch claude
 klava launch claude --provider qwen
 klava launch opencode
+klava launch pi
 ```
 
 Notice: When launching opencode, you need to manually select the "klava" model using the model command in opencode after it starts.
+
+When launching pi, the klava provider is used by default with the active provider's model, so no manual selection is needed.
 
 Supported code agents:
 
@@ -45,6 +48,7 @@ Supported code agents:
 | ---------- | -------------- | ------------------------- |
 | `claude`   | Claude Code    | <https://code.claude.com> |
 | `opencode` | OpenCode Agent | <https://opencode.ai/>    |
+| `pi`       | Pi Agent       | <https://pi.dev>          |
 
 ### Configuration File Location
 

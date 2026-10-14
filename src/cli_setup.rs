@@ -257,8 +257,10 @@ impl InteractiveSetup {
     }
 }
 
-/// Build config with interactive setup on validation errors
-pub async fn build_config_interactive() -> Result<Config> {
+/// Build config with interactive setup on validation errors, showing
+/// an optional context message before the wizard (e.g. "klava launch
+/// needs an AI provider first") so the user understands why setup runs.
+pub async fn build_config_interactive_with_context(context: Option<&str>) -> Result<Config> {
     let persistent = match Config::load() {
         Ok(config) => config,
         Err(_) => {
@@ -273,6 +275,9 @@ pub async fn build_config_interactive() -> Result<Config> {
     if let Err(e) = persistent.validate_complete() {
         match e {
             Error::ActiveProviderNotSetup | Error::MissingBaseUrl | Error::MissingApiKey(_) => {
+                if let Some(context) = context {
+                    println!("\n{}", context);
+                }
                 let mut setup = InteractiveSetup::new(persistent);
                 return setup.run().await;
             }

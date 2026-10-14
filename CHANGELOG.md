@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.13] - 2026-10-14
+
+### Added
+
+- `klava launch pi` launches the Pi agent harness (https://pi.dev): `setup` registers a `klava` provider (OpenAI-chat-completions wire API) in `~/.pi/agent/models.json`, preserving existing providers, registering the active klava provider's completion and reasoning models (deduplicated) as selectable models. `~/.pi/agent/settings.json` gets `defaultProvider: "klava"` and `defaultModel: <active model>`, so pi starts on the klava proxy with the right model out of the box; `run` passes `--provider klava --model <active model>` as well
+
 ## [0.2.12] - 2026-09-23
 
 ### Fixed

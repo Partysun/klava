@@ -36,7 +36,22 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let mut config = cli_setup::build_config_interactive().await?;
+    // Explain why interactive setup runs when a command needs it
+    let setup_context = match &cli.command {
+        Command::Launch { agent, .. } => Some(match agent {
+            Some(agent) => format!(
+                "klava launch {} needs an AI provider first. Let's configure one, then we'll launch {}.",
+                agent.name(),
+                agent.name()
+            ),
+            None => {
+                "klava launch needs an AI provider first. Let's configure one now.".to_string()
+            }
+        }),
+        _ => None,
+    };
+
+    let mut config = cli_setup::build_config_interactive_with_context(setup_context.as_deref()).await?;
 
     let hook_chain = Arc::new(default_chain(&config));
 

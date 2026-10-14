@@ -1,6 +1,6 @@
 [package]
 name = "klava"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
@@ -92,9 +92,10 @@ rand = { version = "0.10", optional = true }
 
 # Optional feature flags
 [features]
-default = ["qwen-code", "opencode", "codex"]
+default = ["qwen-code", "opencode", "codex", "pi"]
 opencode = []
 codex = []
+pi = []
 telemetry = []
 qwen-code = ["dep:sha2", "dep:base64", "dep:rand"]
 

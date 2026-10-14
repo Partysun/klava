@@ -6,6 +6,9 @@ mod opencode;
 #[cfg(feature = "codex")]
 mod codex;
 
+#[cfg(feature = "pi")]
+mod pi;
+
 pub use claude::ClaudeRunner;
 
 #[cfg(feature = "opencode")]
@@ -13,6 +16,9 @@ pub use opencode::OpencodeRunner;
 
 #[cfg(feature = "codex")]
 pub use codex::CodexRunner;
+
+#[cfg(feature = "pi")]
+pub use pi::PiRunner;
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -47,6 +53,8 @@ pub enum CodeAgents {
     Opencode,
     #[cfg(feature = "codex")]
     Codex,
+    #[cfg(feature = "pi")]
+    Pi,
 }
 
 impl CodeAgents {
@@ -57,6 +65,8 @@ impl CodeAgents {
             CodeAgents::Opencode => OpencodeRunner::name_static(),
             #[cfg(feature = "codex")]
             CodeAgents::Codex => CodexRunner::name_static(),
+            #[cfg(feature = "pi")]
+            CodeAgents::Pi => PiRunner::name_static(),
         }
     }
 
@@ -67,6 +77,8 @@ impl CodeAgents {
             CodeAgents::Opencode => "OpenCode Agent",
             #[cfg(feature = "codex")]
             CodeAgents::Codex => "Codex Agent",
+            #[cfg(feature = "pi")]
+            CodeAgents::Pi => "Pi Agent (https://pi.dev)",
         }
     }
 
@@ -84,6 +96,12 @@ impl CodeAgents {
             v.push(CodeAgents::Codex);
             v
         };
+        #[cfg(feature = "pi")]
+        let variants = {
+            let mut v = variants;
+            v.push(CodeAgents::Pi);
+            v
+        };
         variants
     }
 
@@ -94,6 +112,8 @@ impl CodeAgents {
             CodeAgents::Opencode => OpencodeRunner::check_installation(),
             #[cfg(feature = "codex")]
             CodeAgents::Codex => CodexRunner::check_installation(),
+            #[cfg(feature = "pi")]
+            CodeAgents::Pi => PiRunner::check_installation(),
         }
     }
 
@@ -104,6 +124,8 @@ impl CodeAgents {
             CodeAgents::Opencode => OpencodeRunner::new().run(args, proxy_url).await,
             #[cfg(feature = "codex")]
             CodeAgents::Codex => CodexRunner::new().run(args, proxy_url).await,
+            #[cfg(feature = "pi")]
+            CodeAgents::Pi => PiRunner::new().run(args, proxy_url).await,
         }
     }
 
@@ -114,6 +136,8 @@ impl CodeAgents {
             CodeAgents::Opencode => OpencodeRunner::new().setup(proxy_url).await,
             #[cfg(feature = "codex")]
             CodeAgents::Codex => CodexRunner::new().setup(proxy_url).await,
+            #[cfg(feature = "pi")]
+            CodeAgents::Pi => PiRunner::new().setup(proxy_url).await,
         }
     }
 }

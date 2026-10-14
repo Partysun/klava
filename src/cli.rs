@@ -51,11 +51,13 @@ pub enum Command {
     /// the specified AI code agent with appropriate environment variables.
     #[command(after_help = "Supported code agents:\n  \
                      claude    Claude Code (https://code.claude.com)\n  \
-                     opencode  OpenCode Agent\n\n \
+                     opencode  OpenCode Agent\n  \
+                     pi        Pi Agent (https://pi.dev)\n\n \
                      Examples:\n  \
                      klava launch\n  \
                      klava launch claude\n  \
                      klava launch opencode\n  \
+                     klava launch pi\n  \
                      klava launch claude --config")]
     Launch {
         #[arg(value_enum, help = "The code agent to launch")]
