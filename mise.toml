@@ -1,5 +1,6 @@
 [tools]
 rust = "stable"
+jj = "0.45.1"
 
 [tasks.test-watch]
 description = "Auto-run tests when files change"
