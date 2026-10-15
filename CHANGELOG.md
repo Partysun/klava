@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.17] - 2026-10-15
+
+### Fixed
+
+- PII guardrail no longer corrupts base64 image payloads. The request is serialized to one JSON string before redaction, so a `CryptoAddress`-shaped run inside an image's base64 (e.g. a 40-hex-char `0x…` sequence) was replaced with `<CryptoAddress>`, making the data URL invalid and the provider reject the whole request with `Invalid image data URL in messages[].content[].image_url.url: payload is not base64-encoded data`. Inline payloads are now masked with inert placeholders before redaction and restored afterwards. Only genuine encoded fields are masked (OpenAI/Responses `image_url` data URLs and Anthropic `{"type":"base64","data":…}` image sources), so secrets in code — including text next to a `;base64,`-looking literal — are still redacted.
+- `/v1/messages`: image blocks are now converted to a valid `data:<media-type>;base64,<data>` URL. The header was previously emitted as `;base,` (missing `64`), so the provider could not decode the image.
+
 ## [0.2.16] - 2026-10-15
 
 ### Fixed

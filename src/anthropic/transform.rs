@@ -171,7 +171,7 @@ fn convert_message(msg: anthropic::Message) -> Result<Vec<openai::Message>> {
                         current_content_parts.push(openai::ContentPart::Text { text });
                     }
                     anthropic::ContentBlock::Image { source } => {
-                        let data_url = format!("data:{};base,{}", source.media_type, source.data);
+                        let data_url = format!("data:{};base64,{}", source.media_type, source.data);
                         current_content_parts.push(openai::ContentPart::ImageUrl {
                             image_url: openai::ImageUrl { url: data_url },
                         });
@@ -389,6 +389,29 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_image_block_becomes_base64_data_url() {
+        let msg = anthropic::Message {
+            role: "user".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![anthropic::ContentBlock::Image {
+                source: anthropic::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                },
+            }]),
+        };
+
+        let converted = convert_message(msg).unwrap();
+        let Some(openai::MessageContent::Parts(parts)) = &converted[0].content else {
+            panic!("expected content parts, got {:?}", converted[0].content);
+        };
+        let Some(openai::ContentPart::ImageUrl { image_url }) = parts.first() else {
+            panic!("expected an image part, got {parts:?}");
+        };
+        assert_eq!(image_url.url, "data:image/png;base64,iVBORw0KGgo=");
+    }
 
     #[test]
     fn test_clean_schema_removes_uri_format() {
