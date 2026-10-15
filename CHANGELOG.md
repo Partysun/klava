@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.15] - 2026-10-15
+
+### Fixed
+
+- `klava login` stores the catalog `openrouter_id` (e.g. `~deepseek/deepseek-flash-latest`) as the default model instead of the internal record id, fixing "is not a valid model ID" errors from the proxy; the non-interactive (`$KLAVA_MODEL`) and interactive model pickers now select the same ID the chat endpoint accepts
+- `klava balance` and `klava whoami` parse the balance amount whether the server sends it as a JSON number or a decimal string; `whoami` reads the working `/v1/balance` endpoint instead of `/v1/me` (which the server does not expose)
+
 ## [0.2.13] - 2026-10-14
 
 ### Added

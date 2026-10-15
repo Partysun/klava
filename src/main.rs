@@ -831,17 +831,17 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
             } else if !interactive {
                 enabled
                     .iter()
-                    .find(|m| m.id.contains("deepseek-flash"))
-                    .or_else(|| enabled.iter().find(|m| m.id.contains("deepseek")))
+                    .find(|m| m.chat_id().contains("deepseek-flash"))
+                    .or_else(|| enabled.iter().find(|m| m.chat_id().contains("deepseek")))
                     .or(enabled.first())
-                    .map(|m| m.id.clone())
+                    .map(|m| m.chat_id())
             } else {
                 let options: Vec<String> = enabled
                     .iter()
                     .map(|m| {
                         format!(
                             "{}  {}",
-                            m.id,
+                            m.chat_id(),
                             if m.label.is_empty() {
                                 m.openrouter_id.as_str()
                             } else {
@@ -852,8 +852,8 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
                     .collect();
                 let default_idx = enabled
                     .iter()
-                    .position(|m| m.id.contains("deepseek-flash"))
-                    .or_else(|| enabled.iter().position(|m| m.id.contains("deepseek")))
+                    .position(|m| m.chat_id().contains("deepseek-flash"))
+                    .or_else(|| enabled.iter().position(|m| m.chat_id().contains("deepseek")))
                     .unwrap_or(0);
                 let selected =
                     Select::new("Select the default model for the klava provider:", options)
@@ -865,7 +865,7 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
                     .find(|m| {
                         format!(
                             "{}  {}",
-                            m.id,
+                            m.chat_id(),
                             if m.label.is_empty() {
                                 m.openrouter_id.as_str()
                             } else {
@@ -873,7 +873,7 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
                             }
                         ) == selected
                     })
-                    .map(|m| m.id.clone())
+                    .map(|m| m.chat_id())
                     .or_else(|| Some(selected.split("  ").next().unwrap_or("").to_string()))
             }
         }
@@ -996,15 +996,15 @@ async fn handle_klava_whoami() -> anyhow::Result<()> {
         println!("  Account: {}", creds.email);
     }
 
-    match auth.me().await {
-        Ok(me) => {
+    match auth.balance().await {
+        Ok(balance) => {
             println!(
                 "  Balance: {} {}",
-                format_rub(&me.amount_rub),
-                if me.currency.is_empty() {
+                format_rub(balance.amount_rub),
+                if balance.currency.is_empty() {
                     "RUB".to_string()
                 } else {
-                    me.currency
+                    balance.currency
                 }
             );
         }
@@ -1028,7 +1028,7 @@ async fn handle_klava_balance() -> anyhow::Result<()> {
 
     println!(
         "Balance: {} {}",
-        format_rub(&balance.amount_rub),
+        format_rub(balance.amount_rub),
         if balance.currency.is_empty() {
             "RUB".to_string()
         } else {
@@ -1038,11 +1038,10 @@ async fn handle_klava_balance() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Format a money string from the proxy ("1234.000000") for display.
+/// Format a money amount from the proxy ("1234.000000" / 1234.0) for display.
 #[cfg(feature = "klava")]
-fn format_rub(raw: &str) -> String {
-    let v: f64 = raw.parse().unwrap_or(0.0);
-    let s = format!("{v:.2}");
+fn format_rub(raw: f64) -> String {
+    let s = format!("{raw:.2}");
     let (int_part, frac) = s.split_once('.').unwrap_or((&s, "00"));
     let mut out = String::new();
     let chars: Vec<char> = int_part.chars().collect();
@@ -1219,5 +1218,13 @@ mod tests {
                 _ => panic!("Expected config command"),
             }
         }
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn format_rub_formats_thousands_and_decimals() {
+        assert_eq!(format_rub(0.0), "0,00");
+        assert_eq!(format_rub(1234.0), "1 234,00");
+        assert_eq!(format_rub(9411.823457), "9 411,82");
     }
 }

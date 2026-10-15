@@ -35,6 +35,39 @@ pub struct KlavaModel {
     pub enabled: bool,
 }
 
+impl KlavaModel {
+    /// The model ID accepted by the chat completions endpoint. The catalog's
+    /// `id` is a backend record ID, not a valid model — `openrouter_id` is.
+    pub fn chat_id(&self) -> String {
+        if self.openrouter_id.is_empty() {
+            self.id.clone()
+        } else {
+            self.openrouter_id.clone()
+        }
+    }
+}
+
+/// Deserialize a money amount that the backend may send either as a JSON
+/// number (`9411.823457`) or as a decimal string (`"9411.823457"`).
+fn deserialize_amount<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Amount {
+        Number(f64),
+        Text(String),
+    }
+    match Amount::deserialize(d)? {
+        Amount::Number(n) => Ok(n),
+        Amount::Text(s) => s
+            .trim()
+            .parse()
+            .map_err(|_| serde::de::Error::custom(format!("invalid amount: {s:?}"))),
+    }
+}
+
 /// `GET /v1/me` — authenticated user identity plus balance.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KlavaMe {
@@ -42,8 +75,8 @@ pub struct KlavaMe {
     pub email: String,
     #[serde(default)]
     pub key_name: String,
-    #[serde(default)]
-    pub amount_rub: String,
+    #[serde(default, deserialize_with = "deserialize_amount")]
+    pub amount_rub: f64,
     #[serde(default)]
     pub currency: String,
 }
@@ -51,8 +84,8 @@ pub struct KlavaMe {
 /// `GET /v1/balance` response.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KlavaBalance {
-    #[serde(default)]
-    pub amount_rub: String,
+    #[serde(default, deserialize_with = "deserialize_amount")]
+    pub amount_rub: f64,
     #[serde(default)]
     pub currency: String,
 }
@@ -678,5 +711,60 @@ mod tests {
         let name = auth.client_name().unwrap();
         assert!(name.starts_with("klava-cli ("));
         assert!(name.ends_with(')'));
+    }
+
+    #[test]
+    fn test_balance_deserializes_numeric_amount() {
+        let balance: KlavaBalance =
+            serde_json::from_str(r#"{"amount_rub": 9411.823457, "currency": "RUB"}"#).unwrap();
+        assert_eq!(balance.amount_rub, 9411.823457);
+        assert_eq!(balance.currency, "RUB");
+    }
+
+    #[test]
+    fn test_balance_deserializes_string_amount() {
+        let balance: KlavaBalance =
+            serde_json::from_str(r#"{"amount_rub": "9411.823457", "currency": "RUB"}"#).unwrap();
+        assert_eq!(balance.amount_rub, 9411.823457);
+        assert_eq!(balance.currency, "RUB");
+    }
+
+    #[test]
+    fn test_me_deserializes_numeric_amount() {
+        let me: KlavaMe = serde_json::from_str(
+            r#"{"email":"a@b.c","amount_rub": 1234.0,"usd_rub_rate": 83.9497,"currency":"RUB"}"#,
+        )
+        .unwrap();
+        assert_eq!(me.amount_rub, 1234.0);
+        assert_eq!(me.email, "a@b.c");
+    }
+
+    #[test]
+    fn test_balance_deserializes_missing_amount() {
+        let balance: KlavaBalance = serde_json::from_str(r#"{"currency": "RUB"}"#).unwrap();
+        assert_eq!(balance.amount_rub, 0.0);
+        assert_eq!(balance.currency, "RUB");
+    }
+
+    #[test]
+    fn test_chat_id_prefers_openrouter_id() {
+        let model = KlavaModel {
+            id: "o7gii3jijhxnxf3".to_string(),
+            openrouter_id: "~deepseek/deepseek-flash-latest".to_string(),
+            label: "DeepSeek Flash (latest)".to_string(),
+            enabled: true,
+        };
+        assert_eq!(model.chat_id(), "~deepseek/deepseek-flash-latest");
+    }
+
+    #[test]
+    fn test_chat_id_falls_back_to_record_id() {
+        let model = KlavaModel {
+            id: "qbpfc4hl61d0hls".to_string(),
+            openrouter_id: String::new(),
+            label: String::new(),
+            enabled: true,
+        };
+        assert_eq!(model.chat_id(), "qbpfc4hl61d0hls");
     }
 }
