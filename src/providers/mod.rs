@@ -8,8 +8,7 @@ mod qwen;
 use serde::{Deserialize, Serialize};
 
 /// Provider type enum for configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum Type {
     #[serde(rename = "openai-compatible")]
     #[serde(alias = "openai")]
@@ -18,8 +17,10 @@ pub enum Type {
     #[cfg(feature = "qwen-code")]
     #[serde(rename = "qwen-code")]
     QwenCode,
+    #[cfg(feature = "klava")]
+    #[serde(rename = "klava")]
+    Klava,
 }
-
 
 impl Type {
     pub fn parse(name: &str) -> Option<Self> {
@@ -27,6 +28,8 @@ impl Type {
             "openai-compatible" | "openai" | "default" => Some(Self::OpenAICompatible),
             #[cfg(feature = "qwen-code")]
             "qwen-code" | "qwen" => Some(Self::QwenCode),
+            #[cfg(feature = "klava")]
+            "klava" => Some(Self::Klava),
             _ => None,
         }
     }
@@ -36,6 +39,8 @@ impl Type {
             Self::OpenAICompatible => "openai-compatible",
             #[cfg(feature = "qwen-code")]
             Self::QwenCode => "qwen-code",
+            #[cfg(feature = "klava")]
+            Self::Klava => "klava",
         }
     }
 }
@@ -62,3 +67,6 @@ pub struct Config {
 
 pub use crate::qwen_auth::QwenAuth;
 pub use qwen::setup as setup_qwen;
+
+#[cfg(feature = "klava")]
+pub use crate::klava_auth::KlavaAuth;

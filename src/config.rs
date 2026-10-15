@@ -115,6 +115,12 @@ impl Config {
 # name = "qwen"
 # type = "qwen-code"
 
+# Klava provider (klava.zatsepin.dev) — sign in with `klava login` (browser
+# device OAuth). The key and default model are written automatically.
+# [[providers]]
+# name = "klava"
+# type = "klava"
+
 # Port to listen on (default: 48017)
 # Can also be set via PORT env var
 #port = 48017
@@ -433,9 +439,7 @@ mod tests {
                 name: "immerse".to_string(),
                 provider_type: ProviderType::OpenAICompatible,
                 base_url: Some("https://chat.immers.cloud/".to_string()),
-                chat_completions_path: Some(
-                    "/v1/endpoints/generate/chat/completions".to_string(),
-                ),
+                chat_completions_path: Some("/v1/endpoints/generate/chat/completions".to_string()),
                 api_key: None,
                 api_key_name: Some("IMMERSE_TOKEN".to_string()),
                 reasoning_model: Some("deepseek-v4-flash-0731".to_string()),

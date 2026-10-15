@@ -92,12 +92,13 @@ rand = { version = "0.10", optional = true }
 
 # Optional feature flags
 [features]
-default = ["qwen-code", "opencode", "codex", "pi"]
+default = ["qwen-code", "klava", "opencode", "codex", "pi"]
 opencode = []
 codex = []
 pi = []
 telemetry = []
 qwen-code = ["dep:sha2", "dep:base64", "dep:rand"]
+klava = ["dep:sha2", "dep:base64", "dep:rand"]
 
 # Examples using qwen-code feature
 [[example]]

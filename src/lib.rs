@@ -18,4 +18,7 @@ pub mod utils;
 #[cfg(feature = "qwen-code")]
 pub mod qwen_auth;
 
+#[cfg(feature = "klava")]
+pub mod klava_auth;
+
 pub use config::Config;

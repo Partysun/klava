@@ -14,6 +14,8 @@ impl ProvidersConfig {
             }
             #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => "Qwen Code (Free*) with OAuth authentication",
+            #[cfg(feature = "klava")]
+            ProviderType::Klava => "Klava (klava.zatsepin.dev) with device-flow login",
         }
     }
 
@@ -32,6 +34,8 @@ impl ProvidersConfig {
         match self.provider_type {
             #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
+            #[cfg(feature = "klava")]
+            ProviderType::Klava => Some("https://klava.zatsepin.dev/api".to_string()),
             _ => None,
         }
     }
@@ -85,6 +89,14 @@ impl ProvidersConfig {
                     .map(Some)
                     .map_err(|e| Error::Provider(format!("Qwen auth failed: {}", e)))
             }
+            #[cfg(feature = "klava")]
+            ProviderType::Klava => {
+                let mut klava_auth = crate::klava_auth::KlavaAuth::new();
+                klava_auth
+                    .get_auth_headers()
+                    .map(Some)
+                    .map_err(|e| Error::Provider(format!("Klava auth failed: {}", e)))
+            }
         }
     }
 
@@ -120,6 +132,11 @@ impl ProvidersConfig {
             ProviderType::QwenCode => {
                 // Qwen uses OAuth, no config validation needed
             }
+            #[cfg(feature = "klava")]
+            ProviderType::Klava => {
+                // Klava uses OAuth: the API key comes from the local auth
+                // file (klava login) — nothing to validate in the config.
+            }
         }
         Ok(())
     }
@@ -130,6 +147,8 @@ impl ProvidersConfig {
             ProviderType::OpenAICompatible => self.base_url.clone(),
             #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
+            #[cfg(feature = "klava")]
+            ProviderType::Klava => Some("https://klava.zatsepin.dev/api".to_string()),
         }
     }
 
@@ -189,9 +208,7 @@ mod tests {
                 Some("/v1/endpoints/generate/chat/completions")
             )
             .chat_completions_url(),
-            Some(
-                "https://chat.immers.cloud/v1/endpoints/generate/chat/completions".to_string()
-            )
+            Some("https://chat.immers.cloud/v1/endpoints/generate/chat/completions".to_string())
         );
     }
 

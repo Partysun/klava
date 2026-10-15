@@ -198,4 +198,35 @@ pub enum Command {
         #[arg(short, long, value_name = "MODEL", help = "Model to check with")]
         model: Option<String>,
     },
+
+    /// Sign in to the Klava provider (device OAuth flow)
+    ///
+    /// Opens a browser for authorization and saves the minted API key
+    /// locally; also configures the default model from the catalog.
+    #[command(after_help = "Examples:\n  \
+                     klava login\n  \
+                     klava login --force")]
+    Login {
+        /// Re-authenticate even if already signed in
+        #[arg(long, help = "Re-authenticate even if already signed in")]
+        force: bool,
+    },
+
+    /// Sign out from the Klava provider and revoke the API key
+    #[command(after_help = "Examples:\n  \
+                     klava logout\n  \
+                     klava logout --force")]
+    Logout {
+        /// Skip the confirmation prompt
+        #[arg(long, help = "Skip the confirmation prompt")]
+        force: bool,
+    },
+
+    /// Show the current Klava session (account, key, balance)
+    #[command(after_help = "Examples:\n  klava whoami")]
+    Whoami {},
+
+    /// Show the Klava account balance
+    #[command(after_help = "Examples:\n  klava balance")]
+    Balance {},
 }

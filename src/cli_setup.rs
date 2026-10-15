@@ -49,6 +49,15 @@ impl InteractiveSetup {
             klava::providers::Type::OpenAICompatible => {
                 self.setup_default().await?;
             }
+            #[cfg(feature = "klava")]
+            klava::providers::Type::Klava => {
+                // No interactive prompts: authentication and model selection
+                // happen in `klava login` (browser device flow).
+                println!("\nKlava uses browser-based login.");
+                println!("  • Run `klava login` after setup to authenticate");
+                println!("  • Or set it as the provider with: klava providers klava login");
+                println!();
+            }
         }
 
         self.display_summary();
@@ -68,20 +77,29 @@ impl InteractiveSetup {
         println!("\nNo provider configured.");
         println!();
 
-        let options: Vec<String> =
-            vec!["OpenAI-compatible (OpenRouter, OpenAI, DeepSeek, etc.)".to_string()];
+        let options: Vec<String> = vec![
+            "Klava (klava.zatsepin.dev, browser login)".to_string(),
+            "OpenAI-compatible (OpenRouter, OpenAI, DeepSeek, etc.)".to_string(),
+        ];
 
         let selected = Select::new("Select a provider to configure:", options)
             .prompt()
             .map_err(|e| anyhow!("Failed to select provider: {}", e))?;
 
-        let (provider_name, provider_type) = if selected.contains("OpenAI") {
+        use klava::providers::Type;
+        #[allow(unreachable_patterns)]
+        let (provider_name, provider_type) = if selected.starts_with("Klava") {
             (
-                "openai-compatible".to_string(),
-                klava::providers::Type::OpenAICompatible,
+                "klava".to_string(),
+                #[cfg(feature = "klava")]
+                Type::Klava,
+                #[cfg(not(feature = "klava"))]
+                Type::OpenAICompatible,
             )
+        } else if selected.contains("OpenAI") {
+            ("openai-compatible".to_string(), Type::OpenAICompatible)
         } else {
-            ("qwen".to_string(), klava::providers::Type::QwenCode)
+            ("qwen".to_string(), Type::QwenCode)
         };
 
         // Set as active provider and add to providers list

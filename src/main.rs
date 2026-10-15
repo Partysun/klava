@@ -44,14 +44,13 @@ async fn main() -> anyhow::Result<()> {
                 agent.name(),
                 agent.name()
             ),
-            None => {
-                "klava launch needs an AI provider first. Let's configure one now.".to_string()
-            }
+            None => "klava launch needs an AI provider first. Let's configure one now.".to_string(),
         }),
         _ => None,
     };
 
-    let mut config = cli_setup::build_config_interactive_with_context(setup_context.as_deref()).await?;
+    let mut config =
+        cli_setup::build_config_interactive_with_context(setup_context.as_deref()).await?;
 
     let hook_chain = Arc::new(default_chain(&config));
 
@@ -101,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
                 match selected_provider.provider_type {
                     klava::providers::Type::QwenCode => {
                         handle_qwen_authentication().await?;
+                    }
+                    #[cfg(feature = "klava")]
+                    klava::providers::Type::Klava => {
+                        ensure_klava_authenticated(false).await?;
                     }
                     klava::providers::Type::OpenAICompatible => {
                         // Validate OpenAI-compatible provider config
@@ -286,6 +289,10 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Login { force } => handle_klava_login(force).await,
+        Command::Logout { force } => handle_klava_logout(force).await,
+        Command::Whoami {} => handle_klava_whoami().await,
+        Command::Balance {} => handle_klava_balance().await,
     }
 }
 
@@ -372,6 +379,10 @@ async fn ensure_provider_ready(config: &config::Config) -> anyhow::Result<()> {
     match active_provider_config.provider_type {
         klava::providers::Type::QwenCode => {
             handle_qwen_authentication().await?;
+        }
+        #[cfg(feature = "klava")]
+        klava::providers::Type::Klava => {
+            ensure_klava_authenticated(false).await?;
         }
         klava::providers::Type::OpenAICompatible => {
             active_provider_config.validate_config(config)?;
@@ -465,10 +476,12 @@ async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
 
     match subcommand.as_deref() {
         Some("login") => {
+            let force = flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
+            if provider_name.as_deref() == Some("klava") {
+                return handle_klava_login(force).await;
+            }
             #[cfg(feature = "qwen-code")]
             {
-                let force =
-                    flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
                 handle_qwen_login(force).await?;
             }
             #[cfg(not(feature = "qwen-code"))]
@@ -477,10 +490,12 @@ async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
             }
         }
         Some("logout") => {
+            let force = flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
+            if provider_name.as_deref() == Some("klava") {
+                return handle_klava_logout(force).await;
+            }
             #[cfg(feature = "qwen-code")]
             {
-                let force =
-                    flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
                 handle_qwen_logout(force).await?;
             }
             #[cfg(not(feature = "qwen-code"))]
@@ -489,6 +504,9 @@ async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
             }
         }
         Some("status") => {
+            if provider_name.as_deref() == Some("klava") {
+                return handle_klava_status().await;
+            }
             #[cfg(feature = "qwen-code")]
             {
                 handle_qwen_status().await?;
@@ -524,7 +542,7 @@ async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
                     })?;
 
                 save_provider_config(selected_provider)?;
-                handle_qwen_provider_switch(&selected_provider.name).await?;
+                handle_provider_switch(&selected_provider.name).await?;
             } else {
                 // Show current and prompt to choose
                 let current_config = config::Config::load()?;
@@ -567,7 +585,7 @@ async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("Failed to determine selected provider"))?;
 
                 save_provider_config(selected_provider)?;
-                handle_qwen_provider_switch(&selected_provider.name).await?;
+                handle_provider_switch(&selected_provider.name).await?;
             }
         }
         Some(other) => anyhow::bail!(
@@ -609,6 +627,14 @@ async fn handle_qwen_provider_switch(provider_name: &str) -> anyhow::Result<()> 
     }
 
     Ok(())
+}
+
+/// Dispatch the "set provider" post-switch hook to the right provider.
+async fn handle_provider_switch(provider_name: &str) -> anyhow::Result<()> {
+    if provider_name == "klava" {
+        return handle_klava_login(false).await;
+    }
+    handle_qwen_provider_switch(provider_name).await
 }
 
 /// Handle qwen provider switch (no-op when feature not enabled)
@@ -748,6 +774,311 @@ async fn handle_qwen_status() -> anyhow::Result<()> {
         println!("  Login with: klava providers qwen login");
     }
     Ok(())
+}
+
+// ============================================================
+// Klava provider commands (feature "klava")
+// ============================================================
+
+/// Ensure the Klava provider is authenticated, running the device login
+/// when no local session exists.
+#[cfg(feature = "klava")]
+async fn ensure_klava_authenticated(force: bool) -> anyhow::Result<()> {
+    use klava::klava_auth::KlavaAuth;
+
+    let mut auth = KlavaAuth::new();
+    if auth.is_authenticated() && !force {
+        return Ok(());
+    }
+    if force {
+        println!("⚠️  Re-authenticating Klava...");
+    }
+    handle_klava_login(force).await
+}
+
+/// `klava login` / `klava providers klava login` — device flow, then write
+/// the provider config (models, base URL) and activate it.
+#[cfg(feature = "klava")]
+async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
+    use inquire::Select;
+    use klava::klava_auth::KlavaAuth;
+    use klava::providers::Type;
+
+    let mut auth = KlavaAuth::new();
+
+    if !force && auth.is_authenticated() {
+        println!("Already signed in to Klava.");
+        println!("Use --force to re-authenticate.");
+        return Ok(());
+    }
+
+    let credentials = auth.authenticate().await?;
+
+    // Pick the default model from the live catalog. Interactive selection
+    // only when stdin is a TTY; otherwise honor $KLAVA_MODEL or fall back to
+    // the first enabled deepseek model.
+    use std::io::IsTerminal;
+    let env_model = std::env::var("KLAVA_MODEL").ok().filter(|m| !m.is_empty());
+    let interactive = std::io::stdin().is_terminal() && env_model.is_none();
+
+    let model: Option<String> = match auth.models().await {
+        Ok(models) => {
+            let enabled: Vec<_> = models.into_iter().filter(|m| m.enabled).collect();
+            if enabled.is_empty() {
+                None
+            } else if let Some(m) = env_model {
+                Some(m)
+            } else if !interactive {
+                enabled
+                    .iter()
+                    .find(|m| m.id.contains("deepseek-flash"))
+                    .or_else(|| enabled.iter().find(|m| m.id.contains("deepseek")))
+                    .or(enabled.first())
+                    .map(|m| m.id.clone())
+            } else {
+                let options: Vec<String> = enabled
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{}  {}",
+                            m.id,
+                            if m.label.is_empty() {
+                                m.openrouter_id.as_str()
+                            } else {
+                                m.label.as_str()
+                            }
+                        )
+                    })
+                    .collect();
+                let default_idx = enabled
+                    .iter()
+                    .position(|m| m.id.contains("deepseek-flash"))
+                    .or_else(|| enabled.iter().position(|m| m.id.contains("deepseek")))
+                    .unwrap_or(0);
+                let selected =
+                    Select::new("Select the default model for the klava provider:", options)
+                        .with_starting_cursor(default_idx)
+                        .prompt()
+                        .map_err(|e| anyhow::anyhow!("Failed to select model: {}", e))?;
+                enabled
+                    .iter()
+                    .find(|m| {
+                        format!(
+                            "{}  {}",
+                            m.id,
+                            if m.label.is_empty() {
+                                m.openrouter_id.as_str()
+                            } else {
+                                m.label.as_str()
+                            }
+                        ) == selected
+                    })
+                    .map(|m| m.id.clone())
+                    .or_else(|| Some(selected.split("  ").next().unwrap_or("").to_string()))
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Could not fetch model catalog: {}", e);
+            None
+        }
+    };
+    let mut config = config::Config::load()?;
+
+    let entry = config.providers.iter_mut().find(|p| p.name == "klava");
+    if let Some(provider) = entry {
+        provider.provider_type = Type::Klava;
+        provider.base_url = Some(format!("{}/api", auth.base_url()));
+        if let Some(m) = &model {
+            provider.reasoning_model = Some(m.clone());
+            provider.completion_model = Some(m.clone());
+        }
+    } else {
+        config.providers.push(klava::providers::Config {
+            name: "klava".to_string(),
+            provider_type: Type::Klava,
+            base_url: Some(format!("{}/api", auth.base_url())),
+            chat_completions_path: None,
+            api_key: None,
+            api_key_name: None,
+            reasoning_model: model.clone(),
+            completion_model: model,
+        });
+    }
+    config.active_provider = "klava".to_string();
+    config.save()?;
+
+    println!("✓ Provider 'klava' configured and set as active.");
+    if !credentials.email.is_empty() {
+        println!("  Account: {}", credentials.email);
+    }
+    if credentials.key_preview.is_empty() {
+        println!("  Key: {}", credentials.api_key);
+    } else {
+        println!(
+            "  Key: {} ({} chars)",
+            credentials.key_preview,
+            credentials.api_key.chars().count()
+        );
+    }
+    println!();
+    println!("Next steps:");
+    println!("  klava whoami     — account + balance");
+    println!("  klava launch pi  — start an agent on the klava provider");
+    Ok(())
+}
+
+/// `klava logout` / `klava providers klava logout` — revoke + clear.
+#[cfg(feature = "klava")]
+async fn handle_klava_logout(force: bool) -> anyhow::Result<()> {
+    use inquire::Confirm;
+    use klava::klava_auth::KlavaAuth;
+
+    let mut auth = KlavaAuth::new();
+    if !auth.is_authenticated() {
+        println!("Not signed in to Klava.");
+        return Ok(());
+    }
+
+    if !force {
+        let confirmed =
+            Confirm::new("Revoke the KLava API key on the server and sign out locally?")
+                .with_default(false)
+                .prompt()
+                .map_err(|e| anyhow::anyhow!("Failed to get confirmation: {}", e))?;
+        if !confirmed {
+            println!("Logout cancelled.");
+            return Ok(());
+        }
+    }
+
+    auth.logout(true).await?;
+    println!("✅ Signed out from Klava");
+    Ok(())
+}
+
+/// `klava providers klava status` — local session state.
+#[cfg(feature = "klava")]
+async fn handle_klava_status() -> anyhow::Result<()> {
+    use klava::klava_auth::KlavaAuth;
+
+    let mut auth = KlavaAuth::new();
+    println!("Klava authentication:");
+    match auth.get_credentials() {
+        Some(creds) => {
+            println!("  Status: ✓ Authenticated");
+            println!("  Key: {}", creds.key_preview);
+            if !creds.email.is_empty() {
+                println!("  Account: {}", creds.email);
+            }
+            println!("  Key saved at: ~/.local/share/klava/klava-auth.json");
+        }
+        None => {
+            println!("  Status: ✗ Not signed in");
+            println!("  Login with: klava login");
+        }
+    }
+    Ok(())
+}
+
+/// `klava whoami` — account email, key preview and balance.
+#[cfg(feature = "klava")]
+async fn handle_klava_whoami() -> anyhow::Result<()> {
+    use klava::klava_auth::KlavaAuth;
+
+    let mut auth = KlavaAuth::new();
+    let creds = auth
+        .get_credentials()
+        .ok_or_else(|| anyhow::anyhow!("Not signed in to Klava. Run: klava login"))?;
+
+    println!("Klava session:");
+    println!("  Key: {}", creds.key_preview);
+    if !creds.email.is_empty() {
+        println!("  Account: {}", creds.email);
+    }
+
+    match auth.me().await {
+        Ok(me) => {
+            println!(
+                "  Balance: {} {}",
+                format_rub(&me.amount_rub),
+                if me.currency.is_empty() {
+                    "RUB".to_string()
+                } else {
+                    me.currency
+                }
+            );
+        }
+        Err(e) => {
+            println!("  Balance: unavailable ({})", e);
+        }
+    }
+    Ok(())
+}
+
+/// `klava balance` — the prepaid RUB balance of the current account.
+#[cfg(feature = "klava")]
+async fn handle_klava_balance() -> anyhow::Result<()> {
+    use klava::klava_auth::KlavaAuth;
+
+    let mut auth = KlavaAuth::new();
+    let balance = auth
+        .balance()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to load balance: {}", e))?;
+
+    println!(
+        "Balance: {} {}",
+        format_rub(&balance.amount_rub),
+        if balance.currency.is_empty() {
+            "RUB".to_string()
+        } else {
+            balance.currency
+        }
+    );
+    Ok(())
+}
+
+/// Format a money string from the proxy ("1234.000000") for display.
+#[cfg(feature = "klava")]
+fn format_rub(raw: &str) -> String {
+    let v: f64 = raw.parse().unwrap_or(0.0);
+    let s = format!("{v:.2}");
+    let (int_part, frac) = s.split_once('.').unwrap_or((&s, "00"));
+    let mut out = String::new();
+    let chars: Vec<char> = int_part.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && (chars.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(*c);
+    }
+    format!("{out},{frac}")
+}
+
+// Fallbacks when the klava feature is disabled.
+#[cfg(not(feature = "klava"))]
+async fn handle_klava_login(_force: bool) -> anyhow::Result<()> {
+    anyhow::bail!("klava feature is not enabled in this build")
+}
+
+#[cfg(not(feature = "klava"))]
+async fn handle_klava_logout(_force: bool) -> anyhow::Result<()> {
+    anyhow::bail!("klava feature is not enabled in this build")
+}
+
+#[cfg(not(feature = "klava"))]
+async fn handle_klava_status() -> anyhow::Result<()> {
+    anyhow::bail!("klava feature is not enabled in this build")
+}
+
+#[cfg(not(feature = "klava"))]
+async fn handle_klava_whoami() -> anyhow::Result<()> {
+    anyhow::bail!("klava feature is not enabled in this build")
+}
+
+#[cfg(not(feature = "klava"))]
+async fn handle_klava_balance() -> anyhow::Result<()> {
+    anyhow::bail!("klava feature is not enabled in this build")
 }
 
 /// Handle providers command
