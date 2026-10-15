@@ -90,9 +90,10 @@ impl ChatChunkConverter for OpenaiPassthrough {
             .choices
             .first()
             .and_then(|c| c.finish_reason.as_deref())
-            && (reason == "stop" || reason == "tool_calls" || reason == "length") {
-                self.completed = true;
-            }
+            && (reason == "stop" || reason == "tool_calls" || reason == "length")
+        {
+            self.completed = true;
+        }
 
         // Fix null id/type for tool calls
         let fixed_chunk = self.fix_null_fields(chunk);

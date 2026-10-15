@@ -5,18 +5,35 @@ use crate::utils::{anthropic_to_openai_id, openai_to_anthropic_id, openai_to_too
 use serde_json::{Value, json};
 
 /// Transform Anthropic request to OpenAI format
+/// Map an Anthropic `tool_choice` onto the OpenAI Chat Completions shape.
+/// Anthropic's `any` is OpenAI's `required`; a named tool nests under
+/// `function`. Returns `None` for unrecognized values.
+fn anthropic_tool_choice_to_openai(tool_choice: &Value) -> Option<Value> {
+    match tool_choice.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(json!("auto")),
+        Some("any") => Some(json!("required")),
+        Some("none") => Some(json!("none")),
+        Some("tool") => tool_choice
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| json!({ "type": "function", "function": { "name": name } })),
+        _ => None,
+    }
+}
+
 pub fn anthropic_to_openai(
     req: anthropic::AnthropicRequest,
     reasoning_model: Option<String>,
     completion_model: Option<String>,
 ) -> Result<openai::OpenAIRequest> {
-    // Determine model based on thinking parameter
+    // Thinking is requested when `thinking.type` is `enabled` or the newer
+    // `adaptive`. `disabled` (and an absent block) mean no thinking.
     let has_thinking = req
         .extra
         .get("thinking")
         .and_then(|v| v.as_object())
-        .map(|o| o.get("type").and_then(|t| t.as_str()) == Some("enabled"))
-        .unwrap_or(false);
+        .and_then(|o| o.get("type").and_then(|t| t.as_str()))
+        .is_some_and(|t| matches!(t, "enabled" | "adaptive"));
 
     // Use provided model or fall back to the model from the request
     let model = if has_thinking {
@@ -92,6 +109,29 @@ pub fn anthropic_to_openai(
         }
     });
 
+    // Anthropic `tool_choice` -> OpenAI `tool_choice`.
+    let tool_choice = req
+        .extra
+        .get("tool_choice")
+        .and_then(anthropic_tool_choice_to_openai);
+
+    let mut extra = serde_json::Map::new();
+    // `disable_parallel_tool_use` (a sibling of `tool_choice`) maps to OpenAI's
+    // top-level `parallel_tool_calls`.
+    if req
+        .extra
+        .get("tool_choice")
+        .and_then(|tc| tc.get("disable_parallel_tool_use"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        extra.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+    }
+    // Anthropic `metadata` (e.g. `{"user_id": "..."}`) passes through unchanged.
+    if let Some(metadata) = req.metadata {
+        extra.insert("metadata".to_string(), metadata);
+    }
+
     Ok(openai::OpenAIRequest {
         model,
         messages: openai_messages,
@@ -101,9 +141,9 @@ pub fn anthropic_to_openai(
         stop: req.stop_sequences,
         stream: req.stream,
         tools,
-        tool_choice: None,
+        tool_choice,
         reasoning_effort: None,
-        extra: json!({}),
+        extra: Value::Object(extra),
     })
 }
 
@@ -285,6 +325,14 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
             .unwrap_or("end_turn"),
     ));
 
+    // Safety refusals arrive as a normal 200 with `stop_reason: "refusal"` and
+    // a `stop_details` object. OpenAI expresses the same as
+    // `finish_reason: "content_filter"`; the policy category is
+    // provider-specific and unknown here, so its fields are null (a valid,
+    // documented value).
+    let stop_details = (stop_reason.as_deref() == Some("refusal"))
+        .then(|| json!({ "type": "refusal", "category": Value::Null, "explanation": Value::Null }));
+
     Ok(anthropic::AnthropicResponse {
         id: openai_to_anthropic_id(&resp.id),
         response_type: "message".to_string(),
@@ -293,6 +341,7 @@ pub fn openai_to_anthropic(resp: openai::OpenAIResponse) -> Result<anthropic::An
         model: resp.model,
         stop_reason,
         stop_sequence: None,
+        stop_details,
         usage: anthropic::Usage {
             input_tokens: resp.usage.prompt_tokens,
             output_tokens: resp.usage.completion_tokens,
@@ -317,7 +366,8 @@ fn map_finish_reason_to_stop_reason(reason: &str) -> &'static str {
         "tool_calls" => "tool_use",
         "stop" => "end_turn",
         "length" => "max_tokens",
-        "content_filter" => "end_turn",
+        // OpenAI filters unsafe content; Anthropic reports this as a refusal.
+        "content_filter" => "refusal",
         _ => "end_turn",
     }
 }
@@ -329,6 +379,7 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
             "tool_calls" => "tool_use",
             "stop" => "end_turn",
             "length" => "max_tokens",
+            "content_filter" => "refusal",
             _ => "end_turn",
         }
         .to_string()
@@ -377,11 +428,165 @@ mod tests {
             map_stop_reason(Some("length")),
             Some("max_tokens".to_string())
         );
+        // Safety filtering surfaces as an Anthropic refusal.
+        assert_eq!(
+            map_stop_reason(Some("content_filter")),
+            Some("refusal".to_string())
+        );
         assert_eq!(
             map_stop_reason(Some("unknown")),
             Some("end_turn".to_string())
         );
         assert_eq!(map_stop_reason(None), None);
+    }
+
+    /// Build an Anthropic request, overlaying `extra` keys onto the base body.
+    fn anthropic_request_with(extra: Value) -> anthropic::AnthropicRequest {
+        let mut base = json!({
+            "model": "claude-opus-5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let (Some(obj), Some(add)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in add {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn anthropic_enabled_thinking_selects_reasoning_model() {
+        let req =
+            anthropic_request_with(json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}));
+        let out = anthropic_to_openai(
+            req,
+            Some("reasoner".to_string()),
+            Some("completer".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out.model, "reasoner");
+    }
+
+    #[test]
+    fn anthropic_adaptive_thinking_selects_reasoning_model() {
+        // Newer Claude models use `adaptive`; it must select the reasoning model
+        // just like `enabled`.
+        let req = anthropic_request_with(json!({"thinking": {"type": "adaptive"}}));
+        let out = anthropic_to_openai(
+            req,
+            Some("reasoner".to_string()),
+            Some("completer".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out.model, "reasoner");
+    }
+
+    #[test]
+    fn anthropic_disabled_thinking_selects_completion_model() {
+        let req = anthropic_request_with(json!({"thinking": {"type": "disabled"}}));
+        let out = anthropic_to_openai(
+            req,
+            Some("reasoner".to_string()),
+            Some("completer".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out.model, "completer");
+    }
+
+    #[test]
+    fn anthropic_to_openai_forwards_tool_choice_and_metadata() {
+        let req = anthropic_request_with(json!({
+            "tools": [{
+                "name": "get_weather",
+                "description": "Look up the weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }],
+            "tool_choice": {
+                "type": "tool",
+                "name": "get_weather",
+                "disable_parallel_tool_use": true
+            },
+            "metadata": {"user_id": "u_123"}
+        }));
+
+        let out = anthropic_to_openai(req, None, None).unwrap();
+        assert_eq!(
+            out.tool_choice,
+            Some(json!({"type": "function", "function": {"name": "get_weather"}}))
+        );
+        assert_eq!(out.extra["parallel_tool_calls"], json!(false));
+        assert_eq!(out.extra["metadata"]["user_id"], json!("u_123"));
+    }
+
+    #[test]
+    fn anthropic_tool_choice_auto_any_none_map_to_openai() {
+        for (anthropic_type, expected) in [("auto", "auto"), ("any", "required"), ("none", "none")]
+        {
+            let req = anthropic_request_with(json!({"tool_choice": {"type": anthropic_type}}));
+            let out = anthropic_to_openai(req, None, None).unwrap();
+            assert_eq!(out.tool_choice, Some(json!(expected)));
+        }
+    }
+
+    #[test]
+    fn anthropic_without_tool_choice_leaves_it_unset() {
+        let req = anthropic_request_with(json!({}));
+        let out = anthropic_to_openai(req, None, None).unwrap();
+        assert!(out.tool_choice.is_none());
+        assert!(out.extra.get("parallel_tool_calls").is_none());
+        assert!(out.extra.get("metadata").is_none());
+    }
+
+    fn response_with_finish_reason(finish_reason: &str) -> openai::OpenAIResponse {
+        openai::OpenAIResponse {
+            id: "chatcmpl-abc".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "m".to_string(),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                finish_reason: Some(finish_reason.to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            },
+            system_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn openai_to_anthropic_maps_content_filter_to_refusal_with_stop_details() {
+        let resp = response_with_finish_reason("content_filter");
+        let out = openai_to_anthropic(resp).unwrap();
+
+        assert_eq!(out.stop_reason.as_deref(), Some("refusal"));
+        let details = out
+            .stop_details
+            .as_ref()
+            .expect("stop_details is present on a refusal");
+        assert_eq!(details["type"], json!("refusal"));
+        assert!(details["category"].is_null());
+        assert!(details["explanation"].is_null());
+    }
+
+    #[test]
+    fn openai_to_anthropic_stop_details_absent_for_normal_stop() {
+        let resp = response_with_finish_reason("stop");
+        let out = openai_to_anthropic(resp).unwrap();
+
+        assert_eq!(out.stop_reason.as_deref(), Some("end_turn"));
+        assert!(out.stop_details.is_none());
     }
 
     #[test]

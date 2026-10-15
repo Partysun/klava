@@ -205,11 +205,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(data) = line.strip_prefix("data: ")
                     && data != "[DONE]"
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
-                        && let Some(choices) = parsed.get("choices").and_then(|c| c.as_array())
-                            && let Some(choice) = choices.first()
-                                && let Some(delta) = choice.get("delta")
-                                    && let Some(content) =
-                                        delta.get("content").and_then(|c| c.as_str())
+                    && let Some(choices) = parsed.get("choices").and_then(|c| c.as_array())
+                    && let Some(choice) = choices.first()
+                    && let Some(delta) = choice.get("delta")
+                    && let Some(content) = delta.get("content").and_then(|c| c.as_str())
                 {
                     print!("{}", content);
                     std::io::Write::flush(&mut std::io::stdout()).ok();

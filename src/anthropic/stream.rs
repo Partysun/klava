@@ -414,9 +414,16 @@ impl AnthropicStreamConverter {
                 "tool_calls" => "tool_use",
                 "stop" => "end_turn",
                 "length" => "max_tokens",
+                "content_filter" => "refusal",
                 _ => "end_turn",
             })
             .unwrap_or("end_turn");
+
+        // `stop_details` travels on `message_delta` alongside `stop_reason`.
+        // It is present on a refusal and null otherwise.
+        let stop_details = (stop_reason == "refusal").then(
+            || json!({ "type": "refusal", "category": Value::Null, "explanation": Value::Null }),
+        );
 
         let usage = chunk.usage.as_ref().map(|u| {
             json!({
@@ -430,7 +437,8 @@ impl AnthropicStreamConverter {
                 "type": "message_delta",
                 "delta": {
                     "stop_reason": stop_reason,
-                    "stop_sequence": Value::Null
+                    "stop_sequence": Value::Null,
+                    "stop_details": stop_details
                 },
                 "usage": usage
             }),
@@ -462,18 +470,20 @@ impl ChatChunkConverter for AnthropicStreamConverter {
 
             //. Reasoning (must complete before other content)
             if let Some(reasoning) = &delta.reasoning
-                && !reasoning.is_empty() {
-                    events.extend(self.process_reasoning_delta(reasoning));
-                }
+                && !reasoning.is_empty()
+            {
+                events.extend(self.process_reasoning_delta(reasoning));
+            }
 
             //. Content text
             if let Some(content) = &delta.content
-                && !content.is_empty() {
-                    // Finish reasoning first
-                    events.extend(self.finish_reasoning());
+                && !content.is_empty()
+            {
+                // Finish reasoning first
+                events.extend(self.finish_reasoning());
 
-                    events.extend(self.process_content_delta(content));
-                }
+                events.extend(self.process_content_delta(content));
+            }
 
             //. Tool calls
             if let Some(tool_calls) = &delta.tool_calls {
@@ -723,9 +733,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         // Should have content_block_stop, message_delta, message_stop
@@ -814,9 +824,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         assert!(conv.is_completed());
@@ -981,5 +991,47 @@ mod tests {
         assert_eq!(tool_block["type"].as_str(), Some("tool_use"));
         assert!(tool_block["name"].as_str().is_some());
         assert!(tool_block["id"].as_str().is_some());
+    }
+
+    /// OpenAI `finish_reason: "content_filter"` becomes an Anthropic refusal,
+    /// with `stop_details` carried on `message_delta`.
+    #[test]
+    fn test_content_filter_maps_to_refusal_with_stop_details() {
+        let mut conv = AnthropicStreamConverter::new();
+
+        conv.process(&make_chunk(
+            "c",
+            Delta {
+                role: Some("assistant".to_string()),
+                content: Some("partial".to_string()),
+                tool_calls: None,
+                reasoning: None,
+            },
+            None,
+            None,
+        ));
+
+        let events = conv.process(&make_chunk(
+            "c",
+            Delta {
+                role: None,
+                content: None,
+                tool_calls: None,
+                reasoning: None,
+            },
+            Some("content_filter".to_string()),
+            None,
+        ));
+
+        let delta = events
+            .iter()
+            .find(|e| e.event_type == "message_delta")
+            .expect("expected message_delta");
+        assert_eq!(delta.data["delta"]["stop_reason"].as_str(), Some("refusal"));
+        assert_eq!(
+            delta.data["delta"]["stop_details"]["type"].as_str(),
+            Some("refusal")
+        );
+        assert!(delta.data["delta"]["stop_details"]["category"].is_null());
     }
 }

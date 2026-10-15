@@ -126,7 +126,12 @@ impl PiRunner {
     }
 
     /// Merge or update the klava provider entry in a models.json config
-    fn configure_provider(&self, config: &mut PiModelsConfig, proxy_url: &str, model_ids: &[String]) {
+    fn configure_provider(
+        &self,
+        config: &mut PiModelsConfig,
+        proxy_url: &str,
+        model_ids: &[String],
+    ) {
         let base_url = format!("{}/v1", proxy_url);
 
         let models: Vec<serde_json::Value> = model_ids
@@ -151,9 +156,10 @@ impl PiRunner {
     /// provider's completion model (the first model id).
     fn configure_settings(&self, config: &mut PiSettingsConfig, model_ids: &[String]) {
         let default_model = model_ids.first().map(|s| s.as_str()).unwrap_or("klava");
-        config
-            .rest
-            .insert("defaultProvider".to_string(), serde_json::json!(KLAVA_PROVIDER_NAME));
+        config.rest.insert(
+            "defaultProvider".to_string(),
+            serde_json::json!(KLAVA_PROVIDER_NAME),
+        );
         config
             .rest
             .insert("defaultModel".to_string(), serde_json::json!(default_model));
@@ -277,7 +283,8 @@ impl AgentRunner for PiRunner {
         self.configure_settings(&mut settings_config, &model_ids);
 
         let new_settings_str = serde_json::to_string_pretty(&settings_config)?;
-        let settings_changed = old_settings_config != settings_config || old_settings_str.is_empty();
+        let settings_changed =
+            old_settings_config != settings_config || old_settings_str.is_empty();
 
         if !models_changed && !settings_changed {
             return Ok(());
@@ -319,9 +326,8 @@ impl AgentRunner for PiRunner {
 
         // Write both configs with backup
         if models_changed {
-            write_with_backup(&models_path, new_models_str.as_bytes()).map_err(|e| {
-                anyhow::anyhow!("Failed to write {}: {}", models_path.display(), e)
-            })?;
+            write_with_backup(&models_path, new_models_str.as_bytes())
+                .map_err(|e| anyhow::anyhow!("Failed to write {}: {}", models_path.display(), e))?;
             println!("✓ Configuration updated: {}", models_path.display());
         }
 
@@ -448,10 +454,7 @@ mod tests {
         runner.configure_provider(
             &mut config,
             "http://test-proxy:8080",
-            &[
-                "glm-4.7".to_string(),
-                "glm-4.7-reasoning".to_string(),
-            ],
+            &["glm-4.7".to_string(), "glm-4.7-reasoning".to_string()],
         );
 
         let provider = config
@@ -530,7 +533,10 @@ mod tests {
 
         runner.configure_settings(
             &mut config,
-            &["deepseek-v4-flash".to_string(), "deepseek-v4-reason".to_string()],
+            &[
+                "deepseek-v4-flash".to_string(),
+                "deepseek-v4-reason".to_string(),
+            ],
         );
 
         assert_eq!(config.rest["defaultProvider"], json!("klava"));
@@ -543,7 +549,9 @@ mod tests {
     #[test]
     fn test_settings_config_serialization_round_trip() {
         let mut config = PiSettingsConfig::default();
-        config.rest.insert("defaultProvider".to_string(), json!("klava"));
+        config
+            .rest
+            .insert("defaultProvider".to_string(), json!("klava"));
         config
             .rest
             .insert("defaultModel".to_string(), json!("glm-4.7"));

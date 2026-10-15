@@ -77,6 +77,14 @@ impl<C: ChatChunkConverter> UniversalConverter<C> {
             return Some(raw_event);
         }
 
+        // Never swallow upstream error events: forward them verbatim so the
+        // client sees the real error (e.g. OpenRouter's `data: {"error":...}`
+        // on upstream provider failure) instead of a truncated stream that the
+        // AI SDK misreports as "OpenAI Chat stream ended without finish_reason".
+        if Self::is_upstream_error(&data_payload) {
+            return Some(raw_event);
+        }
+
         let chat_chunk: StreamChunk = serde_json::from_slice(&data_payload).ok()?;
         let output_events = self.converter.process(&chat_chunk);
 
@@ -94,6 +102,13 @@ impl<C: ChatChunkConverter> UniversalConverter<C> {
         if trim_ascii(&data) == b"[DONE]" {
             self.buffer.clear();
             return Some(b"data: [DONE]\n\n".to_vec());
+        }
+
+        // Forward an upstream error event that arrived without a trailing
+        // blank line / at stream end (see extract_and_convert).
+        if Self::is_upstream_error(&data) {
+            let raw = std::mem::take(&mut self.buffer);
+            return Some(raw);
         }
 
         let chat_chunk: StreamChunk = serde_json::from_slice(&data).ok()?;
@@ -127,6 +142,15 @@ impl<C: ChatChunkConverter> UniversalConverter<C> {
         }
 
         Some(data_parts.join(&b'\n'))
+    }
+
+    /// Whether an SSE `data:` payload is an upstream error event
+    /// (`{"error": {...}}`), as emitted by OpenAI-compatible providers such as
+    /// OpenRouter when the upstream model provider fails mid-stream.
+    fn is_upstream_error(payload: &[u8]) -> bool {
+        serde_json::from_slice::<serde_json::Value>(payload)
+            .ok()
+            .is_some_and(|v| v.get("error").is_some())
     }
 }
 
@@ -563,6 +587,7 @@ impl ChatChunkConverter for EchoConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai_stream::OpenaiPassthrough;
     use crate::test_helpers::*;
     use bytes::Bytes;
     use tokio_stream::StreamExt;
@@ -698,6 +723,55 @@ mod tests {
         assert!(output[1].is_ok()); // finalize event
     }
 
+    /// Upstream error events (`data: {"error": {...}}`) must be forwarded, not
+    /// dropped. Before this fix they were silently swallowed, so clients like
+    /// opencode saw a truncated stream and misreported it as
+    /// "OpenAI Chat stream ended without finish_reason".
+    #[tokio::test]
+    async fn test_upstream_error_event_is_forwarded() {
+        let inputs = vec![
+            Ok(Bytes::from(
+                "data: {\"error\":{\"message\":\"upstream provider error\",\"code\":502}}\n\n",
+            )),
+            Ok(Bytes::from("data: [DONE]\n\n")),
+        ];
+        let stream = tokio_stream::iter(inputs);
+        let converter = UniversalConverter::new(OpenaiPassthrough::default());
+
+        let output: Vec<Result<Bytes, _>> = converter.convert(stream).collect().await;
+        let text = output
+            .iter()
+            .map(|r| String::from_utf8_lossy(r.as_ref().unwrap()).to_string())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(
+            text.contains("\"error\""),
+            "error event must be forwarded, got: {text}"
+        );
+        assert!(text.contains("[DONE]"), "got: {text}");
+    }
+
+    /// An upstream error event that arrives as the final, trailing (unterminated)
+    /// line of the stream must also be forwarded via parse_partial.
+    #[tokio::test]
+    async fn test_upstream_error_event_trailing_is_forwarded() {
+        let inputs = vec![Ok(Bytes::from(
+            "data: {\"error\":{\"message\":\"boom\",\"code\":500}}\n",
+        ))];
+        let stream = tokio_stream::iter(inputs);
+        let converter = UniversalConverter::new(OpenaiPassthrough::default());
+
+        let output: Vec<Result<Bytes, _>> = converter.convert(stream).collect().await;
+        let text = output
+            .iter()
+            .map(|r| String::from_utf8_lossy(r.as_ref().unwrap()).to_string())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(text.contains("\"error\""), "got: {text}");
+    }
+
     /// Test duplicate chunk handling in OpenaiConverter.
     /// Reference log shows same chunk being sent multiple times:
     /// data: {"id":"chatcmpl-8ad8f78f-553d-439e-a2f5-bfeedcf968c7","delta":{"content":"Greeting"}}
@@ -804,9 +878,9 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 167,
                 total_tokens: 177,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         };
 
         let import_event = make_sse_event(&serde_json::to_string(&empty_choices).unwrap());

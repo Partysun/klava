@@ -77,3 +77,43 @@ pub fn pii_guardrail_hook(data: Value, _config: &Config) -> Result<Value> {
     let redacted_json: Value = serde_json::from_str(&redacted.text)?;
     Ok(redacted_json)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn run(content: &str) -> String {
+        let data = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": content}]
+        });
+        let out = pii_guardrail_hook(data, &Config::default()).unwrap();
+        out["messages"][0]["content"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn redacts_email_addresses() {
+        let out = run("reach me at test@example.com please");
+        assert!(out.contains("<EMAIL>"), "got: {out}");
+        assert!(!out.contains("test@example.com"), "got: {out}");
+    }
+
+    #[test]
+    fn redacts_ethereum_addresses() {
+        let out = run("send to 0x1234567890abcdef1234567890abcdef12345678 now");
+        assert!(out.contains("<CryptoAddress>"), "got: {out}");
+        assert!(
+            !out.contains("0x1234567890abcdef1234567890abcdef12345678"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn leaves_plain_text_untouched() {
+        let out = run("just a normal instruction to refactor the parser");
+        assert!(out.contains("refactor the parser"), "got: {out}");
+        assert!(!out.contains("<EMAIL>"), "got: {out}");
+        assert!(!out.contains("<CryptoAddress>"), "got: {out}");
+    }
+}

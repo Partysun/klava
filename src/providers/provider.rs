@@ -229,4 +229,124 @@ mod tests {
         };
         assert_eq!(p.chat_completions_url(), None);
     }
+
+    fn minimal(name: &str) -> ProvidersConfig {
+        ProvidersConfig {
+            name: name.to_string(),
+            provider_type: ProviderType::OpenAICompatible,
+            base_url: Some("https://x.example".to_string()),
+            chat_completions_path: None,
+            api_key: None,
+            api_key_name: None,
+            reasoning_model: None,
+            completion_model: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_headers_use_configured_api_key() {
+        let p = ProvidersConfig {
+            api_key: Some("sk-test".to_string()),
+            ..minimal("t")
+        };
+        let headers = p
+            .get_auth_headers_for(&Config::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-test");
+    }
+
+    #[tokio::test]
+    async fn auth_headers_read_api_key_from_env_name() {
+        // Safety: setting a process-wide env var is fine in a single test;
+        // the name is unique to avoid races with other tests.
+        unsafe {
+            std::env::set_var("KLAVA_TEST_AUTH_KEY", "env-key");
+        }
+        let p = ProvidersConfig {
+            api_key_name: Some("KLAVA_TEST_AUTH_KEY".to_string()),
+            ..minimal("t")
+        };
+        let headers = p
+            .get_auth_headers_for(&Config::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer env-key");
+        unsafe {
+            std::env::remove_var("KLAVA_TEST_AUTH_KEY");
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_headers_missing_key_is_error() {
+        let p = minimal("t");
+        let err = p
+            .get_auth_headers_for(&Config::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::MissingApiKey(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_config_rejects_missing_base_url() {
+        let p = ProvidersConfig {
+            base_url: None,
+            api_key: Some("k".to_string()),
+            ..minimal("t")
+        };
+        let cfg = Config {
+            active_provider: "t".to_string(),
+            providers: vec![p],
+            ..Config::default()
+        };
+        let err = cfg.validate_complete().unwrap_err();
+        assert!(matches!(err, Error::MissingBaseUrl));
+    }
+
+    #[tokio::test]
+    async fn validate_config_rejects_non_http_base_url() {
+        let p = ProvidersConfig {
+            base_url: Some("ftp://x.example".to_string()),
+            api_key: Some("k".to_string()),
+            ..minimal("t")
+        };
+        let cfg = Config {
+            active_provider: "t".to_string(),
+            providers: vec![p],
+            ..Config::default()
+        };
+        let err = cfg.validate_complete().unwrap_err();
+        assert!(matches!(err, Error::InvalidBaseUrl(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_config_requires_api_key_for_openai_compatible() {
+        let cfg = Config {
+            active_provider: "t".to_string(),
+            providers: vec![minimal("t")],
+            ..Config::default()
+        };
+        let err = cfg.validate_complete().unwrap_err();
+        assert!(matches!(err, Error::MissingApiKey(_)));
+    }
+
+    #[test]
+    fn type_parse_and_as_str_round_trip() {
+        assert_eq!(
+            ProviderType::parse("openai-compatible"),
+            Some(ProviderType::OpenAICompatible)
+        );
+        assert_eq!(
+            ProviderType::parse("openai"),
+            Some(ProviderType::OpenAICompatible)
+        );
+        assert_eq!(
+            ProviderType::parse("default"),
+            Some(ProviderType::OpenAICompatible)
+        );
+        assert_eq!(ProviderType::parse("nonsense"), None);
+        assert_eq!(ProviderType::OpenAICompatible.as_str(), "openai-compatible");
+    }
 }

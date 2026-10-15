@@ -111,8 +111,7 @@ pub fn openai_to_anthropic_hook(data: Value, _config: &Config) -> Result<Value> 
 /// corresponding config option is enabled, keeping the default hot path
 /// lightweight — the PII analyzer is expensive on large payloads.
 pub fn default_chain(config: &Config) -> HookChain {
-    let mut chain = HookChain::new()
-        .with_hook(HookStage::RequestReceived, "logging", logging_hook);
+    let mut chain = HookChain::new().with_hook(HookStage::RequestReceived, "logging", logging_hook);
 
     if config.enable_pii {
         chain = chain.with_hook(HookStage::RequestReceived, "pii", pii_guardrail_hook);
@@ -248,7 +247,10 @@ mod tests {
 
         let chain = default_chain(&enabled);
         let has_hook = |stage: HookStage, name: &str| {
-            chain.hooks.iter().any(|(s, n, _)| *s == stage && *n == name)
+            chain
+                .hooks
+                .iter()
+                .any(|(s, n, _)| *s == stage && *n == name)
         };
 
         assert!(has_hook(HookStage::RequestReceived, "pii"));
@@ -264,7 +266,10 @@ mod tests {
         };
         let chain = default_chain(&disabled);
         let has_hook = |stage: HookStage, name: &str| {
-            chain.hooks.iter().any(|(s, n, _)| *s == stage && *n == name)
+            chain
+                .hooks
+                .iter()
+                .any(|(s, n, _)| *s == stage && *n == name)
         };
 
         assert!(!has_hook(HookStage::RequestReceived, "pii"));

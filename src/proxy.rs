@@ -21,7 +21,6 @@ use reqwest::Client;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Apply model override based on config for OpenAI requests
 /// Detects reasoning requests by checking reasoning_effort parameter
@@ -189,8 +188,20 @@ pub async fn proxy_openai(
     Ok(response)
 }
 
+/// Max request body we accept from a client. Code-agent clients (opencode,
+/// Claude Code) can send very large conversations with tool results and file
+/// contents; 1 MiB was too small and produced 502s on legitimate requests.
+/// Matches the upstream rupilot proxy's `MAX_BODY`.
+const MAX_BODY: usize = 128 * 1024 * 1024;
+
 async fn read_body_bytes(request: Request) -> Result<bytes::Bytes> {
-    axum::body::to_bytes(request.into_body(), 1024 * 1024)
+    read_body_bytes_limited(request, MAX_BODY).await
+}
+
+/// Body reader with an explicit byte cap. Kept separate from `read_body_bytes`
+/// so tests can exercise the limit without allocating a 128 MiB request.
+async fn read_body_bytes_limited(request: Request, limit: usize) -> Result<bytes::Bytes> {
+    axum::body::to_bytes(request.into_body(), limit)
         .await
         .map_err(|e| Error::Upstream(format!("Failed to read request body: {}", e)))
 }
@@ -237,10 +248,11 @@ async fn send_request(
         }
     }
 
-    let mut req_builder = client
-        .post(&url)
-        .json(&request_payload)
-        .timeout(Duration::from_secs(300));
+    let mut req_builder = client.post(&url).json(&request_payload);
+
+    // Note: no per-request `.timeout()` here — a hard total timeout would cut
+    // long streaming responses mid-generation. The client's `read_timeout`
+    // (main.rs build_http_client) bounds silent connections instead.
 
     // Conditionally add OpenRouter headers if base URL contains "openrouter"
     if url.contains("openrouter") {
@@ -541,5 +553,74 @@ mod tests {
             Some("chat-model".to_string()),
         );
         assert_eq!(completion.model, "chat-model");
+    }
+
+    #[test]
+    fn apply_openai_model_override_detects_reasoning_from_effort() {
+        fn req(effort: Option<openai::ReasoningEffort>) -> openai::OpenAIRequest {
+            openai::OpenAIRequest {
+                model: "default".to_string(),
+                messages: vec![],
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                stop: None,
+                stream: None,
+                tools: None,
+                tool_choice: None,
+                reasoning_effort: effort,
+                extra: json!({}),
+            }
+        }
+
+        let thinking = Some("thinking-model".to_string());
+        let chat = Some("chat-model".to_string());
+
+        // Explicit reasoning effort -> reasoning model.
+        let reasoning = apply_openai_model_override(
+            req(Some(openai::ReasoningEffort::High)),
+            thinking.clone(),
+            chat.clone(),
+        );
+        assert_eq!(reasoning.model, "thinking-model");
+        let reasoning = apply_openai_model_override(
+            req(Some(openai::ReasoningEffort::Medium)),
+            thinking.clone(),
+            chat.clone(),
+        );
+        assert_eq!(reasoning.model, "thinking-model");
+
+        // Absent or explicit "none" effort -> completion model.
+        let completion = apply_openai_model_override(req(None), thinking.clone(), chat.clone());
+        assert_eq!(completion.model, "chat-model");
+        let completion =
+            apply_openai_model_override(req(Some(openai::ReasoningEffort::None)), thinking, chat);
+        assert_eq!(completion.model, "chat-model");
+    }
+
+    #[tokio::test]
+    async fn read_body_bytes_under_limit_ok() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let bytes = read_body_bytes_limited(req, 1000).await.unwrap();
+        assert_eq!(bytes.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn read_body_bytes_over_limit_errors() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let err = read_body_bytes_limited(req, 10).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to read request body"),
+            "unexpected error: {err}"
+        );
     }
 }

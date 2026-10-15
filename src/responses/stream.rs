@@ -165,10 +165,22 @@ impl ResponsesStreamConverter {
                 json!({
                     "output_index": self.output_idx,
                     "item": {
-                        "id": item_id,
+                        "id": &item_id,
                         "type": "reasoning",
                         "summary": []
                     }
+                }),
+            ));
+
+            // A reasoning item's summary is a list of parts; open the first one
+            // before any summary text deltas, as the real API does.
+            events.push(self.create_event(
+                "response.reasoning_summary_part.added",
+                json!({
+                    "item_id": &item_id,
+                    "output_index": self.output_idx,
+                    "summary_index": 0,
+                    "part": { "type": "summary_text", "text": "" }
                 }),
             ));
         }
@@ -214,6 +226,16 @@ impl ResponsesStreamConverter {
                 "output_index": self.output_idx,
                 "summary_index": 0,
                 "text": &self.reasoning_acc
+            }),
+        ));
+
+        events.push(self.create_event(
+            "response.reasoning_summary_part.done",
+            json!({
+                "item_id": &item_id,
+                "output_index": self.output_idx,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": &self.reasoning_acc }
             }),
         ));
 
@@ -644,18 +666,20 @@ impl ChatChunkConverter for ResponsesStreamConverter {
 
             // 1. Reasoning (must complete before other content)
             if let Some(ref reasoning) = delta.reasoning
-                && !reasoning.is_empty() {
-                    events.extend(self.process_reasoning_delta(reasoning));
-                }
+                && !reasoning.is_empty()
+            {
+                events.extend(self.process_reasoning_delta(reasoning));
+            }
 
             // 2. Content text
             if let Some(ref content) = delta.content
-                && !content.is_empty() {
-                    // Finish reasoning first
-                    events.extend(self.finish_reasoning());
+                && !content.is_empty()
+            {
+                // Finish reasoning first
+                events.extend(self.finish_reasoning());
 
-                    events.extend(self.process_content_delta(content));
-                }
+                events.extend(self.process_content_delta(content));
+            }
 
             // 3. Tool calls
             if let Some(ref tool_calls) = delta.tool_calls {
@@ -925,9 +949,9 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         // output_text.done, content_part.done, output_item.done, response.completed
@@ -998,11 +1022,13 @@ mod tests {
             None,
         ));
 
-        // created, in_progress, output_item.added (reasoning), reasoning_summary_text.delta
-        assert_eq!(events.len(), 4);
+        // created, in_progress, output_item.added (reasoning),
+        // reasoning_summary_part.added, reasoning_summary_text.delta
+        assert_eq!(events.len(), 5);
         assert_eq!(events[2].event, "response.output_item.added");
         assert_eq!(events[2].data["item"]["type"].as_str(), Some("reasoning"));
-        assert_eq!(events[3].event, "response.reasoning_summary_text.delta");
+        assert_eq!(events[3].event, "response.reasoning_summary_part.added");
+        assert_eq!(events[4].event, "response.reasoning_summary_text.delta");
 
         // Text chunk — should close reasoning first
         let events = conv.process(&make_chunk(
@@ -1032,6 +1058,48 @@ mod tests {
                 .iter()
                 .any(|e| e.event == "response.output_text.delta")
         );
+    }
+
+    /// Reasoning summaries stream as parts: `reasoning_summary_part.added`
+    /// before the text deltas and `reasoning_summary_part.done` after them.
+    #[test]
+    fn test_reasoning_summary_part_lifecycle() {
+        let mut conv = ResponsesStreamConverter::new("resp_123", "msg_456", "gpt-4");
+
+        let events = conv.process(&make_chunk(
+            "c",
+            Delta {
+                role: None,
+                content: None,
+                tool_calls: None,
+                reasoning: Some("Let me think...".to_string()),
+            },
+            None,
+            None,
+        ));
+        let added = events
+            .iter()
+            .find(|e| e.event == "response.reasoning_summary_part.added")
+            .expect("expected reasoning_summary_part.added");
+        assert_eq!(added.data["summary_index"].as_u64(), Some(0));
+        assert_eq!(added.data["part"]["type"].as_str(), Some("summary_text"));
+
+        let events = conv.process(&make_chunk(
+            "c",
+            Delta {
+                role: None,
+                content: Some("The answer".to_string()),
+                tool_calls: None,
+                reasoning: None,
+            },
+            None,
+            None,
+        ));
+        let done = events
+            .iter()
+            .find(|e| e.event == "response.reasoning_summary_part.done")
+            .expect("expected reasoning_summary_part.done");
+        assert_eq!(done.data["part"]["text"].as_str(), Some("Let me think..."));
     }
 
     #[test]
@@ -1145,9 +1213,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         // Find the output_item.done event
@@ -1193,9 +1261,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         let completed = events.iter().find(|e| e.event == "response.completed");
@@ -1291,9 +1359,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         // Now output_item.done for function_call should have status "completed"
@@ -1377,9 +1445,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-}),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
         ));
 
         let completed = events

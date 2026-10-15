@@ -18,6 +18,21 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    /// Parse a lowercase effort name (as sent in a Responses `reasoning.effort`
+    /// or an OpenAI request). Unknown values yield `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" => ReasoningEffort::None,
+            "low" => ReasoningEffort::Low,
+            "medium" => ReasoningEffort::Medium,
+            "high" => ReasoningEffort::High,
+            "xhigh" => ReasoningEffort::XHigh,
+            "max" => ReasoningEffort::Max,
+            "minimal" => ReasoningEffort::Minimal,
+            _ => return None,
+        })
+    }
+
     /// Returns the lowercase variant name.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -279,5 +294,15 @@ mod tests {
         let out = serde_json::to_value(&req).unwrap();
         assert!(!out.as_object().unwrap().contains_key("extra"));
         assert!(req.extra.is_object() && req.extra.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reasoning_effort_round_trips_via_lowercase_names() {
+        for name in ["none", "low", "medium", "high", "xhigh", "max", "minimal"] {
+            let parsed: ReasoningEffort = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(parsed.variant_name(), name);
+            let round = serde_json::to_value(parsed).unwrap();
+            assert_eq!(round, json!(name), "name mismatch for {name}");
+        }
     }
 }

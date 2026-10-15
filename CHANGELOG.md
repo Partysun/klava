@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.16] - 2026-10-15
+
+### Fixed
+
+- Streaming proxy no longer swallows upstream error events: `data: {"error": ...}` SSE payloads from the provider are now forwarded verbatim instead of being dropped, so clients (opencode, Codex) surface the real upstream error instead of "stream ended without finish_reason"
+- The request body cap for streaming requests was raised from 1 MB to 128 MB, and the fixed 300 s per-request timeout was replaced with a 300 s read timeout, so long-lived streams are no longer cut off between tokens
+- `/v1/responses`: top-level `instructions` (the Codex system prompt) is now forwarded to the provider as a leading system message instead of being dropped
+- Anthropic `stop_reason` `"refusal"` is now produced for upstream `finish_reason: "content_filter"`, with the `stop_details` object emitted on both the message and the streaming `message_delta` (previously mapped to `end_turn`)
+
+### Added
+
+- `/v1/responses`: `reasoning.effort`, `tool_choice`, `parallel_tool_calls` and `text.format` (→ `response_format`) are now forwarded upstream
+- `/v1/messages`: `tool_choice` (`auto`/`any`/`none`/named tool), `disable_parallel_tool_use` (→ `parallel_tool_calls`) and `metadata` are now forwarded upstream
+- `/v1/messages`: `thinking.type` `"adaptive"` (newer Claude models) now selects the configured reasoning model, alongside the existing `"enabled"`
+- `/v1/responses` streaming now emits `response.reasoning_summary_part.added` / `.done` around reasoning summary text, matching the upstream event order
+
+### Added (tests)
+
+- Router-level integration tests with an in-process fake upstream covering chat, Anthropic and Responses streaming paths (including upstream error forwarding, `instructions`, `content_filter` → refusal, adaptive thinking and reasoning-summary-part events), plus unit tests for `error`, `provider`, `pii_guardrail`, `proxy`, `models` and the two stream converters
+
 ## [0.2.15] - 2026-10-15
 
 ### Fixed

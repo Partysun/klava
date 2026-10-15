@@ -299,7 +299,10 @@ async fn main() -> anyhow::Result<()> {
 // Build a reqwest client with configurable settings
 fn build_http_client() -> Result<Client, anyhow::Error> {
     Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        // Read timeout, not a total timeout: a streaming response that is
+        // slowly producing tokens must not be cut off at a fixed deadline.
+        // Only abort when the connection goes completely silent for this long.
+        .read_timeout(std::time::Duration::from_secs(300))
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(10)
         .build()
@@ -853,7 +856,11 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
                 let default_idx = enabled
                     .iter()
                     .position(|m| m.chat_id().contains("deepseek-flash"))
-                    .or_else(|| enabled.iter().position(|m| m.chat_id().contains("deepseek")))
+                    .or_else(|| {
+                        enabled
+                            .iter()
+                            .position(|m| m.chat_id().contains("deepseek"))
+                    })
                     .unwrap_or(0);
                 let selected =
                     Select::new("Select the default model for the klava provider:", options)

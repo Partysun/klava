@@ -121,6 +121,9 @@ pub struct AnthropicResponse {
     pub model: String,
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
+    /// Structured refusal detail. Always present on the wire (null for every
+    /// stop reason other than `refusal`), so it is not skipped when `None`.
+    pub stop_details: Option<Value>,
     pub usage: Usage,
 }
 
@@ -217,6 +220,8 @@ pub enum Delta {
 pub struct MessageDeltaData {
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }

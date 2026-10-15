@@ -178,11 +178,12 @@ impl CodexRunner {
         // Remove legacy `profile = "klava"` line
         if let Some(line_start) =
             find_line_start(&content, &format!("profile = \"{}\"", KLAVA_PROFILE_NAME))
-            && let Some(line_end) = content[line_start..].find('\n') {
-                let line_end = line_start + line_end + 1;
-                updated = format!("{}{}", &updated[..line_start], &updated[line_end..]);
-                changed = true;
-            }
+            && let Some(line_end) = content[line_start..].find('\n')
+        {
+            let line_end = line_start + line_end + 1;
+            updated = format!("{}{}", &updated[..line_start], &updated[line_end..]);
+            changed = true;
+        }
 
         // Remove legacy `[profiles.klava]` section
         let profile_header = format!("[profiles.{}]", KLAVA_PROFILE_NAME);
@@ -378,8 +379,7 @@ pub struct AnalyticsConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ProfileConfig {
     #[serde(default)]
     pub model: Option<String>,
@@ -414,7 +414,6 @@ pub struct ProfileConfig {
     #[serde(default)]
     pub features: Option<HashMap<String, bool>>,
 }
-
 
 fn default_model_value() -> String {
     "klava".to_string()

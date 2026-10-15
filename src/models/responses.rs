@@ -305,3 +305,47 @@ pub struct ResponsesTextField {
 fn default_parameters() -> Value {
     json!({"type": "object", "properties": {}})
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_request_round_trips_text_input_and_extra_fields() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "stream": true,
+            "parallel_tool_calls": false,
+            "metadata": {"session": "abc"},
+            "extra_field": 42
+        }))
+        .unwrap();
+
+        assert!(matches!(req.input, ResponsesInput::Text(ref s) if s == "hi"));
+        assert_eq!(req.stream, Some(true));
+        // Unmodeled fields are preserved via the flatten `extra`.
+        assert_eq!(req.extra["parallel_tool_calls"], json!(false));
+        assert_eq!(req.extra["metadata"]["session"], json!("abc"));
+        assert_eq!(req.extra["extra_field"], json!(42));
+
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["input"], json!("hi"));
+        assert_eq!(out["stream"], json!(true));
+        assert_eq!(out["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn responses_request_defaults_optional_fields() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": [{"type": "message", "role": "user"}]
+        }))
+        .unwrap();
+
+        assert!(matches!(req.input, ResponsesInput::Items(_)));
+        assert_eq!(req.stream, None);
+        assert!(!req.background);
+        assert!(req.tools.is_empty());
+    }
+}

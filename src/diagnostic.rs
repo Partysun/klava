@@ -422,7 +422,8 @@ mod tests {
             "42"
         );
         assert_eq!(
-            validate_api_response(&response_with_content(Some("Sure, here is a summary."))).unwrap(),
+            validate_api_response(&response_with_content(Some("Sure, here is a summary.")))
+                .unwrap(),
             "Sure, here is a summary."
         );
     }

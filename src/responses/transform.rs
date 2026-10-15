@@ -4,10 +4,60 @@ use crate::models::{openai, responses};
 use crate::utils::{clean_schema, openai_to_call_id};
 use serde_json::{Value, json};
 
+/// Map a Responses API `tool_choice` onto the OpenAI Chat Completions shape.
+/// Responses names the function directly (`{"type":"function","name":"x"}`),
+/// while Chat Completions nests it under `function`. Returns `None` for values
+/// with no OpenAI equivalent (e.g. `allowed_tools`).
+fn responses_tool_choice_to_openai(tool_choice: &Value) -> Option<Value> {
+    match tool_choice {
+        Value::String(_) => Some(tool_choice.clone()),
+        Value::Object(obj) => {
+            if let Some(name) = obj.get("name").and_then(Value::as_str) {
+                Some(json!({ "type": "function", "function": { "name": name } }))
+            } else if obj.contains_key("function") {
+                Some(tool_choice.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Map a Responses `text.format` onto the OpenAI `response_format` shape.
+/// Plain text (the default) has no OpenAI equivalent and is dropped.
+fn responses_text_format_to_openai(format: &responses::ResponsesTextFormat) -> Option<Value> {
+    match format.format_type.as_str() {
+        "json_schema" => Some(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": format.name.clone().unwrap_or_else(|| "response".to_string()),
+                "schema": format.format_schema.clone().unwrap_or_else(|| json!({})),
+                "strict": format.strict.unwrap_or(false),
+            }
+        })),
+        _ => None,
+    }
+}
+
 /// Transform Responses request to OpenAI format
 pub fn responses_to_openai(req: ResponsesRequest) -> Result<openai::OpenAIRequest> {
     // Convert input items to OpenAI messages
     let mut openai_messages = Vec::new();
+
+    // Top-level `instructions` is the system prompt. OpenAI-compatible
+    // providers only see it once it becomes a leading system message.
+    if let Some(instructions) = req.instructions.clone()
+        && !instructions.is_empty()
+    {
+        openai_messages.push(openai::Message {
+            role: "system".to_string(),
+            content: Some(openai::MessageContent::Text(instructions)),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+    }
 
     // Handle the ResponsesInput enum which can be either a single string or array of InputItems
     match req.input {
@@ -159,6 +209,32 @@ pub fn responses_to_openai(req: ResponsesRequest) -> Result<openai::OpenAIReques
         )
     };
 
+    // Forward `reasoning.effort` when the Responses request set one.
+    let reasoning_effort = req
+        .reasoning
+        .as_ref()
+        .and_then(|r| r.effort.as_deref())
+        .and_then(openai::ReasoningEffort::parse);
+
+    // Forward `tool_choice` in the OpenAI Chat Completions shape.
+    let tool_choice = req
+        .extra
+        .get("tool_choice")
+        .and_then(responses_tool_choice_to_openai);
+
+    // Fields OpenAI carries at the top level but the Responses request only
+    // exposes as siblings: `parallel_tool_calls` and `text.format`
+    // (→ `response_format`). `OpenAIRequest.extra` is flattened on serialize.
+    let mut extra = serde_json::Map::new();
+    if let Some(v) = req.extra.get("parallel_tool_calls") {
+        extra.insert("parallel_tool_calls".to_string(), v.clone());
+    }
+    if let Some(format) = req.text.as_ref().and_then(|t| t.format.as_ref())
+        && let Some(response_format) = responses_text_format_to_openai(format)
+    {
+        extra.insert("response_format".to_string(), response_format);
+    }
+
     Ok(openai::OpenAIRequest {
         model: req.model,
         messages: openai_messages,
@@ -174,9 +250,9 @@ pub fn responses_to_openai(req: ResponsesRequest) -> Result<openai::OpenAIReques
         stop: None, // ResponsesRequest doesn't have an equivalent stop field
         stream: req.stream,
         tools,
-        tool_choice: None,
-        reasoning_effort: None, // Don't map reasoning effort directly, as many providers don't support it
-        extra: json!({}),
+        tool_choice,
+        reasoning_effort,
+        extra: Value::Object(extra),
     })
 }
 
@@ -972,5 +1048,77 @@ mod tests {
         let out = serde_json::to_value(&req).unwrap();
         assert_eq!(out["tool_choice"]["name"], json!("lookup"));
         assert!(!out.as_object().unwrap().contains_key("extra"));
+    }
+
+    /// Fix: top-level `instructions` must become a leading system message
+    /// (providers never see it otherwise), and `reasoning.effort`,
+    /// `tool_choice`, `parallel_tool_calls` and `text.format` must be forwarded.
+    #[test]
+    fn responses_to_openai_forwards_instructions_reasoning_and_tools() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "input": "hi",
+            "instructions": "You are a helpful agent.",
+            "reasoning": { "effort": "high" },
+            "tool_choice": { "type": "function", "name": "get_weather" },
+            "parallel_tool_calls": false,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": { "type": "object" },
+                    "strict": true
+                }
+            }
+        }))
+        .unwrap();
+
+        let out = responses_to_openai(req).unwrap();
+
+        // instructions -> leading system message, before the user input
+        assert_eq!(out.messages[0].role, "system");
+        match out.messages[0].content.as_ref() {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "You are a helpful agent.")
+            }
+            other => panic!("expected system text, got {other:?}"),
+        }
+        assert_eq!(out.messages[1].role, "user");
+
+        assert_eq!(
+            out.reasoning_effort.as_ref().map(|e| e.variant_name()),
+            Some("high")
+        );
+        assert_eq!(
+            out.tool_choice,
+            Some(json!({"type": "function", "function": {"name": "get_weather"}}))
+        );
+        assert_eq!(out.extra["parallel_tool_calls"], json!(false));
+        assert_eq!(out.extra["response_format"]["type"], json!("json_schema"));
+        assert_eq!(
+            out.extra["response_format"]["json_schema"]["name"],
+            json!("answer")
+        );
+        assert_eq!(
+            out.extra["response_format"]["json_schema"]["strict"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn responses_to_openai_omits_defaults() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-4",
+            "input": "hi",
+            "text": { "format": { "type": "text" } }
+        }))
+        .unwrap();
+
+        let out = responses_to_openai(req).unwrap();
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0].role, "user");
+        assert!(out.reasoning_effort.is_none());
+        assert!(out.tool_choice.is_none());
+        assert!(out.extra.get("response_format").is_none());
     }
 }
