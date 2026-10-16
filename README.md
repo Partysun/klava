@@ -42,6 +42,33 @@ Notice: When launching opencode, you need to manually select the "klava" model u
 
 When launching pi, the klava provider is used by default with the active provider's model, so no manual selection is needed.
 
+#### Managed background service (Linux/systemd)
+
+`klava launch` (and `klava up --daemon`) manage the proxy as a per-port
+systemd **user** service (`klava-<port>.service`) whenever a systemd user
+session is available:
+
+- created on first use and kept up to date (binary path, port, env keys);
+- auto-started at login and restarted on crash (`Restart=always`);
+- the proxy survives agent sessions, terminals and reboots;
+- each port is its own instance, so several proxies can run side by side.
+
+Since the service takes over the port, agents started later just reuse it —
+no per-session proxy spawn, no "proxy is dead" surprises.
+
+```bash
+klava status                                   # list managed instances
+klava stop                                     # stop the proxy on the configured port
+systemctl --user status klava-48017            # unit status
+journalctl --user -u klava-48017 -f            # live proxy logs
+systemctl --user disable --now klava-48017     # stop managing a port (keep the proxy running per-launch once)
+```
+
+Pass `--no-service` to `klava launch` (or use plain `klava up`) to run a
+short-lived child/foreground proxy instead — e.g. for CI or custom ports.
+On macOS and Windows the managed service is not available yet; `klava up`
+keeps working there.
+
 Supported code agents:
 
 | Agent      | Description    | Link                      |

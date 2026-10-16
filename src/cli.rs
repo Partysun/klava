@@ -83,6 +83,14 @@ pub enum Command {
             help = "Port to listen on (overrides PORT env var and config)"
         )]
         port: Option<u16>,
+
+        /// Don't use the managed background service; spawn the proxy as a
+        /// short-lived child process that stops when the agent exits.
+        #[arg(
+            long,
+            help = "Spawn a child proxy instead of the managed background service"
+        )]
+        no_service: bool,
     },
     /// Start the proxy server
     ///
@@ -109,6 +117,11 @@ pub enum Command {
             help = "Run in foreground (don't daemonize)"
         )]
         foreground: bool,
+
+        /// Skip the provider readiness check (used by the managed service to
+        /// avoid interactive prompts and restart-loops inside systemd).
+        #[arg(long, hide = true, help = "Skip the provider readiness check")]
+        no_provider_check: bool,
     },
 
     /// Stop a running daemon

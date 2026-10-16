@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Managed background service: `klava launch` and `klava up --daemon` now provision a per-port systemd **user** service (`klava-<port>.service`) when a systemd user session is available. The unit is created/refreshed on first use (binary path, port and env keys), enabled for login auto-start, started idempotently and health-checked via `/health`. `Restart=always` makes the proxy self-healing — it survives agent sessions, terminals, crashes and reboots, so clients never see `ConnectionRefused` on `localhost:<port>` again. Several ports = several independent managed instances. `--no-service` on `launch` restores the old short-lived child-proxy behavior.
+- `klava status` now lists every managed instance and its systemd state when systemd is available.
+
+### Changed
+
+- `klava up --daemon` prefers the managed systemd service over the legacy fork-based daemon when systemd is available.
+- Upstream error responses now carry actionable hints (401/403 → `klava login`, 429 → back off, 5xx → `klava check`), and connect failures mention `klava check`.
+
+### Fixed
+
+- `klava status` (legacy daemon path) no longer uses `pgrep -P` (which looked for children of the PID); it probes the process directly with `kill -0`.
+
 ## [0.2.18] - 2026-10-15
 
 ### Changed

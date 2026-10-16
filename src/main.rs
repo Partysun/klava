@@ -1,6 +1,7 @@
 mod cli;
 mod cli_setup;
 mod daemon;
+mod service;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -60,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
             config: config_flag,
             provider,
             port,
+            no_service,
         } => {
             use inquire::Select;
 
@@ -160,32 +162,63 @@ async fn main() -> anyhow::Result<()> {
 
             agent.check_installation()?;
 
-            //TODO: we need to have an option to start agent without proxy server
-            // Start proxy server first and report the port it bound to
-            let config_clone = current_config.clone();
-            let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
-            let server_handle = tokio::spawn(async move {
-                let config = Arc::new(config_clone);
-                let client = build_http_client()?;
+            // Prefer the managed background service (systemd user session):
+            // the proxy keeps running after the agent exits, survives crashes
+            // via Restart=always and restarts at login. Fall back to spawning
+            // a child proxy when systemd is unavailable or --no-service is set.
+            let use_service = !no_service && service::systemd_available();
 
-                server::run_server(
-                    config,
-                    client,
-                    hook_chain,
-                    server::LogMode::SILENT,
-                    Some(port_tx),
-                )
-                .await?;
-                Ok::<(), anyhow::Error>(())
-            });
+            let (proxy_url, server_handle) = if use_service {
+                let action = service::ensure_service(&current_config).await?;
+                match action {
+                    service::ServiceAction::Installed => tracing::info!(
+                        "✓ Installed managed service for port {} (auto-start at login)",
+                        current_config.port
+                    ),
+                    service::ServiceAction::Rewritten => tracing::info!(
+                        "✓ Refreshed managed service for port {}",
+                        current_config.port
+                    ),
+                    service::ServiceAction::AlreadyActive | service::ServiceAction::Started => {}
+                }
+                let url = format!("http://localhost:{}", current_config.port);
+                tracing::info!(
+                    "✓ klava proxy running as a managed service ({}) — restarts automatically",
+                    service::unit_name(current_config.port)
+                );
+                (url, None)
+            } else {
+                // Spawn a child proxy whose lifetime is tied to this launch.
+                let config_clone = current_config.clone();
+                let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+                let server_handle = tokio::spawn(async move {
+                    let config = Arc::new(config_clone);
+                    let client = build_http_client()?;
 
-            // Wait for the proxy server to report the port it bound to
-            let proxy_port = tokio::time::timeout(tokio::time::Duration::from_secs(10), port_rx)
-                .await
-                .map_err(|_| anyhow::anyhow!("Proxy server failed to start in time"))?
-                .map_err(|_| anyhow::anyhow!("Proxy server failed to start"))?;
+                    server::run_server(
+                        config,
+                        client,
+                        hook_chain,
+                        server::LogMode::SILENT,
+                        Some(port_tx),
+                    )
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
+                });
 
-            let proxy_url = format!("http://localhost:{}", proxy_port);
+                // Wait for the proxy server to report the port it bound to
+                let proxy_port =
+                    tokio::time::timeout(tokio::time::Duration::from_secs(10), port_rx)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Proxy server failed to start in time"))?
+                        .map_err(|_| anyhow::anyhow!("Proxy server failed to start"))?;
+
+                let url = format!("http://localhost:{}", proxy_port);
+                tracing::info!(
+                    "✓ klava proxy started for this launch (child process, stops when the agent exits)"
+                );
+                (url, Some(server_handle))
+            };
 
             if let Err(e) = agent.setup(&proxy_url).await {
                 return Err(
@@ -199,11 +232,14 @@ async fn main() -> anyhow::Result<()> {
                 proxy_url
             );
 
-            // Run agent
+            // Run agent. The managed service keeps the proxy alive; the
+            // child proxy (legacy mode) is aborted when the agent exits.
             let result = agent.run(&[], &proxy_url).await;
 
-            // Abort the server task when Code Agent exits (always)
-            server_handle.abort();
+            if let Some(handle) = server_handle {
+                // Abort the server task when Code Agent exits (legacy behavior)
+                handle.abort();
+            }
 
             result?;
 
@@ -211,11 +247,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Stop { pid_file } => {
             let pid_file_path = pid_file.as_ref().unwrap_or(&cli.pid_file);
-            stop_daemon(pid_file_path)?;
-            tracing::info!("✓ Daemon stopped");
+            let _ = stop_daemon(pid_file_path); // legacy daemon, may not exist
+            let _ = service::stop_service(config.port); // managed service
+            tracing::info!("✓ Proxy stopped");
             return Ok(());
         }
         Command::Status { pid_file } => {
+            if service::systemd_available() {
+                return service::status();
+            }
             let pid_file_path = pid_file.as_ref().unwrap_or(&cli.pid_file);
             match check_status(pid_file_path) {
                 Ok(true) => return Ok(()),
@@ -229,12 +269,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Up { port, .. } => {
-            // Daemon mode
-            if cli.daemon {
-                return handle_daemon_mode().await;
-            }
-
+        Command::Up { port, no_provider_check, .. } => {
             if cli.verbose {
                 config.verbose = true;
             }
@@ -243,7 +278,45 @@ async fn main() -> anyhow::Result<()> {
                 config.port = cli_port;
             }
 
-            ensure_provider_ready(&config).await?;
+            // Daemon mode: prefer the managed systemd service (self-healing,
+            // survives terminals and reboots); fall back to the legacy
+            // fork-based daemon when systemd is unavailable.
+            if cli.daemon {
+                if service::systemd_available() {
+                    let action = service::ensure_service(&config).await?;
+                    match action {
+                        service::ServiceAction::Installed => tracing::info!(
+                            "✓ Installed managed service for port {} (auto-start at login)",
+                            config.port
+                        ),
+                        service::ServiceAction::Rewritten => tracing::info!(
+                            "✓ Refreshed managed service for port {}",
+                            config.port
+                        ),
+                        service::ServiceAction::AlreadyActive => tracing::info!(
+                            "✓ Managed service already running on port {}",
+                            config.port
+                        ),
+                        service::ServiceAction::Started => tracing::info!(
+                            "✓ Managed service started on port {}",
+                            config.port
+                        ),
+                    }
+                    tracing::info!(
+                        "  Managed by: {} (status: `klava status`, logs: `journalctl --user -u {}`)",
+                        service::unit_name(config.port),
+                        service::unit_name(config.port)
+                    );
+                    return Ok(());
+                }
+                return handle_daemon_mode().await;
+            }
+
+            // The managed service passes --no-provider-check to avoid
+            // interactive prompts and restart-loops inside systemd.
+            if !no_provider_check {
+                ensure_provider_ready(&config).await?;
+            }
 
             let config = Arc::new(config);
 
@@ -1100,11 +1173,34 @@ mod tests {
 
         if let Ok(cli) = parsed {
             match cli.command {
-                Command::Up { port, foreground } => {
+                Command::Up {
+                    port,
+                    foreground,
+                    no_provider_check,
+                } => {
                     assert_eq!(port, Some(8080));
                     assert!(foreground);
+                    assert!(!no_provider_check);
                 }
                 _ => panic!("Expected up command"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parses_launch_no_service_flag() {
+        let parsed = Cli::try_parse_from(["klava", "launch", "opencode", "--no-service"]);
+        assert!(parsed.is_ok());
+
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Launch {
+                    no_service, agent, ..
+                } => {
+                    assert!(no_service);
+                    assert!(agent.is_some());
+                }
+                _ => panic!("Expected launch command"),
             }
         }
     }

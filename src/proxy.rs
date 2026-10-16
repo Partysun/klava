@@ -277,18 +277,28 @@ async fn send_request(
     req_builder
         .send()
         .await
-        .map_err(|e| Error::Upstream(format!("Failed to send request to upstream: {}", e)))
+        .map_err(|e| Error::Upstream(format!("Failed to send request to upstream ({url}): {e} — check provider connectivity with `klava check`")))
 }
 
-/// Handle upstream error response
+/// Handle upstream error response, annotating it with an actionable hint so
+/// the client sees a clear message instead of a bare status code.
 async fn handle_upstream_error(response: reqwest::Response) -> Error {
     let status = response.status();
     let error_text = response
         .text()
         .await
         .unwrap_or_else(|_| "Unknown error".to_string());
+    let hint = match status.as_u16() {
+        401 | 403 => " - provider rejected the credentials: run `klava login` or `klava check`",
+        429 => " - provider rate limit reached: wait a moment and retry",
+        500..=599 => " - upstream provider issue: run `klava check` for diagnostics",
+        _ => "",
+    };
     tracing::error!("Upstream error ({}): {}", status, error_text);
-    Error::Upstream(format!("Upstream returned {}: {}", status, error_text))
+    Error::Upstream(format!(
+        "Upstream returned {}: {}{}",
+        status, error_text, hint
+    ))
 }
 
 /// Build SSE response with proper headers

@@ -102,12 +102,9 @@ pub fn check_status(pid_file: &Path) -> Result<bool> {
 
     #[cfg(unix)]
     {
-        // Check if process exists by checking if it can be found with pgrep
-        let output = Command::new("pgrep")
-            .arg("-P")
-            .arg(pid.to_string())
-            .output();
-
+        // Check if the process exists without needing root or procfs:
+        // `kill -0` reports success when the PID belongs to a live process.
+        let output = Command::new("kill").arg("-0").arg(pid.to_string()).output();
         let exists = output.is_ok() && output.unwrap().status.success();
 
         if exists {
