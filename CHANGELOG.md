@@ -5,6 +5,7 @@
 ### Added
 
 - Managed background service: `klava launch` and `klava up --daemon` now provision a per-port systemd **user** service (`klava-<port>.service`) when a systemd user session is available. The unit is created/refreshed on first use (binary path, port and env keys), enabled for login auto-start, started idempotently and health-checked via `/health`. `Restart=always` makes the proxy self-healing — it survives agent sessions, terminals, crashes and reboots, so clients never see `ConnectionRefused` on `localhost:<port>` again. Several ports = several independent managed instances. `--no-service` on `launch` restores the old short-lived child-proxy behavior.
+- macOS: the same managed-service behavior via launchd — per-port LaunchAgent `~/Library/LaunchAgents/klava-<port>.plist` with `RunAtLoad` (login auto-start) and `KeepAlive` (crash restart), rendered with env keys and rewritten when stale. `klava status` and `klava stop` cover launchd instances; `launchctl list | grep klava` shows their state. Falls back to the child proxy when no service manager exists (Linux without systemd, Windows).
 - `klava status` now lists every managed instance and its systemd state when systemd is available.
 
 ### Changed

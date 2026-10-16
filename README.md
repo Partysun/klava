@@ -42,32 +42,36 @@ Notice: When launching opencode, you need to manually select the "klava" model u
 
 When launching pi, the klava provider is used by default with the active provider's model, so no manual selection is needed.
 
-#### Managed background service (Linux/systemd)
+#### Managed background service (Linux/systemd, macOS/launchd)
 
 `klava launch` (and `klava up --daemon`) manage the proxy as a per-port
-systemd **user** service (`klava-<port>.service`) whenever a systemd user
-session is available:
+background service whenever a supported service manager is available:
 
-- created on first use and kept up to date (binary path, port, env keys);
-- auto-started at login and restarted on crash (`Restart=always`);
-- the proxy survives agent sessions, terminals and reboots;
-- each port is its own instance, so several proxies can run side by side.
+- **Linux**: systemd user unit `klava-<port>.service` — auto-started at
+  login, `Restart=always` on crash;
+- **macOS**: launchd LaunchAgent `~/Library/LaunchAgents/klava-<port>.plist`
+  — `RunAtLoad` at login, `KeepAlive` on crash.
 
-Since the service takes over the port, agents started later just reuse it —
-no per-session proxy spawn, no "proxy is dead" surprises.
+In both cases the unit/plist is created on first use and kept up to date
+(binary path, port, env keys), the service is started idempotently and
+health-checked via `/health`, and each port is its own instance — so several
+proxies can run side by side. Since the service takes over the port, agents
+started later just reuse it — no per-session proxy spawn, no
+"proxy is dead" surprises.
 
 ```bash
 klava status                                   # list managed instances
 klava stop                                     # stop the proxy on the configured port
-systemctl --user status klava-48017            # unit status
-journalctl --user -u klava-48017 -f            # live proxy logs
-systemctl --user disable --now klava-48017     # stop managing a port (keep the proxy running per-launch once)
+systemctl --user status klava-48017            # Linux: unit status
+journalctl --user -u klava-48017 -f            # Linux: live proxy logs
+launchctl list | grep klava                    # macOS: instance state
+tail -f ~/Library/Logs/klava-48017.log         # macOS: live proxy logs
 ```
 
 Pass `--no-service` to `klava launch` (or use plain `klava up`) to run a
 short-lived child/foreground proxy instead — e.g. for CI or custom ports.
-On macOS and Windows the managed service is not available yet; `klava up`
-keeps working there.
+On Windows the managed service is not available yet; `klava up` keeps
+working there.
 
 Supported code agents:
 

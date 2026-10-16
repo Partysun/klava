@@ -1,16 +1,20 @@
 //! Self-provisioning managed service.
 //!
-//! On Linux with a systemd user session, the proxy is managed as a per-port
-//! user unit (`klava-<port>.service`):
+//! `ensure_service` converges a per-port, auto-starting, self-healing
+//! background service for the proxy:
 //!
-//! * `ensure_service` converges the unit (writes it when missing or stale —
-//!   binary path or port changed), enables it for login auto-start and
-//!   starts it. The unit carries `Restart=always`, so the proxy heals itself
-//!   and survives terminals, agent sessions and reboots.
-//! * `status` reports every managed instance.
-//! * `stop_service` stops one instance.
+//! * **Linux (systemd user session)** — a per-port user unit
+//!   `klava-<port>.service` with `Restart=always`, enabled for login.
+//! * **macOS (launchd)** — a per-port LaunchAgent
+//!   `~/Library/LaunchAgents/klava-<port>.plist` with `KeepAlive` and
+//!   `RunAtLoad`.
 //!
-//! When systemd is unavailable (containers, macOS, Windows) callers fall back
+//! In both cases the file is rewritten when it is missing or stale (binary
+//! path or port changed), then loaded idempotently and health-checked
+//! (`GET /health`). The proxy survives terminals, agent sessions, crashes
+//! and reboots.
+//!
+//! When neither manager is available (containers, Windows) callers fall back
 //! to the legacy spawned/daemonized proxy.
 
 use anyhow::{Context, Result, anyhow};
@@ -22,13 +26,18 @@ use std::time::Duration;
 
 use klava::config::Config;
 
-/// Marker written into generated unit files so we can tell ours apart and
-/// rewrite them when the binary or the port changes.
+/// Marker written into generated unit/plist files so we can tell ours apart
+/// and rewrite them when the binary or the port changes.
 pub const UNIT_MARKER: &str = "# Managed by klava - do not edit manually";
 
-/// Name of the unit that manages the proxy on `port`.
+/// Base name shared by the systemd unit and the launchd label for `port`.
+pub fn instance_name(port: u16) -> String {
+    format!("klava-{port}")
+}
+
+/// Name of the systemd unit that manages the proxy on `port`.
 pub fn unit_name(port: u16) -> String {
-    format!("klava-{port}.service")
+    format!("{}.service", instance_name(port))
 }
 
 /// Absolute path of the unit that manages the proxy on `port`.
@@ -200,9 +209,40 @@ pub enum ServiceAction {
     Started,
 }
 
-/// Converge the managed service for `config.port`: create/refresh the unit,
-/// enable auto-start at login and make sure it is running and healthy.
+/// Whether a supported service manager is usable from this process.
+pub fn manager_available() -> bool {
+    systemd_available() || launchd_available()
+}
+
+/// Whether a launchd user session is usable from this process (macOS).
+#[cfg(target_os = "macos")]
+pub fn launchd_available() -> bool {
+    which::which("launchctl").is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn launchd_available() -> bool {
+    false
+}
+
+/// Converge the managed service for `config.port`: create/refresh the
+/// systemd unit or launchd LaunchAgent, enable auto-start at login and make
+/// sure it is running and healthy.
 pub async fn ensure_service(config: &Config) -> Result<ServiceAction> {
+    if systemd_available() {
+        ensure_systemd_service(config).await
+    } else if launchd_available() {
+        ensure_launchd_service(config).await
+    } else {
+        Err(anyhow!(
+            "No supported service manager found (systemd/launchd). \
+             Run `klava up` in a terminal, or `klava launch --no-service`."
+        ))
+    }
+}
+
+/// Converge the per-port systemd user unit.
+async fn ensure_systemd_service(config: &Config) -> Result<ServiceAction> {
     let port = config.port;
     let exe = exe_path();
     let env = env_entries(config);
@@ -212,13 +252,14 @@ pub async fn ensure_service(config: &Config) -> Result<ServiceAction> {
 
     if is_active(port)
         && path.exists()
-        && fs::read_to_string(&path).ok().as_deref() == Some(&expected)
+        && fs::read_to_string(&path).ok().as_deref() == Some(expected.as_str())
     {
         return Ok(ServiceAction::AlreadyActive);
     }
 
     let existed = path.exists();
-    let needs_write = !existed || fs::read_to_string(&path).ok().as_deref() != Some(&expected);
+    let needs_write =
+        !existed || fs::read_to_string(&path).ok().as_deref() != Some(expected.as_str());
 
     // Occupy the port before rewriting: a stale unit may point at an old
     // binary that still runs.
@@ -281,13 +322,44 @@ pub async fn ensure_service(config: &Config) -> Result<ServiceAction> {
 }
 
 /// Stop a managed instance (used by `klava stop`). Errors are ignored so a
-/// missing unit falls back to the legacy PID-based stop.
+/// missing instance falls back to the legacy PID-based stop.
 pub fn stop_service(port: u16) {
-    let _ = run_systemctl(&["stop", &unit_name(port)]);
+    if systemd_available() {
+        let _ = run_systemctl(&["stop", &unit_name(port)]);
+    } else if launchd_available() {
+        let _ = launchctl_unload(&launchd_plist_path(port));
+    }
+}
+
+/// Hint for tailing the logs of the managed instance on this platform.
+pub fn logs_command(port: u16) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let log = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("~"))
+            .join("Library/Logs")
+            .join(format!("{}.log", instance_name(port)));
+        format!("tail -f {}", log.display())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!("journalctl --user -u {} -f", unit_name(port))
+    }
 }
 
 /// Report the state of every managed instance.
 pub fn status() -> Result<()> {
+    if systemd_available() {
+        return systemd_status();
+    }
+    if launchd_available() {
+        return launchd_status();
+    }
+    println!("No supported service manager found (systemd/launchd).");
+    Ok(())
+}
+
+fn systemd_status() -> Result<()> {
     let dir = units_dir();
     if !dir.exists() {
         println!("No managed klava service instances.");
@@ -318,6 +390,254 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// launchd (macOS)
+// ---------------------------------------------------------------------------
+
+/// Directory for user LaunchAgents.
+#[cfg(target_os = "macos")]
+pub fn launchd_agents_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join("Library/LaunchAgents")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn launchd_agents_dir() -> PathBuf {
+    PathBuf::from(".")
+}
+
+/// Plist path for the LaunchAgent managing `port`.
+pub fn launchd_plist_path(port: u16) -> PathBuf {
+    launchd_agents_dir().join(format!("{}.plist", instance_name(port)))
+}
+
+/// Escape a string for use inside a plist `<string>` element.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Render the launchd LaunchAgent plist for a proxy on `port`.
+pub fn render_plist(exe: &Path, port: u16, env: &[(String, String)], log_path: &Path) -> String {
+    let label = instance_name(port);
+    let log = log_path.display();
+    let mut plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <!-- {UNIT_MARKER} -->\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>{label}</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{}</string>\n\
+         \t\t<string>up</string>\n\
+         \t\t<string>--port</string>\n\
+         \t\t<string>{port}</string>\n\
+         \t\t<string>--foreground</string>\n\
+         \t\t<string>--no-provider-check</string>\n\
+         \t</array>\n",
+        xml_escape(&exe.display().to_string()),
+    );
+    if !env.is_empty() {
+        plist.push_str("\t<key>EnvironmentVariables</key>\n\t<dict>\n");
+        for (key, value) in env {
+            plist.push_str(&format!(
+                "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+                xml_escape(key),
+                xml_escape(value)
+            ));
+        }
+        plist.push_str("\t</dict>\n");
+    }
+    plist.push_str(&format!(
+        "\t<key>RunAtLoad</key>\n\t<true/>\n\
+         \t<key>KeepAlive</key>\n\t<true/>\n\
+         \t<key>StandardOutPath</key>\n\t<string>{}</string>\n\
+         \t<key>StandardErrorPath</key>\n\t<string>{}</string>\n\
+         </dict>\n\
+         </plist>\n",
+        log, log
+    ));
+    plist
+}
+
+fn launchctl_run<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<std::process::Output> {
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run launchctl with {} arguments", args.len()))
+}
+
+/// Whether a LaunchAgent with `label` is loaded into the user's launchd.
+fn launchd_is_loaded(label: &str) -> bool {
+    launchctl_run(&["list"])
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().last() == Some(label))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a loaded LaunchAgent is currently running (PID column != "-").
+fn launchd_is_running(label: &str) -> bool {
+    launchctl_run(&["list"])
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                parts.len() >= 3 && parts[2] == label && parts[0] != "-"
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Load a LaunchAgent and mark it enabled (survives logout/login).
+/// Already-loaded agents are left alone (idempotent start).
+fn launchctl_load(path: &Path) -> Result<()> {
+    let args = [
+        std::ffi::OsStr::new("load"),
+        std::ffi::OsStr::new("-w"),
+        path.as_os_str(),
+    ];
+    let out = launchctl_run(&args)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("already loaded") {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "launchctl load -w {} failed: {}",
+        path.display(),
+        stderr.trim()
+    ))
+}
+
+/// Unload a LaunchAgent; errors are ignored (job may not exist).
+fn launchctl_unload(path: &Path) -> Result<()> {
+    let args = [std::ffi::OsStr::new("unload"), path.as_os_str()];
+    let _ = launchctl_run(&args)?;
+    Ok(())
+}
+
+/// Converge the per-port launchd LaunchAgent.
+async fn ensure_launchd_service(config: &Config) -> Result<ServiceAction> {
+    let port = config.port;
+    let exe = exe_path();
+    let env = env_entries(config);
+    let path = launchd_plist_path(port);
+    let label = instance_name(port);
+    let log_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("cannot determine home directory"))?
+        .join("Library/Logs");
+    let log_path = log_dir.join(format!("{label}.log"));
+    let expected = render_plist(&exe, port, &env, &log_path);
+
+    let loaded = launchd_is_loaded(&label);
+    if loaded
+        && path.exists()
+        && fs::read_to_string(&path).ok().as_deref() == Some(expected.as_str())
+        && launchd_is_running(&label)
+    {
+        return Ok(ServiceAction::AlreadyActive);
+    }
+
+    let existed = path.exists();
+    let needs_write =
+        !existed || fs::read_to_string(&path).ok().as_deref() != Some(expected.as_str());
+
+    if needs_write {
+        if !loaded {
+            stop_legacy_daemon();
+            if port_in_use(port) {
+                return Err(anyhow!(
+                    "port {port} is already bound by another process (e.g. `klava up` \
+                     in a terminal or another tool). Stop it first, then retry."
+                ));
+            }
+        }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::create_dir_all(&log_dir)?;
+        fs::write(&path, &expected)
+            .with_context(|| format!("failed to write LaunchAgent {}", path.display()))?;
+        // launchd refuses world/group-writable agent plists.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        }
+        // Reload so the new arguments take effect.
+        let _ = launchctl_unload(&path);
+    }
+
+    launchctl_load(&path)?;
+    if !launchd_is_loaded(&label) {
+        return Err(anyhow!(
+            "failed to load LaunchAgent {}: check `launchctl list`",
+            path.display()
+        ));
+    }
+
+    wait_health(port, Duration::from_secs(10))
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "{e}\nThe LaunchAgent may be crash-looping. Inspect it with:\n  \t{}",
+                logs_command(port)
+            )
+        })?;
+
+    Ok(if !existed {
+        ServiceAction::Installed
+    } else if needs_write {
+        ServiceAction::Rewritten
+    } else {
+        ServiceAction::Started
+    })
+}
+
+/// Report launchd-managed instances.
+fn launchd_status() -> Result<()> {
+    let dir = launchd_agents_dir();
+    if !dir.exists() {
+        println!("No managed klava service instances.");
+        return Ok(());
+    }
+    let mut found = false;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("klava-") || !name.ends_with(".plist") {
+            continue;
+        }
+        found = true;
+        let label = name.trim_end_matches(".plist");
+        let state = launchd_is_running(label);
+        let loaded = launchd_is_loaded(label);
+        let icon = if state { "✓" } else { "✗" };
+        println!(
+            "{icon} {name}  [{}{}]",
+            if loaded { "loaded, " } else { "" },
+            if state { "running" } else { "stopped" }
+        );
+    }
+    if !found {
+        println!("No managed klava service instances. `klava launch` creates one per port.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +646,54 @@ mod tests {
     fn unit_name_embeds_port() {
         assert_eq!(unit_name(48017), "klava-48017.service");
         assert_eq!(unit_name(48018), "klava-48018.service");
+        assert_eq!(instance_name(48017), "klava-48017");
+    }
+
+    #[test]
+    fn plist_has_marker_label_args_and_keepalive() {
+        let plist = render_plist(
+            Path::new("/opt/klava"),
+            48017,
+            &[],
+            Path::new("/tmp/klava-48017.log"),
+        );
+        assert!(plist.contains(UNIT_MARKER));
+        assert!(plist.contains("<string>klava-48017</string>"));
+        assert!(plist.contains("<string>/opt/klava</string>"));
+        assert!(plist.contains("<string>--no-provider-check</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<string>/tmp/klava-48017.log</string>"));
+    }
+
+    #[test]
+    fn plist_escapes_env_values() {
+        let plist = render_plist(
+            Path::new("/opt/klava"),
+            48017,
+            &[("KEY".to_string(), "a&b<c>d\"e".to_string())],
+            Path::new("/tmp/klava-48017.log"),
+        );
+        assert!(plist.contains("<key>KEY</key>"));
+        assert!(plist.contains("<string>a&amp;b&lt;c&gt;d&quot;e</string>"));
+        assert!(!plist.contains("a&b<c>d\"e"));
+    }
+
+    #[test]
+    fn xml_escape_handles_all_specials() {
+        assert_eq!(xml_escape("&<>\"'"), "&amp;&lt;&gt;&quot;&apos;");
+        assert_eq!(xml_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn plist_path_is_under_launchagents_dir() {
+        let p = launchd_plist_path(48017);
+        assert!(p.to_string_lossy().ends_with("klava-48017.plist"));
+        #[cfg(target_os = "macos")]
+        assert!(
+            p.to_string_lossy()
+                .ends_with("LaunchAgents/klava-48017.plist")
+        );
     }
 
     #[test]
@@ -363,8 +731,6 @@ mod tests {
     #[test]
     fn env_entries_only_include_set_vars() {
         let config = Config {
-            port: 48017,
-            active_provider: String::new(),
             providers: vec![
                 klava::providers::Config {
                     name: "with-env".into(),
@@ -387,9 +753,7 @@ mod tests {
                     completion_model: None,
                 },
             ],
-            verbose: false,
-            enable_pii: true,
-            enable_token_stats: false,
+            ..Config::default()
         };
         unsafe {
             std::env::set_var("KLAVA_TEST_AUTH_KEY_A", "set-value");

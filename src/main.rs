@@ -162,11 +162,12 @@ async fn main() -> anyhow::Result<()> {
 
             agent.check_installation()?;
 
-            // Prefer the managed background service (systemd user session):
-            // the proxy keeps running after the agent exits, survives crashes
-            // via Restart=always and restarts at login. Fall back to spawning
-            // a child proxy when systemd is unavailable or --no-service is set.
-            let use_service = !no_service && service::systemd_available();
+            // Prefer the managed background service (systemd user session on
+            // Linux, launchd on macOS): the proxy keeps running after the
+            // agent exits, survives crashes via Restart=always/KeepAlive and
+            // restarts at login. Fall back to spawning a child proxy when no
+            // service manager is available or --no-service is set.
+            let use_service = !no_service && service::manager_available();
 
             let (proxy_url, server_handle) = if use_service {
                 let action = service::ensure_service(&current_config).await?;
@@ -184,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
                 let url = format!("http://localhost:{}", current_config.port);
                 tracing::info!(
                     "✓ klava proxy running as a managed service ({}) — restarts automatically",
-                    service::unit_name(current_config.port)
+                    service::instance_name(current_config.port)
                 );
                 (url, None)
             } else {
@@ -253,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Command::Status { pid_file } => {
-            if service::systemd_available() {
+            if service::manager_available() {
                 return service::status();
             }
             let pid_file_path = pid_file.as_ref().unwrap_or(&cli.pid_file);
@@ -282,11 +283,12 @@ async fn main() -> anyhow::Result<()> {
                 config.port = cli_port;
             }
 
-            // Daemon mode: prefer the managed systemd service (self-healing,
-            // survives terminals and reboots); fall back to the legacy
-            // fork-based daemon when systemd is unavailable.
+            // Daemon mode: prefer the managed service (systemd on Linux,
+            // launchd on macOS — self-healing, survives terminals and
+            // reboots); fall back to the legacy fork-based daemon when no
+            // manager exists.
             if cli.daemon {
-                if service::systemd_available() {
+                if service::manager_available() {
                     let action = service::ensure_service(&config).await?;
                     match action {
                         service::ServiceAction::Installed => tracing::info!(
@@ -305,9 +307,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     tracing::info!(
-                        "  Managed by: {} (status: `klava status`, logs: `journalctl --user -u {}`)",
-                        service::unit_name(config.port),
-                        service::unit_name(config.port)
+                        "  Managed by: {} (status: `klava status`, logs: `{}`)",
+                        service::instance_name(config.port),
+                        service::logs_command(config.port)
                     );
                     return Ok(());
                 }
