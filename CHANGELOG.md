@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.20] - 2026-10-16
+
+### Added
+
+- Web search for launched agents: `klava launch --search` gives the agent a search tool that klava runs itself through the klava gateway (no agent-side setup); `--search-model MODEL` selects the model used for searches (implies `--search`). Search behavior is configurable via `enable_websearch`, `search_engine` (`web_fast`/`web_deep`/`web_native`/`auto`), `search_context` (`low`/`medium`/`high`), `search_max_results`, `search_prompt`, `search_include_domains`/`search_exclude_domains`, and `search_decide`/`search_decide_model` for model-decided per-query tuning.
+- Managed services carry the search flag: systemd units and launchd plists render `--search` when web search is enabled, so the background proxy exposes the search tool to every agent that connects to it.
+
 ## [0.2.19] - 2026-10-16
 
 ### Added
