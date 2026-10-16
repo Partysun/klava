@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.21] - 2026-10-16
+
+### Fixed
+
+- PII guardrail no longer corrupts the request into invalid JSON. The guardrail serialized the whole request to one JSON string and redacted spans inside it, so the email recognizer could match the `n`/`t`/`r` of a structural escape (`\n`, `\t`, `\r`) when a redactable value followed a newline/tab/CR. Redaction then consumed the escape letter and left a lone backslash, and parsing the result failed with `400 JSON error: invalid escape` — most visible with large agent histories (e.g. pi) where a line ending immediately precedes an email or other matchable value. Redaction now walks the parsed JSON and processes each string *value*, so escapes are structurally impossible to corrupt and serde re-escapes on the way out.
+
 ## [0.2.20] - 2026-10-16
 
 ### Added

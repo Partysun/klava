@@ -139,18 +139,33 @@ fn restore_encoded_payloads(value: &mut Value, originals: &[(String, String)]) {
     }
 }
 
-pub fn pii_guardrail_hook(mut data: Value, _config: &Config) -> Result<Value> {
-    // Mask inline image/file payloads before analysis so redaction can never
-    // corrupt them; everything else (including secrets in source code) is still
-    // scanned. See `mask_encoded_payloads`.
-    let originals = mask_encoded_payloads(&mut data);
-    let data = serde_json::to_string(&data)?;
+/// Redact PII from a single string value.
+///
+/// Operates on the string's *content*, never on its serialized JSON form, so a
+/// match can never consume a JSON escape (`\n`, `\t`, `\r`, …) and leave a
+/// dangling backslash that breaks the request. Returns the entity types seen
+/// (for aggregate logging).
+fn redact_string(text: &mut String, anonymize: &AnonymizeConfig) -> Vec<pii::EntityType> {
+    let result = match pii_analyzer().analyze(text, &Language::from("en")) {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!("PII analysis failed; leaving string unredacted: {e}");
+            return Vec::new();
+        }
+    };
 
-    let result = pii_analyzer()
-        .analyze(&data, &Language::from("en"))
-        .unwrap();
+    if result.entities.is_empty() {
+        return Vec::new();
+    }
+
+    let seen = result
+        .entities
+        .iter()
+        .map(|entity| entity.entity_type.clone())
+        .collect();
+
     for detection in &result.entities {
-        let span = &data[detection.start..detection.end];
+        let span = text.get(detection.start..detection.end).unwrap_or_default();
         tracing::debug!(
             "type={} start={} end={} value={}",
             detection.entity_type.as_str(),
@@ -159,16 +174,55 @@ pub fn pii_guardrail_hook(mut data: Value, _config: &Config) -> Result<Value> {
             span
         );
     }
-    // println!("{:?}", result);
-    let unique_entity_types: HashSet<pii::EntityType> = result
-        .entities
-        .iter()
-        .map(|entity| entity.entity_type.clone())
-        .collect();
 
-    tracing::info!("Filtered unique entity types: {:?}", unique_entity_types);
+    match Anonymizer::anonymize(text, &result.entities, anonymize) {
+        Ok(redacted) => *text = redacted.text,
+        Err(e) => tracing::warn!("PII anonymization failed; leaving string unredacted: {e}"),
+    }
 
-    let mut config = AnonymizeConfig::default();
+    seen
+}
+
+/// Recursively redact every string value in the request.
+fn redact_value(
+    value: &mut Value,
+    anonymize: &AnonymizeConfig,
+    seen: &mut HashSet<pii::EntityType>,
+) {
+    match value {
+        Value::String(s) => {
+            for entity in redact_string(s, anonymize) {
+                seen.insert(entity);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                redact_value(nested, anonymize, seen);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items.iter_mut() {
+                redact_value(nested, anonymize, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn pii_guardrail_hook(mut data: Value, _config: &Config) -> Result<Value> {
+    // Mask inline image/file payloads before analysis so redaction can never
+    // corrupt them; everything else (including secrets in source code) is still
+    // scanned. See `mask_encoded_payloads`.
+    let originals = mask_encoded_payloads(&mut data);
+
+    // Redaction runs over each string *value* rather than the serialized
+    // request. Serializing first turned structural escapes (`\n`, `\t`, `\r`)
+    // into characters the recognizers could match, so redacting an email that
+    // followed a newline consumed the `n` and left a lone `\` — producing
+    // invalid JSON and a spurious `400 JSON error: invalid escape`. Walking the
+    // parsed `Value` sidesteps that class of bug entirely; serde re-escapes on
+    // the way out.
+    let mut anonymize = AnonymizeConfig::default();
     let mut per_entity = HashMap::new();
     per_entity.insert(
         "Email".to_string(),
@@ -182,12 +236,14 @@ pub fn pii_guardrail_hook(mut data: Value, _config: &Config) -> Result<Value> {
             with: "<CryptoAddress>".into(),
         },
     );
-    config.per_entity = per_entity;
-    let redacted = Anonymizer::anonymize(&data, &result.entities, &config).unwrap();
-    tracing::trace!("{:?}", redacted.items);
-    let mut redacted_json: Value = serde_json::from_str(&redacted.text)?;
-    restore_encoded_payloads(&mut redacted_json, &originals);
-    Ok(redacted_json)
+    anonymize.per_entity = per_entity;
+
+    let mut seen: HashSet<pii::EntityType> = HashSet::new();
+    redact_value(&mut data, &anonymize, &mut seen);
+    tracing::info!("Filtered unique entity types: {:?}", seen);
+
+    restore_encoded_payloads(&mut data, &originals);
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -307,5 +363,57 @@ mod tests {
         assert!(out.contains("refactor the parser"), "got: {out}");
         assert!(!out.contains("<EMAIL>"), "got: {out}");
         assert!(!out.contains("<CryptoAddress>"), "got: {out}");
+    }
+
+    #[test]
+    fn redacts_email_after_newline_escape() {
+        // Regression: serializing the request first turned the newline into the
+        // two chars backslash + n; the email regex matched that n as the start of
+        // the local part, redaction ate it and left a lone backslash, breaking
+        // JSON with "invalid escape". The email must abut the escape for the old
+        // bug to fire, so there is deliberately no separator after the newline.
+        let out = run("line one\nuser@example.com");
+        assert!(out.contains("<EMAIL>"), "got: {out}");
+        assert!(out.contains("line one\n"), "newline must survive: {out}");
+        assert!(!out.contains("example.com"), "email must be gone: {out}");
+    }
+
+    #[test]
+    fn redacts_email_after_tab_escape() {
+        let out = run("col\tuser@example.com");
+        assert!(out.contains("<EMAIL>"), "got: {out}");
+        assert!(out.contains('\t'), "tab must survive: {out}");
+        assert!(!out.contains("example.com"), "email must be gone: {out}");
+    }
+
+    #[test]
+    fn redacts_email_after_carriage_return_escape() {
+        let out = run("line\ruser@example.com");
+        assert!(out.contains("<EMAIL>"), "got: {out}");
+        assert!(out.contains('\r'), "carriage return must survive: {out}");
+        assert!(!out.contains("example.com"), "email must be gone: {out}");
+    }
+
+    #[test]
+    fn output_is_always_valid_json() {
+        // Values whose escapes abut matchable content - the exact shape that a
+        // serialize-then-redact approach corrupted into invalid JSON.
+        let data = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "a\nuser@example.com\tb\nuser@example.com"},
+                {"role": "assistant", "content": "quotes \" and slash \\ and user@example.com"}
+            ]
+        });
+        let out = pii_guardrail_hook(data, &Config::default()).unwrap();
+        // Re-serializing must round-trip without error.
+        let text = serde_json::to_string(&out).unwrap();
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, out);
+        let content = out["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("<EMAIL>"), "got: {content}");
+        assert!(content.contains('\n'), "newline must survive: {content}");
+        assert!(content.contains('\t'), "tab must survive: {content}");
+        assert!(!content.contains("example.com"), "got: {content}");
     }
 }
