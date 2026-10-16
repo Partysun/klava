@@ -99,12 +99,20 @@ pub struct ImageSource {
     pub data: String,
 }
 
-/// Tool definition
+/// Tool definition.
+///
+/// Client ("function") tools carry an `input_schema`. Anthropic *server* tools
+/// (e.g. `web_search_20250305`, `computer_20241022`, `bash_20241022`) identify
+/// themselves by `type` and carry no schema. `input_schema` is defaulted so
+/// such tools parse instead of failing the entire request; the Anthropic →
+/// OpenAI transform drops them, since they can only be executed on Anthropic's
+/// own backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
     pub input_schema: Value,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,

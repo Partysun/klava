@@ -83,11 +83,17 @@ pub fn anthropic_to_openai(
         openai_messages.extend(converted);
     }
 
-    // Convert tools
+    // Convert tools. Client ("function") tools carry an `input_schema` and
+    // become OpenAI functions. Anthropic *server* tools (`web_search_20250305`,
+    // `computer_20241022`, `bash_20241022`, ...) identify themselves by `type`
+    // and carry no schema; they run only on Anthropic's own backend, which
+    // klava is not, so they are dropped rather than forwarded (an OpenAI
+    // function needs a `parameters` schema). The existing `BatchTool` filter is
+    // subsumed by the same rule.
     let tools = req.tools.and_then(|tools| {
         let filtered: Vec<_> = tools
             .into_iter()
-            .filter(|t| t.tool_type.as_deref() != Some("BatchTool"))
+            .filter(|t| t.tool_type.as_deref() != Some("BatchTool") && !t.input_schema.is_null())
             .collect();
 
         if filtered.is_empty() {
@@ -515,6 +521,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.model, "completer");
+    }
+
+    #[test]
+    fn anthropic_server_tool_without_input_schema_is_dropped() {
+        // Claude Code advertises Anthropic server tools (web_search, computer,
+        // ...) that carry a `type` and no `input_schema`. The request must
+        // parse (previously it 400'd with "missing field `input_schema`"), and
+        // the server tool must not be forwarded as an OpenAI function — only
+        // the client's own function tool survives.
+        let req = anthropic_request_with(json!({
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                {
+                    "name": "get_weather",
+                    "description": "Look up the weather",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }
+            ]
+        }));
+
+        let out = anthropic_to_openai(req, None, None).unwrap();
+        let tools = out.tools.expect("client tool must survive");
+        assert_eq!(tools.len(), 1, "only the client tool: {tools:?}");
+        assert_eq!(tools[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn anthropic_only_server_tools_leaves_tools_unset() {
+        let req = anthropic_request_with(json!({
+            "tools": [{"type": "computer_20241022", "name": "computer", "display_width_px": 1024}]
+        }));
+
+        let out = anthropic_to_openai(req, None, None).unwrap();
+        assert!(out.tools.is_none(), "no client tools -> tools unset");
     }
 
     #[test]

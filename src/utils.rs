@@ -31,6 +31,14 @@ pub fn new_anthropic_tool_id() -> String {
     format!("{}{}", ANTHROPIC_TOOL_PREFIX, random_id_suffix())
 }
 
+/// Generate a fresh Anthropic-format *server* tool_use id (`srvtoolu_<24+ chars>`).
+///
+/// Server tool uses (`web_search`, ...) use the `srvtoolu_` prefix, distinct
+/// from client `tool_use` ids (`toolu_`).
+pub fn new_anthropic_server_tool_id() -> String {
+    format!("srvtoolu_{}", random_id_suffix())
+}
+
 /// Generate a fresh OpenAI-format tool_call id (`call_<uuid>`).
 /// Used when synthesizing IDs for incoming `tool_result` blocks.
 pub fn new_openai_tool_id() -> String {

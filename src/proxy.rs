@@ -98,6 +98,26 @@ pub async fn proxy_anthropic(
         );
     }
 
+    // Claude Code's built-in WebSearch tool sends a native sub-request (a
+    // `web_search_20250305` server tool + forced `tool_choice`). It expects
+    // the answer as native `server_tool_use`/`web_search_tool_result` blocks,
+    // so handle it before the transform consumes the request — the generic
+    // tool loop would return plain text and Claude would report "Did 0
+    // searches".
+    if config.websearch_available()
+        && let Some(query) = search::native::detect(&anthropic_req)
+    {
+        return proxy_native_search(
+            &client,
+            &config,
+            &hook_chain,
+            &anthropic_req,
+            &query,
+            is_streaming,
+        )
+        .await;
+    }
+
     let openai_req = anthropic_to_openai(
         anthropic_req,
         config.resolve_reasoning_model(),
@@ -416,6 +436,69 @@ async fn proxy_streaming_search(
     };
     let _ = responses_req;
     Ok(build_sse_response(converted))
+}
+
+/// Answer a Claude Code WebSearch sub-request with native Anthropic blocks.
+///
+/// The sub-request carries the `web_search_20250305` *server* tool and a forced
+/// `tool_choice`; it expects the response to be `server_tool_use` +
+/// `web_search_tool_result` + text (what Anthropic's own backend returns).
+/// klava runs the search directly and rebuilds that native shape, so Claude
+/// counts the search and surfaces the cited sources.
+async fn proxy_native_search(
+    client: &Client,
+    config: &Config,
+    hook_chain: &HookChain,
+    anthropic_req: &anthropic::AnthropicRequest,
+    query: &str,
+    client_streaming: bool,
+) -> Result<Response> {
+    let settings = search::resolve_settings(config, query).await;
+    tracing::info!(
+        "Web search [1]: query={:?} engine={} context={} max_results={}",
+        query,
+        settings.engine.as_str(),
+        settings.context.as_str(),
+        settings.max_results
+    );
+
+    let outcome = match search::execute_outcome(client, config, query, &settings).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::warn!("Web search failed: {e}");
+            // Keep the search counted and hand Claude a visible failure rather
+            // than a stream that never completes.
+            search::wire::SearchOutcome {
+                content: format!("Web search failed: {e}"),
+                sources: vec![],
+            }
+        }
+    };
+
+    let result = search::native::NativeSearchResult {
+        query: query.to_string(),
+        outcome,
+    };
+    // The search itself ran through a separate upstream request, so klava has
+    // no token accounting for this one; the values are informational.
+    let input_tokens = 0;
+    let output_tokens = 0;
+
+    if client_streaming {
+        let sse = search::native::response_sse(
+            &anthropic_req.model,
+            &result,
+            input_tokens,
+            output_tokens,
+        );
+        let stream = tokio_stream::iter(vec![Ok::<Bytes, Error>(Bytes::from(sse))]);
+        return Ok(build_sse_response(stream));
+    }
+
+    let body =
+        search::native::response_body(&anthropic_req.model, &result, input_tokens, output_tokens);
+    let body = hook_chain.execute(HookStage::BeforeResponse, body, config)?;
+    Ok(Json(body).into_response())
 }
 
 /// Drive a search-enabled request to completion.

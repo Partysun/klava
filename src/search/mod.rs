@@ -18,6 +18,8 @@ pub mod wire;
 #[cfg(feature = "decide")]
 pub mod decide;
 
+pub mod native;
+
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::models::openai;
@@ -238,6 +240,19 @@ pub async fn execute(
     query: &str,
     settings: &SearchSettings,
 ) -> Result<String> {
+    Ok(execute_outcome(client, config, query, settings)
+        .await?
+        .render())
+}
+
+/// Run one search and return its structured outcome (answer text plus cited
+/// sources). Rendering to the agent-visible string is left to the caller.
+pub async fn execute_outcome(
+    client: &Client,
+    config: &Config,
+    query: &str,
+    settings: &SearchSettings,
+) -> Result<wire::SearchOutcome> {
     let model = config
         .resolve_search_model()
         .ok_or_else(|| Error::Internal("No search model configured".to_string()))?;
@@ -273,7 +288,7 @@ pub async fn execute(
                 )));
             }
             let value: Value = response.json().await?;
-            return Ok(wire::parse_response(&value).render());
+            return Ok(wire::parse_response(&value));
         }
 
         return Err(Error::Upstream(format!(
@@ -282,7 +297,7 @@ pub async fn execute(
     }
 
     let value: Value = response.json().await?;
-    Ok(wire::parse_response(&value).render())
+    Ok(wire::parse_response(&value))
 }
 
 #[cfg(test)]
