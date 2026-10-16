@@ -248,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Stop { pid_file } => {
             let pid_file_path = pid_file.as_ref().unwrap_or(&cli.pid_file);
             let _ = stop_daemon(pid_file_path); // legacy daemon, may not exist
-            let _ = service::stop_service(config.port); // managed service
+            service::stop_service(config.port); // managed service
             tracing::info!("✓ Proxy stopped");
             return Ok(());
         }
@@ -269,7 +269,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::Up { port, no_provider_check, .. } => {
+        Command::Up {
+            port,
+            no_provider_check,
+            ..
+        } => {
             if cli.verbose {
                 config.verbose = true;
             }
@@ -289,18 +293,16 @@ async fn main() -> anyhow::Result<()> {
                             "✓ Installed managed service for port {} (auto-start at login)",
                             config.port
                         ),
-                        service::ServiceAction::Rewritten => tracing::info!(
-                            "✓ Refreshed managed service for port {}",
-                            config.port
-                        ),
+                        service::ServiceAction::Rewritten => {
+                            tracing::info!("✓ Refreshed managed service for port {}", config.port)
+                        }
                         service::ServiceAction::AlreadyActive => tracing::info!(
                             "✓ Managed service already running on port {}",
                             config.port
                         ),
-                        service::ServiceAction::Started => tracing::info!(
-                            "✓ Managed service started on port {}",
-                            config.port
-                        ),
+                        service::ServiceAction::Started => {
+                            tracing::info!("✓ Managed service started on port {}", config.port)
+                        }
                     }
                     tracing::info!(
                         "  Managed by: {} (status: `klava status`, logs: `journalctl --user -u {}`)",

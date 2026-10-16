@@ -13,7 +13,7 @@
 //! When systemd is unavailable (containers, macOS, Windows) callers fall back
 //! to the legacy spawned/daemonized proxy.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -111,7 +111,10 @@ pub fn systemd_available() -> bool {
     let Ok(systemctl) = which::which("systemctl") else {
         return false;
     };
-    match Command::new(systemctl).args(["--user", "is-system-running"]).output() {
+    match Command::new(systemctl)
+        .args(["--user", "is-system-running"])
+        .output()
+    {
         Ok(out) => out.status.success(),
         Err(_) => false,
     }
@@ -207,7 +210,9 @@ pub async fn ensure_service(config: &Config) -> Result<ServiceAction> {
     let path = unit_path(port);
     let name = unit_name(port);
 
-    if is_active(port) && path.exists() && fs::read_to_string(&path).ok().as_deref() == Some(&expected)
+    if is_active(port)
+        && path.exists()
+        && fs::read_to_string(&path).ok().as_deref() == Some(&expected)
     {
         return Ok(ServiceAction::AlreadyActive);
     }
@@ -238,8 +243,7 @@ pub async fn ensure_service(config: &Config) -> Result<ServiceAction> {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         }
-        run_systemctl(&["daemon-reload"])
-            .context("systemctl --user daemon-reload failed")?;
+        run_systemctl(&["daemon-reload"]).context("systemctl --user daemon-reload failed")?;
         if existed {
             tracing::info!("Refreshed {}", name);
             let _ = run_systemctl(&["reset-failed", &name]);
@@ -258,12 +262,14 @@ pub async fn ensure_service(config: &Config) -> Result<ServiceAction> {
         ));
     }
 
-    wait_health(port, Duration::from_secs(10)).await.map_err(|e| {
-        anyhow!(
-            "{e}\nThe unit may be crash-looping. Inspect it with:\n  \
+    wait_health(port, Duration::from_secs(10))
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "{e}\nThe unit may be crash-looping. Inspect it with:\n  \
              journalctl --user -u {name} -n 50 --no-pager"
-        )
-    })?;
+            )
+        })?;
 
     Ok(if !existed {
         ServiceAction::Installed
@@ -325,7 +331,10 @@ mod tests {
     #[test]
     fn unit_path_is_under_user_systemd_dir() {
         let p = unit_path(48017);
-        assert!(p.to_string_lossy().ends_with("systemd/user/klava-48017.service"));
+        assert!(
+            p.to_string_lossy()
+                .ends_with("systemd/user/klava-48017.service")
+        );
     }
 
     #[test]
@@ -333,7 +342,9 @@ mod tests {
         let unit = render_unit(Path::new("/opt/klava"), 48017, &[]);
         assert!(unit.contains(UNIT_MARKER));
         assert!(unit.contains("Description=klava proxy (port 48017)"));
-        assert!(unit.contains("ExecStart=/opt/klava up --port 48017 --foreground --no-provider-check"));
+        assert!(
+            unit.contains("ExecStart=/opt/klava up --port 48017 --foreground --no-provider-check")
+        );
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=2"));
         assert!(unit.contains("WantedBy=default.target"));
@@ -351,29 +362,35 @@ mod tests {
 
     #[test]
     fn env_entries_only_include_set_vars() {
-        let mut config = Config::default();
-        config.providers = vec![
-            klava::providers::Config {
-                name: "with-env".into(),
-                provider_type: klava::providers::Type::OpenAICompatible,
-                base_url: None,
-                chat_completions_path: None,
-                api_key: None,
-                api_key_name: Some("KLAVA_TEST_AUTH_KEY_A".into()),
-                reasoning_model: None,
-                completion_model: None,
-            },
-            klava::providers::Config {
-                name: "no-env".into(),
-                provider_type: klava::providers::Type::OpenAICompatible,
-                base_url: None,
-                chat_completions_path: None,
-                api_key: Some("inline".into()),
-                api_key_name: None,
-                reasoning_model: None,
-                completion_model: None,
-            },
-        ];
+        let config = Config {
+            port: 48017,
+            active_provider: String::new(),
+            providers: vec![
+                klava::providers::Config {
+                    name: "with-env".into(),
+                    provider_type: klava::providers::Type::OpenAICompatible,
+                    base_url: None,
+                    chat_completions_path: None,
+                    api_key: None,
+                    api_key_name: Some("KLAVA_TEST_AUTH_KEY_A".into()),
+                    reasoning_model: None,
+                    completion_model: None,
+                },
+                klava::providers::Config {
+                    name: "no-env".into(),
+                    provider_type: klava::providers::Type::OpenAICompatible,
+                    base_url: None,
+                    chat_completions_path: None,
+                    api_key: Some("inline".into()),
+                    api_key_name: None,
+                    reasoning_model: None,
+                    completion_model: None,
+                },
+            ],
+            verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
+        };
         unsafe {
             std::env::set_var("KLAVA_TEST_AUTH_KEY_A", "set-value");
         }
