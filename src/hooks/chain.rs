@@ -263,6 +263,7 @@ mod tests {
             enable_token_stats: true,
             active_provider: "".to_string(),
             providers: vec![],
+            ..Config::default()
         };
         let chain = default_chain(&disabled);
         let has_hook = |stage: HookStage, name: &str| {

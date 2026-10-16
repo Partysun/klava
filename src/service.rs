@@ -82,7 +82,8 @@ fn env_entries(config: &Config) -> Vec<(String, String)> {
 }
 
 /// Render the systemd user unit for a proxy on `port`.
-pub fn render_unit(exe: &Path, port: u16, env: &[(String, String)]) -> String {
+pub fn render_unit(exe: &Path, port: u16, env: &[(String, String)], search: bool) -> String {
+    let search_arg = if search { " --search" } else { "" };
     let mut unit = format!(
         "{UNIT_MARKER}\n\
          [Unit]\n\
@@ -92,7 +93,7 @@ pub fn render_unit(exe: &Path, port: u16, env: &[(String, String)]) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={} up --port {port} --foreground --no-provider-check\n",
+         ExecStart={} up --port {port} --foreground --no-provider-check{search_arg}\n",
         exe.display(),
     );
     for (key, value) in env {
@@ -246,7 +247,7 @@ async fn ensure_systemd_service(config: &Config) -> Result<ServiceAction> {
     let port = config.port;
     let exe = exe_path();
     let env = env_entries(config);
-    let expected = render_unit(&exe, port, &env);
+    let expected = render_unit(&exe, port, &env, config.enable_websearch);
     let path = unit_path(port);
     let name = unit_name(port);
 
@@ -423,9 +424,20 @@ fn xml_escape(value: &str) -> String {
 }
 
 /// Render the launchd LaunchAgent plist for a proxy on `port`.
-pub fn render_plist(exe: &Path, port: u16, env: &[(String, String)], log_path: &Path) -> String {
+pub fn render_plist(
+    exe: &Path,
+    port: u16,
+    env: &[(String, String)],
+    log_path: &Path,
+    search: bool,
+) -> String {
     let label = instance_name(port);
     let log = log_path.display();
+    let search_arg = if search {
+        "\t\t<string>--search</string>\n"
+    } else {
+        ""
+    };
     let mut plist = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -443,7 +455,7 @@ pub fn render_plist(exe: &Path, port: u16, env: &[(String, String)], log_path: &
          \t\t<string>{port}</string>\n\
          \t\t<string>--foreground</string>\n\
          \t\t<string>--no-provider-check</string>\n\
-         \t</array>\n",
+         {search_arg}\t</array>\n",
         xml_escape(&exe.display().to_string()),
     );
     if !env.is_empty() {
@@ -540,7 +552,7 @@ async fn ensure_launchd_service(config: &Config) -> Result<ServiceAction> {
         .ok_or_else(|| anyhow!("cannot determine home directory"))?
         .join("Library/Logs");
     let log_path = log_dir.join(format!("{label}.log"));
-    let expected = render_plist(&exe, port, &env, &log_path);
+    let expected = render_plist(&exe, port, &env, &log_path, config.enable_websearch);
 
     let loaded = launchd_is_loaded(&label);
     if loaded
@@ -656,6 +668,7 @@ mod tests {
             48017,
             &[],
             Path::new("/tmp/klava-48017.log"),
+            false,
         );
         assert!(plist.contains(UNIT_MARKER));
         assert!(plist.contains("<string>klava-48017</string>"));
@@ -673,6 +686,7 @@ mod tests {
             48017,
             &[("KEY".to_string(), "a&b<c>d\"e".to_string())],
             Path::new("/tmp/klava-48017.log"),
+            false,
         );
         assert!(plist.contains("<key>KEY</key>"));
         assert!(plist.contains("<string>a&amp;b&lt;c&gt;d&quot;e</string>"));
@@ -707,7 +721,7 @@ mod tests {
 
     #[test]
     fn render_unit_has_marker_port_and_no_provider_check() {
-        let unit = render_unit(Path::new("/opt/klava"), 48017, &[]);
+        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], false);
         assert!(unit.contains(UNIT_MARKER));
         assert!(unit.contains("Description=klava proxy (port 48017)"));
         assert!(
@@ -719,11 +733,35 @@ mod tests {
     }
 
     #[test]
+    fn render_unit_adds_search_flag_when_enabled() {
+        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], true);
+        assert!(
+            unit.contains(
+                "ExecStart=/opt/klava up --port 48017 --foreground --no-provider-check --search"
+            ),
+            "unit: {unit}"
+        );
+
+        let plist = render_plist(
+            Path::new("/opt/klava"),
+            48017,
+            &[],
+            Path::new("/tmp/klava-48017.log"),
+            true,
+        );
+        assert!(
+            plist.contains("<string>--search</string>"),
+            "plist: {plist}"
+        );
+    }
+
+    #[test]
     fn render_unit_includes_environment_entries() {
         let unit = render_unit(
             Path::new("/opt/klava"),
             48017,
             &[("OPENROUTER_API_KEY".to_string(), "sk-123".to_string())],
+            false,
         );
         assert!(unit.contains("Environment=OPENROUTER_API_KEY=sk-123"));
     }

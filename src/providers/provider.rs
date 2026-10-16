@@ -91,6 +91,23 @@ impl ProvidersConfig {
             }
             #[cfg(feature = "klava")]
             ProviderType::Klava => {
+                // An explicit key wins: the config `api_key` field, or the
+                // env var named by `api_key_name` (e.g. KLAVA_API_KEY).
+                // Otherwise fall back to the credentials saved by `klava login`.
+                let explicit = self.api_key.clone().filter(|k| !k.is_empty()).or_else(|| {
+                    self.api_key_name
+                        .as_ref()
+                        .and_then(|name| std::env::var(name).ok())
+                });
+                if let Some(key) = explicit.filter(|k| !k.is_empty()) {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        reqwest::header::AUTHORIZATION,
+                        HeaderValue::from_str(&format!("Bearer {key}"))
+                            .map_err(|_| Error::Provider("Invalid API key".to_string()))?,
+                    );
+                    return Ok(Some(headers));
+                }
                 let mut klava_auth = crate::klava_auth::KlavaAuth::new();
                 klava_auth
                     .get_auth_headers()
@@ -103,6 +120,42 @@ impl ProvidersConfig {
     /// Auth headers ( delegates to get_auth_headers_for for backward compat )
     pub async fn get_auth_headers(&self, config: &Config) -> Result<Option<HeaderMap>> {
         self.get_auth_headers_for(config).await
+    }
+
+    /// Whether this provider is the klava gateway provider.
+    pub fn is_klava(&self) -> bool {
+        #[cfg(feature = "klava")]
+        {
+            self.provider_type == ProviderType::Klava
+        }
+        #[cfg(not(feature = "klava"))]
+        {
+            false
+        }
+    }
+
+    /// Whether klava is usable right now: an explicit key (config `api_key`,
+    /// or the `api_key_name` env var such as `KLAVA_API_KEY`) or a saved
+    /// `klava login` session.
+    pub fn has_klava_auth(&self) -> bool {
+        if self.api_key.as_ref().is_some_and(|k| !k.is_empty()) {
+            return true;
+        }
+        if self
+            .api_key_name
+            .as_ref()
+            .is_some_and(|n| std::env::var(n).is_ok_and(|k| !k.is_empty()))
+        {
+            return true;
+        }
+        #[cfg(feature = "klava")]
+        {
+            crate::klava_auth::KlavaAuth::new().is_authenticated()
+        }
+        #[cfg(not(feature = "klava"))]
+        {
+            false
+        }
     }
 
     /// Validate config
@@ -148,7 +201,11 @@ impl ProvidersConfig {
             #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
             #[cfg(feature = "klava")]
-            ProviderType::Klava => Some("https://klava.zatsepin.dev/api".to_string()),
+            ProviderType::Klava => Some(
+                self.base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://klava.zatsepin.dev/api".to_string()),
+            ),
         }
     }
 

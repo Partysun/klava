@@ -1,6 +1,6 @@
 [package]
 name = "klava"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."
@@ -85,6 +85,10 @@ inquire = { version = "0.9.4", default-features = false, features = [
 pii = "0.1.0"
 tokenx-rs = "0.1.0"
 
+# Decision model (System One / jigor) used to tune web-search settings.
+# Remote-only: `default-features = false` keeps ONNX Runtime out of the tree.
+jigor = { version = "0.1.14", default-features = false, optional = true }
+
 # Optional dependencies for qwen-code feature
 sha2 = { version = "0.11", optional = true }
 base64 = { version = "0.23.1", optional = true }
@@ -92,11 +96,14 @@ rand = { version = "0.10", optional = true }
 
 # Optional feature flags
 [features]
-default = ["qwen-code", "klava", "opencode", "codex", "pi"]
+default = ["qwen-code", "klava", "opencode", "codex", "pi", "decide"]
 opencode = []
 codex = []
 pi = []
 telemetry = []
+# The decision model (jigor / System One) that tunes web-search settings.
+# klava's search tool itself always compiles; this only gates the tuning step.
+decide = ["dep:jigor"]
 qwen-code = ["dep:sha2", "dep:base64", "dep:rand"]
 klava = ["dep:sha2", "dep:base64", "dep:rand"]
 

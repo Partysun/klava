@@ -9,6 +9,7 @@ pub mod openai_stream;
 pub mod providers;
 pub mod proxy;
 pub mod responses;
+pub mod search;
 pub mod server;
 pub mod stream_converter;
 pub mod telemetry;

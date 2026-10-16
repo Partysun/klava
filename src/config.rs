@@ -19,10 +19,71 @@ pub struct Config {
     pub active_provider: String,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+
+    // ---- Web search -------------------------------------------------------
+    /// Offer a web-search tool to the agent and run searches through the
+    /// active provider. On by default; it only makes sense for providers
+    /// that carry a search backend.
+    #[serde(default = "default_enable_websearch")]
+    pub enable_websearch: bool,
+    /// Model used to run the search request. Defaults to the active
+    /// completion model when unset.
+    #[serde(default)]
+    pub search_model: Option<String>,
+    /// Search backend family (klava vocabulary): `web_fast`, `web_deep`,
+    /// `web_native`, or `auto`. Maps to the internal engine/mode pair.
+    #[serde(default = "default_search_engine")]
+    pub search_engine: String,
+    /// How much page context to pull into the answer: `low`, `medium`, `high`.
+    #[serde(default = "default_search_context")]
+    pub search_context: String,
+    /// Upper bound on results the backend may consider.
+    #[serde(default = "default_search_max_results")]
+    pub search_max_results: u32,
+    /// Instruction prepended to the generated search query.
+    #[serde(default)]
+    pub search_prompt: Option<String>,
+    /// Restrict the search to these domains (empty = no restriction).
+    #[serde(default)]
+    pub search_include_domains: Vec<String>,
+    /// Exclude these domains from the search (empty = no restriction).
+    #[serde(default)]
+    pub search_exclude_domains: Vec<String>,
+    /// Let the decision model tune the search settings per query. When off,
+    /// the static config values above are used as-is.
+    #[serde(default = "default_search_decide")]
+    pub search_decide: bool,
+    /// Decision model id used to tune the search settings.
+    #[serde(default = "default_search_decide_model")]
+    pub search_decide_model: String,
 }
 
 fn default_enable_pii() -> bool {
     true
+}
+
+fn default_enable_websearch() -> bool {
+    true
+}
+
+fn default_search_engine() -> String {
+    "auto".to_string()
+}
+
+fn default_search_context() -> String {
+    "medium".to_string()
+}
+
+fn default_search_max_results() -> u32 {
+    5
+}
+
+fn default_search_decide() -> bool {
+    true
+}
+
+fn default_search_decide_model() -> String {
+    "typesafe/jev-1.13".to_string()
 }
 
 impl Default for Config {
@@ -34,6 +95,16 @@ impl Default for Config {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            enable_websearch: default_enable_websearch(),
+            search_model: None,
+            search_engine: default_search_engine(),
+            search_context: default_search_context(),
+            search_max_results: default_search_max_results(),
+            search_prompt: None,
+            search_include_domains: vec![],
+            search_exclude_domains: vec![],
+            search_decide: default_search_decide(),
+            search_decide_model: default_search_decide_model(),
         }
     }
 }
@@ -91,6 +162,9 @@ impl Config {
         println!("verbose:          Enable verbose logging");
         println!("                  Logs full request/response bodies");
         println!();
+        println!("enable_websearch: Offer the agent a web-search tool (default: true)");
+        println!("                  Only active with the klava provider and klava login");
+        println!();
     }
 
     /// Write the config file template with commented examples
@@ -133,6 +207,42 @@ impl Config {
 
 # Log an estimated token count for each request (default: false)
 #enable_token_stats = false
+
+# ---- Web search ----------------------------------------------------------
+# Offer a web-search tool to agents. Only active with the klava provider
+# (the search backend is reachable only through the klava gateway), and only
+# when klava is signed in (`klava login`) or KLAVA_API_KEY is set. When the
+# model calls the tool, klava intercepts it, optionally asks a decision model
+# to tune the settings, runs the search, and feeds the result back — the
+# agent never sees the tool call itself.
+#enable_websearch = true
+
+# Model used to run the search. Defaults to the active completion model.
+#search_model = ""
+
+# Search backend family: "auto", "web_fast", "web_deep" or "web_native".
+#search_engine = "auto"
+
+# How much page context to pull into the answer: "low", "medium" or "high".
+#search_context = "medium"
+
+# Upper bound on results the backend may consider (default: 5).
+#search_max_results = 5
+
+# Instruction prepended to the generated search query.
+#search_prompt = ""
+
+# Restrict the search to these domains (empty = no restriction).
+#search_include_domains = []
+
+# Exclude these domains from the search (empty = no restriction).
+#search_exclude_domains = []
+
+# Let a decision model tune the search settings for each query (default: true).
+#search_decide = true
+
+# Decision model id used to tune the search settings.
+#search_decide_model = "typesafe/jev-1.13"
 "#;
 
         fs::write(&path, template)?;
@@ -277,6 +387,29 @@ impl Config {
             .and_then(|p| p.chat_completions_url())
             .expect("Base URL not configured for active provider")
     }
+
+    /// Model used for web-search requests: the explicit `search_model` when
+    /// set, otherwise the completion model of the active provider.
+    pub fn resolve_search_model(&self) -> Option<String> {
+        self.search_model
+            .clone()
+            .filter(|m| !m.is_empty())
+            .or_else(|| self.resolve_completion_model())
+    }
+
+    /// Whether web search should be active for this setup: enabled in config,
+    /// the active provider is the klava gateway, and klava is authenticated
+    /// (saved `klava login` session or an explicit `KLAVA_API_KEY`-style key).
+    /// The search backend is only reachable through the klava gateway, so the
+    /// feature stays off for every other provider.
+    pub fn websearch_available(&self) -> bool {
+        if !self.enable_websearch {
+            return false;
+        }
+        self.get_active_provider_config()
+            .map(|p| p.is_klava() && p.has_klava_auth())
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -323,6 +456,7 @@ mod tests {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            ..Config::default()
         };
 
         let active_config = config.get_active_provider_config().unwrap();
@@ -365,6 +499,7 @@ mod tests {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            ..Config::default()
         };
 
         let provider_config = config.get_provider_config("second_provider").unwrap();
@@ -397,6 +532,7 @@ mod tests {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            ..Config::default()
         };
 
         let active_config = config.get_active_provider_config().unwrap();
@@ -422,6 +558,7 @@ mod tests {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            ..Config::default()
         };
 
         assert_eq!(
@@ -448,6 +585,7 @@ mod tests {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            ..Config::default()
         };
 
         // Trailing slash on base_url and custom path are handled.
@@ -475,11 +613,227 @@ mod tests {
             verbose: false,
             enable_pii: true,
             enable_token_stats: false,
+            ..Config::default()
         };
 
         assert_eq!(
             config.chat_completions_url(),
             "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[cfg(feature = "klava")]
+    fn klava_provider(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            provider_type: ProviderType::Klava,
+            base_url: None,
+            chat_completions_path: None,
+            api_key: None,
+            api_key_name: None,
+            reasoning_model: None,
+            completion_model: None,
+        }
+    }
+
+    #[cfg(feature = "klava")]
+    fn openai_provider(name: &str) -> ProviderConfig {
+        ProviderConfig {
+            name: name.to_string(),
+            provider_type: ProviderType::OpenAICompatible,
+            base_url: Some("https://test.example.com".to_string()),
+            chat_completions_path: None,
+            api_key: None,
+            api_key_name: None,
+            reasoning_model: None,
+            completion_model: None,
+        }
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_requires_klava_provider() {
+        let _guard = AUTH_FILE_TEST_LOCK.lock().unwrap();
+        let config = Config {
+            port: 3000,
+            active_provider: "openai".to_string(),
+            providers: vec![openai_provider("openai")],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        // Non-klava active provider → no web search, even with auth env set.
+        unsafe {
+            std::env::set_var("KLAVA_API_KEY", "sk-test");
+        }
+        assert!(!config.websearch_available());
+        unsafe {
+            std::env::remove_var("KLAVA_API_KEY");
+        }
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_requires_enable_flag() {
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![ProviderConfig {
+                api_key: Some("sk-test".to_string()),
+                ..klava_provider("klava")
+            }],
+            enable_websearch: false,
+            ..Config::default()
+        };
+        assert!(!config.websearch_available());
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_true_with_explicit_key() {
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![ProviderConfig {
+                api_key: Some("sk-test".to_string()),
+                ..klava_provider("klava")
+            }],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        assert!(config.websearch_available());
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_true_with_env_key() {
+        let _guard = AUTH_FILE_TEST_LOCK.lock().unwrap();
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![ProviderConfig {
+                api_key_name: Some("KLAVA_API_KEY".to_string()),
+                ..klava_provider("klava")
+            }],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        unsafe {
+            std::env::set_var("KLAVA_API_KEY", "sk-env-key");
+        }
+        assert!(config.websearch_available());
+        unsafe {
+            std::env::remove_var("KLAVA_API_KEY");
+        }
+    }
+
+    /// Serializes tests that point `KLAVA_AUTH_FILE` at temp files: the env
+    /// var is process-global and cargo runs tests in parallel.
+    #[cfg(feature = "klava")]
+    static AUTH_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_false_without_any_auth() {
+        let _guard = AUTH_FILE_TEST_LOCK.lock().unwrap();
+        // Point the saved-login check at a nonexistent file so the test is
+        // hermetic (the dev machine may have a real ~/.local/share login).
+        let missing = std::env::temp_dir().join(format!("klava-noauth-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("KLAVA_AUTH_FILE", &missing);
+        }
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![klava_provider("klava")],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        // No api_key, no api_key_name, no saved login at the pointed path.
+        assert!(!config.websearch_available());
+        unsafe {
+            std::env::remove_var("KLAVA_AUTH_FILE");
+        }
+        let _ = std::fs::remove_file(&missing);
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_true_with_saved_login() {
+        let _guard = AUTH_FILE_TEST_LOCK.lock().unwrap();
+        // Simulate a `klava login`: a valid credentials file at the pointed path.
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("klava-auth-{}", std::process::id()));
+        let creds = serde_json::json!({
+            "api_key": "sk_saved_login",
+            "key_preview": "sk_saved…",
+            "email": "t@example.com",
+            "base_url": "https://klava.zatsepin.dev",
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(creds.to_string().as_bytes()).unwrap();
+        unsafe {
+            std::env::set_var("KLAVA_AUTH_FILE", &path);
+        }
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![klava_provider("klava")],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        assert!(config.websearch_available());
+        unsafe {
+            std::env::remove_var("KLAVA_AUTH_FILE");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn websearch_available_false_when_no_active_provider() {
+        let config = Config {
+            port: 3000,
+            active_provider: "missing".to_string(),
+            providers: vec![klava_provider("klava")],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        assert!(!config.websearch_available());
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn klava_provider_resolves_default_base_url_without_config() {
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![klava_provider("klava")],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://klava.zatsepin.dev/api/v1/chat/completions"
+        );
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn klava_provider_resolves_custom_base_url_when_configured() {
+        let config = Config {
+            port: 3000,
+            active_provider: "klava".to_string(),
+            providers: vec![ProviderConfig {
+                base_url: Some("https://dev.example.com/api".to_string()),
+                ..klava_provider("klava")
+            }],
+            enable_websearch: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.chat_completions_url(),
+            "https://dev.example.com/api/v1/chat/completions"
         );
     }
 }

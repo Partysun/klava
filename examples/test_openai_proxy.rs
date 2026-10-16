@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         verbose: persistent.verbose,
         enable_pii: persistent.enable_pii,
         enable_token_stats: persistent.enable_token_stats,
+        ..persistent.clone()
     };
 
     // Validate config and run interactive setup if needed

@@ -49,22 +49,28 @@ impl KlavaModel {
 
 /// Deserialize a money amount that the backend may send either as a JSON
 /// number (`9411.823457`) or as a decimal string (`"9411.823457"`).
+///
+/// Reads through `serde_json::Value` rather than an untagged enum: with
+/// `serde_json`'s `arbitrary_precision` feature enabled anywhere in the
+/// dependency graph (jigor turns it on), a numeric `deserialize_any` no longer
+/// matches an untagged `f64` variant, so the untagged form silently rejects
+/// numbers.
 fn deserialize_amount<'de, D>(d: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Amount {
-        Number(f64),
-        Text(String),
-    }
-    match Amount::deserialize(d)? {
-        Amount::Number(n) => Ok(n),
-        Amount::Text(s) => s
+    let value = serde_json::Value::deserialize(d)?;
+    match &value {
+        serde_json::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid amount: {n}"))),
+        serde_json::Value::String(s) => s
             .trim()
             .parse()
             .map_err(|_| serde::de::Error::custom(format!("invalid amount: {s:?}"))),
+        other => Err(serde::de::Error::custom(format!(
+            "invalid amount: {other:?}"
+        ))),
     }
 }
 
@@ -172,11 +178,14 @@ impl KlavaAuth {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("klava");
 
-        if !auth_dir.exists() {
-            fs::create_dir_all(&auth_dir).ok();
-        }
-
-        let auth_file_path = auth_dir.join("klava-auth.json");
+        // Test/dev override: point the auth file elsewhere (e.g. a temp dir).
+        // Used by unit tests to be hermetic; not a supported user feature.
+        let auth_file_path = std::env::var("KLAVA_AUTH_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                fs::create_dir_all(&auth_dir).ok();
+                auth_dir.join("klava-auth.json")
+            });
         let base_url = std::env::var("KLAVA_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')

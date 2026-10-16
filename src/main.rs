@@ -62,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
             provider,
             port,
             no_service,
+            search,
+            search_model,
         } => {
             use inquire::Select;
 
@@ -71,6 +73,14 @@ async fn main() -> anyhow::Result<()> {
             // Handle port override if provided
             if let Some(cli_port) = port {
                 current_config.port = cli_port;
+            }
+
+            // Web search: --search-model implies --search.
+            if search || search_model.is_some() {
+                current_config.enable_websearch = true;
+            }
+            if let Some(model) = search_model {
+                current_config.search_model = Some(model);
             }
 
             // Handle provider switch if provided
@@ -273,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Up {
             port,
             no_provider_check,
+            search,
             ..
         } => {
             if cli.verbose {
@@ -281,6 +292,12 @@ async fn main() -> anyhow::Result<()> {
 
             if let Some(cli_port) = port {
                 config.port = cli_port;
+            }
+
+            // The managed service passes --search so the running proxy enables
+            // web search even though it only receives a port on its command line.
+            if search {
+                config.enable_websearch = true;
             }
 
             // Daemon mode: prefer the managed service (systemd on Linux,
@@ -1181,10 +1198,12 @@ mod tests {
                     port,
                     foreground,
                     no_provider_check,
+                    search,
                 } => {
                     assert_eq!(port, Some(8080));
                     assert!(foreground);
                     assert!(!no_provider_check);
+                    assert!(!search);
                 }
                 _ => panic!("Expected up command"),
             }
@@ -1204,6 +1223,35 @@ mod tests {
                     assert!(no_service);
                     assert!(agent.is_some());
                 }
+                _ => panic!("Expected launch command"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parses_launch_search_flags() {
+        let parsed =
+            Cli::try_parse_from(["klava", "launch", "opencode", "--search-model", "my/search"]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Launch {
+                    search,
+                    search_model,
+                    ..
+                } => {
+                    assert!(!search);
+                    assert_eq!(search_model.as_deref(), Some("my/search"));
+                }
+                _ => panic!("Expected launch command"),
+            }
+        }
+
+        let parsed = Cli::try_parse_from(["klava", "launch", "opencode", "--search"]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Launch { search, .. } => assert!(search),
                 _ => panic!("Expected launch command"),
             }
         }

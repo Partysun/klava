@@ -259,6 +259,18 @@ mod integration_tests {
         ChatJsonContentFilter,
         /// Streaming: reasoning delta -> content -> finish_reason -> [DONE].
         SseReasoning,
+        /// Web-search loop: first call returns a `web_search` tool call; the
+        /// search request (carrying `plugins`) returns annotated content; the
+        /// follow-up call (carrying a `tool` message) returns the final answer.
+        SearchLoop,
+        /// Web-search loop where the first turn also asks for a client-owned
+        /// tool; klava must run its search but hand the other call back.
+        SearchMixed,
+        /// Web-search loop served over SSE: round 1 streams a `web_search`
+        /// tool call (role delta + tool-call deltas + finish), the search
+        /// request (non-streaming, carrying `plugins`) returns annotated
+        /// content, and round 2 streams the final answer.
+        SearchLoopStreaming,
     }
 
     fn json_response(v: &Value) -> Response<Body> {
@@ -320,6 +332,164 @@ mod integration_tests {
                     log.lock().unwrap().push(v.clone());
 
                     let streaming = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+
+                    // Web-search loop: distinguish the three request kinds by
+                    // shape — search request (has `plugins`), follow-up (has a
+                    // `tool` message), or the first call (tool call request).
+                    if matches!(mode, FakeMode::SearchLoop | FakeMode::SearchMixed) {
+                        let has_plugins = v.get("plugins").is_some();
+                        let has_tool_result = v["messages"]
+                            .as_array()
+                            .is_some_and(|m| m.iter().any(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("tool")));
+
+                        if has_plugins {
+                            return json_response(&json!({
+                                "id": "search-1",
+                                "object": "chat.completion",
+                                "created": 0,
+                                "model": "m",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Rust 1.90 shipped today.",
+                                        "annotations": [
+                                            {"type": "url_citation", "url_citation": {"url": "https://blog.rust-lang.org", "title": "Rust Blog"}}
+                                        ]
+                                    },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                            }));
+                        }
+
+                        if has_tool_result {
+                            return json_response(&json!({
+                                "id": "final-1",
+                                "object": "chat.completion",
+                                "created": 0,
+                                "model": "m",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "Rust 1.90 was released today."},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                            }));
+                        }
+
+                        let tool_calls = if matches!(mode, FakeMode::SearchMixed) {
+                            json!([
+                                {
+                                    "id": "call_search_1",
+                                    "type": "function",
+                                    "function": {"name": "web_search", "arguments": "{\"query\":\"latest rust release\"}"}
+                                },
+                                {
+                                    "id": "call_bash_1",
+                                    "type": "function",
+                                    "function": {"name": "bash", "arguments": "{\"cmd\":\"rustc --version\"}"}
+                                }
+                            ])
+                        } else {
+                            json!([{
+                                "id": "call_search_1",
+                                "type": "function",
+                                "function": {"name": "web_search", "arguments": "{\"query\":\"latest rust release\"}"}
+                            }])
+                        };
+
+                        return json_response(&json!({
+                            "id": "call-1",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "m",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": tool_calls
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }));
+                    }
+
+                    if matches!(mode, FakeMode::SearchLoopStreaming) {
+                        let has_plugins = v.get("plugins").is_some();
+                        let has_tool_result = v["messages"]
+                            .as_array()
+                            .is_some_and(|m| m.iter().any(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("tool")));
+
+                        if has_plugins {
+                            return json_response(&json!({
+                                "id": "search-1",
+                                "object": "chat.completion",
+                                "created": 0,
+                                "model": "m",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Rust 1.90 shipped today.",
+                                        "annotations": [
+                                            {"type": "url_citation", "url_citation": {"url": "https://blog.rust-lang.org", "title": "Rust Blog"}}
+                                        ]
+                                    },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                            }));
+                        }
+
+                        if has_tool_result {
+                            return sse_response(&format!(
+                                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                                content_chunk("Rust 1.90 was released today."),
+                                stop_chunk()
+                            ));
+                        }
+
+                        // Round 1: stream a web_search tool call.
+                        let role_chunk = json!({
+                            "id": "c1",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": "m",
+                            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+                        });
+                        let call_start = json!({
+                            "id": "c1",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": "m",
+                            "choices": [{"index": 0, "delta": {"tool_calls": [
+                                {"index": 0, "id": "call_search_1", "type": "function", "function": {"name": "web_search", "arguments": ""}}
+                            ]}, "finish_reason": null}]
+                        });
+                        let call_args = json!({
+                            "id": "c1",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": "m",
+                            "choices": [{"index": 0, "delta": {"tool_calls": [
+                                {"index": 0, "function": {"arguments": "{\"query\":\"latest rust release\"}"}}
+                            ]}, "finish_reason": null}]
+                        });
+                        let finish_chunk = json!({
+                            "id": "c1",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": "m",
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                        });
+                        return sse_response(&format!(
+                            "data: {role_chunk}\n\ndata: {call_start}\n\ndata: {call_args}\n\ndata: {finish_chunk}\n\ndata: [DONE]\n\n"
+                        ));
+                    }
+
                     if !streaming {
                         let finish_reason = match mode {
                             FakeMode::ChatJsonContentFilter => "content_filter",
@@ -370,7 +540,11 @@ mod integration_tests {
                             content_chunk("hi"),
                             stop_chunk()
                         )),
-                        FakeMode::ChatJson | FakeMode::ChatJsonContentFilter => json_response(&json!({
+                        FakeMode::ChatJson
+                        | FakeMode::ChatJsonContentFilter
+                        | FakeMode::SearchLoop
+                        | FakeMode::SearchMixed
+                        | FakeMode::SearchLoopStreaming => json_response(&json!({
                             "id": "c1",
                             "object": "chat.completion",
                             "created": 0,
@@ -397,6 +571,19 @@ mod integration_tests {
 
     /// Build the klava router pointed at `base_url`.
     fn build_proxy(base_url: &str) -> Router {
+        build_proxy_opts(base_url, false)
+    }
+
+    /// Build the klava router with web search toggled. The fake provider is
+    /// typed as klava (with an explicit api key) so the web-search gate
+    /// passes in tests; the base URL points at the fake upstream. Decision
+    /// tuning is always disabled here so tests never touch the network.
+    fn build_proxy_opts(base_url: &str, enable_websearch: bool) -> Router {
+        #[cfg(feature = "klava")]
+        let provider_type = ProviderType::Klava;
+        #[cfg(not(feature = "klava"))]
+        let provider_type = ProviderType::OpenAICompatible;
+
         let config = Arc::new(Config {
             port: 0,
             verbose: false,
@@ -405,7 +592,7 @@ mod integration_tests {
             active_provider: "fake".to_string(),
             providers: vec![ProviderConfig {
                 name: "fake".to_string(),
-                provider_type: ProviderType::OpenAICompatible,
+                provider_type,
                 base_url: Some(base_url.to_string()),
                 chat_completions_path: None,
                 api_key: Some("test-key".to_string()),
@@ -413,6 +600,9 @@ mod integration_tests {
                 reasoning_model: Some("reasoning-model".to_string()),
                 completion_model: Some("completion-model".to_string()),
             }],
+            enable_websearch,
+            search_decide: false,
+            ..Config::default()
         });
         let client = reqwest::Client::new();
         let cors = create_cors_layer();
@@ -718,5 +908,214 @@ mod integration_tests {
             body.contains("response.reasoning_summary_part.done"),
             "body: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn websearch_loop_runs_search_and_hides_the_tool_call() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchLoop, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "m", "messages": [{"role": "user", "content": "latest rust release?"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // The client sees only the final answer — never the intercepted call.
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            "Rust 1.90 was released today."
+        );
+        assert!(v["choices"][0]["message"].get("tool_calls").is_none());
+
+        let sent = log.lock().unwrap();
+        assert_eq!(sent.len(), 3, "call -> search -> final: {sent:#?}");
+
+        // The search request carried the search plugin + context option.
+        let search = &sent[1];
+        assert_eq!(search["plugins"][0]["id"], json!("web"));
+        assert_eq!(
+            search["messages"][0]["content"],
+            json!("latest rust release")
+        );
+        assert_eq!(
+            search["web_search_options"]["search_context_size"],
+            json!("medium")
+        );
+
+        // The follow-up carried the tool result and kept the search tool def.
+        let follow = &sent[2];
+        assert!(
+            follow["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == json!("tool")),
+            "follow-up must carry the tool result: {follow:#?}"
+        );
+        assert!(
+            follow["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("blog.rust-lang.org"))),
+            "tool result must include the cited source: {follow:#?}"
+        );
+        let tools = follow["tools"].as_array().unwrap();
+        assert!(
+            tools
+                .iter()
+                .any(|t| t["function"]["name"] == json!("web_search"))
+        );
+    }
+
+    #[tokio::test]
+    async fn websearch_mixed_turn_keeps_client_tool_call() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchMixed, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({
+                "model": "m",
+                "tools": [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+                "messages": [{"role": "user", "content": "latest rust release?"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        // The client's own tool call survives; klava's search call does not.
+        let calls = v["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "expected only the client tool: {v:#?}");
+        assert_eq!(calls[0]["function"]["name"], "bash");
+
+        let sent = log.lock().unwrap();
+        // call -> search -> return-to-client (no follow-up re-run).
+        assert_eq!(sent.len(), 2, "{sent:#?}");
+        assert_eq!(sent[1]["plugins"][0]["id"], json!("web"));
+    }
+
+    #[tokio::test]
+    async fn websearch_streaming_loop_streams_answer_without_leaking_tool() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchLoopStreaming, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "latest rust release?"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            body.contains("Rust 1.90 was released today."),
+            "body: {body}"
+        );
+        assert!(body.contains("\"finish_reason\":\"stop\""), "body: {body}");
+        assert!(body.contains("[DONE]"), "body: {body}");
+        // No web_search tool call may leak to the client.
+        assert!(!body.contains("web_search"), "body: {body}");
+        assert!(!body.contains("call_search_1"), "body: {body}");
+
+        // Three upstream requests: streaming round 1 (tool call), non-streaming
+        // search, streaming round 2 (answer).
+        let sent = log.lock().unwrap();
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert_eq!(sent[0]["stream"], json!(true));
+        assert_eq!(sent[1]["plugins"][0]["id"], json!("web"));
+        assert_eq!(sent[2]["stream"], json!(true));
+        // Round 2 carried the tool result with the cited source.
+        assert!(
+            sent[2]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("blog.rust-lang.org"))),
+            "round 2 must carry search result: {:#?}",
+            sent[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn websearch_anthropic_client_gets_anthropic_message() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchLoop, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/messages",
+            json!({"model": "claude-3", "max_tokens": 100, "messages": [{"role": "user", "content": "latest rust release?"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "Rust 1.90 was released today.");
+        assert_eq!(v["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn websearch_anthropic_streaming_gets_anthropic_sse() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchLoopStreaming, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/messages",
+            json!({"model": "claude-3", "max_tokens": 100, "stream": true, "messages": [{"role": "user", "content": "latest rust release?"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        // Exactly one message_start; the final answer arrives as text deltas;
+        // no tool_use content block may leak.
+        assert_eq!(
+            body.matches("event: message_start").count(),
+            1,
+            "body: {body}"
+        );
+        assert!(
+            body.contains("Rust 1.90 was released today."),
+            "body: {body}"
+        );
+        assert!(body.contains("event: message_stop"), "body: {body}");
+        assert!(!body.contains("tool_use"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn websearch_off_leaves_requests_untouched() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), false);
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let sent = log.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        // No search tool was injected.
+        assert!(sent[0].get("tools").is_none(), "{:#?}", sent[0]);
     }
 }

@@ -91,6 +91,19 @@ pub enum Command {
             help = "Spawn a child proxy instead of the managed background service"
         )]
         no_service: bool,
+
+        /// Enable web search: the agent gets a search tool that klava runs for
+        /// it (no agent-side setup needed).
+        #[arg(long, help = "Enable web search for the launched agent")]
+        search: bool,
+
+        /// Model used to run web-search requests (implies --search).
+        #[arg(
+            long,
+            value_name = "MODEL",
+            help = "Model used for web-search requests (implies --search)"
+        )]
+        search_model: Option<String>,
     },
     /// Start the proxy server
     ///
@@ -122,6 +135,11 @@ pub enum Command {
         /// avoid interactive prompts and restart-loops inside systemd).
         #[arg(long, hide = true, help = "Skip the provider readiness check")]
         no_provider_check: bool,
+
+        /// Enable web search (set by `klava launch --search` for the managed
+        /// service; normally comes from the config file).
+        #[arg(long, hide = true, help = "Enable web search")]
+        search: bool,
     },
 
     /// Stop a running daemon

@@ -312,6 +312,7 @@ pub async fn build_config_interactive_with_context(context: Option<&str>) -> Res
         verbose: persistent.verbose,
         enable_pii: persistent.enable_pii,
         enable_token_stats: persistent.enable_token_stats,
+        ..persistent.clone()
     };
 
     Ok(resolved_config)
