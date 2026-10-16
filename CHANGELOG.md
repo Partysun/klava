@@ -7,6 +7,11 @@
 - Web search for launched agents: `klava launch --search` gives the agent a search tool that klava runs itself through the klava gateway (no agent-side setup); `--search-model MODEL` selects the model used for searches (implies `--search`). Search behavior is configurable via `enable_websearch`, `search_engine` (`web_fast`/`web_deep`/`web_native`/`auto`), `search_context` (`low`/`medium`/`high`), `search_max_results`, `search_prompt`, `search_include_domains`/`search_exclude_domains`, and `search_decide`/`search_decide_model` for model-decided per-query tuning.
 - Managed services carry the search flag: systemd units and launchd plists render `--search` when web search is enabled, so the background proxy exposes the search tool to every agent that connects to it.
 
+### Fixed
+
+- `/v1/messages`: Anthropic **server** tools (e.g. Claude Code's `web_search_20250305`, `computer_20241022`, `bash_20241022`), which identify themselves by `type` and carry no `input_schema`, no longer fail the whole request with `400 JSON error: missing field 'input_schema'`. Such tools are parsed and dropped before the OpenAI transform (they can only run on Anthropic's backend), while the client's own function tools are forwarded as before.
+- Claude Code's built-in `WebSearch` tool now counts as a real search. Claude sends a native sub-request (a `web_search_20250305` server tool plus `tool_choice: {type: "tool", name: "web_search"}`) and expects the answer as `server_tool_use` + `web_search_tool_result` content blocks; klava previously returned plain text, so Claude reported "Did 0 searches" even though the search ran. klava now detects the sub-request and answers with the native blocks (plus the answer text), in both streaming and non-streaming form, so Claude reports "Did 1 search" and surfaces the cited sources.
+
 ## [0.2.19] - 2026-10-16
 
 ### Added

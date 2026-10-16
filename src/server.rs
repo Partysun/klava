@@ -805,6 +805,138 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn anthropic_server_tools_do_not_fail_the_request() {
+        // Regression: Claude Code advertises server-side tools such as
+        // `web_search_20250305` (identified by `type`, with no `input_schema`)
+        // next to its own function tools. klava used to 400 the whole request
+        // with "JSON error: missing field `input_schema`". The request must now
+        // succeed, and only the client function tool may reach upstream.
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/messages",
+            json!({
+                "model": "claude-opus-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Who is the CEO of Instinct AI?"}],
+                "tools": [
+                    {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+                    {
+                        "name": "get_weather",
+                        "description": "Look up the weather",
+                        "input_schema": {"type": "object"}
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+
+        let sent = log.lock().unwrap();
+        let tools = sent[0]["tools"].as_array().expect("client tool forwarded");
+        assert_eq!(tools.len(), 1, "{tools:#?}");
+        assert_eq!(tools[0]["function"]["name"], json!("get_weather"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_web_search_sub_request_returns_native_blocks() {
+        // Claude Code's built-in WebSearch tool does not call a model: it
+        // sends a native sub-request carrying the `web_search_20250305` server
+        // tool plus a forced `tool_choice`. klava must answer with native
+        // `server_tool_use` + `web_search_tool_result` blocks (what Claude
+        // counts as "Did N searches"), not plain text.
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchLoop, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/messages",
+            json!({
+                "model": "claude-opus-5",
+                "max_tokens": 4096,
+                "messages": [{
+                    "role": "user",
+                    "content": "Perform a web search for the query: latest rust release"
+                }],
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                "tool_choice": {"type": "tool", "name": "web_search"}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let content = body["content"].as_array().expect("content blocks");
+        assert_eq!(content.len(), 3, "{content:#?}");
+
+        assert_eq!(content[0]["type"], json!("server_tool_use"));
+        assert_eq!(content[0]["name"], json!("web_search"));
+        assert_eq!(content[0]["input"]["query"], json!("latest rust release"));
+
+        assert_eq!(content[1]["type"], json!("web_search_tool_result"));
+        assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+        assert_eq!(content[1]["content"][0]["type"], json!("web_search_result"));
+        assert_eq!(content[1]["content"][0]["title"], json!("Rust Blog"));
+        assert_eq!(
+            content[1]["content"][0]["url"],
+            json!("https://blog.rust-lang.org")
+        );
+
+        assert_eq!(content[2]["type"], json!("text"));
+        assert!(content[2]["text"].as_str().is_some());
+
+        assert_eq!(body["stop_reason"], json!("end_turn"));
+        assert_eq!(
+            body["usage"]["server_tool_use"]["web_search_requests"],
+            json!(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_native_web_search_sub_request_streams_native_blocks() {
+        // The sub-request can also be sent with `stream: true`; the native
+        // blocks must be delivered as Anthropic SSE events.
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::SearchLoop, log.clone()).await;
+        let router = build_proxy_opts(&format!("http://127.0.0.1:{port}"), true);
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/messages",
+            json!({
+                "model": "claude-opus-5",
+                "max_tokens": 4096,
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": "Perform a web search for the query: latest rust release"
+                }],
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                "tool_choice": {"type": "tool", "name": "web_search"}
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "body: {body}");
+
+        assert!(body.contains("\"type\":\"server_tool_use\""), "{body}");
+        assert!(body.contains("\"type\":\"input_json_delta\""), "{body}");
+        assert!(
+            body.contains("\"type\":\"web_search_tool_result\""),
+            "{body}"
+        );
+        assert!(body.contains("\"type\":\"web_search_result\""), "{body}");
+        assert!(body.contains("\"type\":\"text_delta\""), "{body}");
+        assert!(body.contains("\"type\":\"message_stop\""), "{body}");
+    }
+
+    #[tokio::test]
     async fn anthropic_forwards_tool_choice_and_metadata_upstream() {
         let log = Arc::new(Mutex::new(vec![]));
         let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
