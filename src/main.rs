@@ -260,7 +260,16 @@ async fn main() -> anyhow::Result<()> {
             let pid_file_path = pid_file.as_ref().unwrap_or(&cli.pid_file);
             let _ = stop_daemon(pid_file_path); // legacy daemon, may not exist
             service::stop_service(config.port); // managed service
-            tracing::info!("✓ Proxy stopped");
+            println!("✓ Proxy stopped");
+            return Ok(());
+        }
+        Command::Restart { port } => {
+            let target = port.unwrap_or(config.port);
+            service::restart_service(target).await?;
+            println!(
+                "✓ Proxy restarted on port {target} ({})",
+                service::instance_name(target)
+            );
             return Ok(());
         }
         Command::Status { pid_file } => {
@@ -1254,6 +1263,30 @@ mod tests {
             match cli.command {
                 Command::Launch { search, .. } => assert!(search),
                 _ => panic!("Expected launch command"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parses_restart_command() {
+        let parsed = Cli::try_parse_from(["klava", "restart"]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Restart { port } => assert_eq!(port, None),
+                _ => panic!("Expected restart command"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parses_restart_with_port() {
+        let parsed = Cli::try_parse_from(["klava", "restart", "--port", "8085"]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Restart { port } => assert_eq!(port, Some(8085)),
+                _ => panic!("Expected restart command"),
             }
         }
     }

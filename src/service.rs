@@ -121,13 +121,23 @@ pub fn systemd_available() -> bool {
     let Ok(systemctl) = which::which("systemctl") else {
         return false;
     };
-    match Command::new(systemctl)
+    let Ok(out) = Command::new(systemctl)
         .args(["--user", "is-system-running"])
         .output()
-    {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    }
+    else {
+        return false;
+    };
+
+    // `is-system-running` exits non-zero for every state except `running`, but
+    // `degraded`, `starting` and `maintenance` all mean the user manager is
+    // reachable and can start units. Only an unreachable manager (no bus) is
+    // unusable, and it prints no state at all.
+    let state = String::from_utf8_lossy(&out.stdout);
+    let state = state.trim();
+    matches!(
+        state,
+        "running" | "degraded" | "starting" | "maintenance" | "initializing"
+    )
 }
 
 fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
@@ -330,6 +340,84 @@ pub fn stop_service(port: u16) {
     } else if launchd_available() {
         let _ = launchctl_unload(&launchd_plist_path(port));
     }
+}
+
+/// Restart the managed instance for `port`, keeping its configuration.
+///
+/// This is deliberately narrower than `stop` + `up`: the unit/plist already
+/// exists, so a restart must not rewrite it, re-enable it, or prompt for
+/// providers. It stops the running job and starts it again, then waits for
+/// health so the caller learns about a crash-loop instead of a false "ok".
+///
+/// Errors are reported rather than swallowed: unlike [`stop_service`], a failed
+/// restart is something the user asked about and must see.
+pub async fn restart_service(port: u16) -> Result<()> {
+    if systemd_available() {
+        restart_systemd(port).await
+    } else if launchd_available() {
+        restart_launchd(port).await
+    } else {
+        Err(anyhow!(
+            "No supported service manager found (systemd/launchd), so there is \
+             no managed klava instance to restart.\nRun `klava up` to start one."
+        ))
+    }
+}
+
+async fn restart_systemd(port: u16) -> Result<()> {
+    let name = unit_name(port);
+    let path = unit_path(port);
+
+    if !path.exists() {
+        return Err(anyhow!(
+            "no managed service for port {port} ({name} is missing).\n\
+             Start one with `klava up`, which creates it for the configured port."
+        ));
+    }
+
+    // Clear a crash-loop lockout before restarting, otherwise systemd refuses.
+    let _ = run_systemctl(&["reset-failed", &name]);
+
+    let out = run_systemctl(&["restart", &name])?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(anyhow!(
+            "failed to restart {name}: {stderr}\n\
+             Inspect it with: journalctl --user -u {name} -n 50 --no-pager"
+        ));
+    }
+
+    wait_health(port, Duration::from_secs(10))
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "{e}\nThe unit may be crash-looping. Inspect it with:\n  \
+             journalctl --user -u {name} -n 50 --no-pager"
+            )
+        })?;
+
+    Ok(())
+}
+
+async fn restart_launchd(port: u16) -> Result<()> {
+    let path = launchd_plist_path(port);
+    if !path.exists() {
+        return Err(anyhow!(
+            "no managed service for port {port} ({} is missing).\n\
+             Start one with `klava up`, which creates it for the configured port.",
+            path.display()
+        ));
+    }
+
+    // launchd has no atomic restart; unload then load is the documented way.
+    launchctl_unload(&path)?;
+    launchctl_load(&path)?;
+
+    wait_health(port, Duration::from_secs(10))
+        .await
+        .map_err(|e| anyhow!("{e}\nInspect the log with: {}", logs_command(port)))?;
+
+    Ok(())
 }
 
 /// Hint for tailing the logs of the managed instance on this platform.

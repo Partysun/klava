@@ -156,6 +156,24 @@ pub enum Command {
         #[arg(long, value_name = "FILE", help = "PID file path")]
         pid_file: Option<PathBuf>,
     },
+    /// Restart the managed proxy service
+    ///
+    /// Restarts the background service for the configured port without
+    /// rewriting its unit, re-enabling it, or prompting for providers.
+    #[command(after_help = "Examples:\n  \
+                     klava restart\n  \
+                     klava restart --port 8085")]
+    Restart {
+        /// Port of the managed instance (defaults to the configured port)
+        #[arg(
+            short,
+            long,
+            value_name = "PORT",
+            help = "Port of the managed instance (defaults to the configured port)"
+        )]
+        port: Option<u16>,
+    },
+
     /// Check daemon status
     ///
     /// Checks if the proxy server daemon is currently running.

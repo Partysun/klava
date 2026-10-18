@@ -61,6 +61,7 @@ started later just reuse it — no per-session proxy spawn, no
 
 ```bash
 klava status                                   # list managed instances
+klava restart                                  # restart the proxy on the configured port
 klava stop                                     # stop the proxy on the configured port
 systemctl --user status klava-48017            # Linux: unit status
 journalctl --user -u klava-48017 -f            # Linux: live proxy logs
