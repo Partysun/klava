@@ -213,20 +213,24 @@ pub enum Command {
         args: Vec<String>,
     },
 
-    /// List installed extensions and manage their configuration
+    /// Install and manage extensions
     ///
-    /// klava ships with no extensions. Anything executable placed in the
-    /// extensions directory is discovered at runtime; klava only interprets the
-    /// `enabled` key and passes the rest through untouched.
+    /// klava ships with no extensions. An extension is an executable discovered
+    /// at runtime; klava only interprets the `enabled` key and passes the rest
+    /// through untouched.
     #[command(after_help = "Examples:\n  \
                      klava extensions\n  \
+                     klava extensions path\n  \
+                     klava extensions install ./my-extension --trust\n  \
+                     klava extensions install cargo:klava-compress --trust\n  \
+                     klava extensions install cargo-path:./my-crate --trust\n  \
+                     klava extensions install npm:my-ext --trust\n  \
                      klava extensions list\n  \
-                     klava extensions show <name>\n  \
+                     klava extensions verify\n  \
                      klava extensions enable <name>\n  \
-                     klava extensions disable <name>\n  \
-                     klava extensions set <name> key=value")]
+                     klava extensions remove <name>")]
     Extensions {
-        /// Subcommand: list (default), show, enable, disable, set
+        /// Subcommand: list (default), path, install, remove, verify, show, enable, disable, set
         #[arg(
             required = false,
             trailing_var_arg = true,

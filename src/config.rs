@@ -271,11 +271,15 @@ impl Config {
 #search_decide_model = "typesafe/jev-1.13"
 
 # ---- Extensions ----------------------------------------------------------
-# klava ships with no extensions. Place an executable in the extensions
-# directory to install one; it is discovered at runtime and needs no rebuild.
+# klava ships with no extensions. Install one with:
 #
-#   ~/.config/klava/extensions/<name>          # the program (any language)
-#   ~/.config/klava/extensions/<name>.toml     # optional manifest
+#   klava extensions install cargo:<crate> --trust
+#   klava extensions install npm:<package> --trust
+#   klava extensions install ./my-extension --trust
+#
+# Extensions live in ~/.local/share/klava/extensions (or the equivalent data
+# directory) and are discovered at runtime; installing one never rebuilds klava.
+# Run 'klava extensions path' to see every directory searched.
 #
 # klava only interprets `enabled`. Every other key under a settings table is
 # passed to the extension untouched, so klava never needs to know what an

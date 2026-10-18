@@ -4,6 +4,7 @@ pub mod config;
 pub mod diagnostic;
 pub mod error;
 pub mod ext_api;
+pub mod ext_install;
 pub mod ext_cli;
 pub mod extensions;
 pub mod hooks;

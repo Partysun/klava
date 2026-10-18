@@ -8,25 +8,84 @@ JSON object on stdout. That is the whole contract.
 
 ## Install
 
-Put an executable in the extensions directory:
-
-```text
-~/.config/klava/extensions/<name>          # the program
-~/.config/klava/extensions/<name>.toml     # optional manifest
-```
-
-The file name (without extension) is the extension's name. Override the
-directory with `KLAVA_EXTENSIONS_DIR`.
+### With the built-in installer
 
 ```sh
-mkdir -p ~/.config/klava/extensions
-install -m 755 my-extension ~/.config/klava/extensions/my-extension
-klava extensions list
+klava extensions install ./my-extension --trust
+klava extensions install cargo:klava-compress --trust
+klava extensions install cargo:klava-compress@0.1.0 --trust
+klava extensions install cargo-path:./my-crate --trust
+klava extensions install cargo-git:https://github.com/user/repo --trust
+klava extensions install npm:my-extension --trust
+klava extensions install npm:@scope/pkg@1.2.3 --trust
 ```
+
+| Source | What klava does |
+|---|---|
+| `./path`, `/abs/path` | Copies the executable (keeps a symlink if given). A directory works if it contains exactly one executable. |
+| `cargo:<crate>[@ver]` | Runs `cargo install --root <staging>`. |
+| `cargo-path:<dir>` | Same, from a local crate directory. |
+| `cargo-git:<url>[#rev]` | Same, from git. |
+| `npm:<pkg>[@ver]` | Runs `npm pack`, extracts, and takes the `bin` from `package.json`. |
+
+Installing runs third-party code, so klava prints the source and target and
+requires `--trust` (or an interactive `y`). The exact command is printed before
+it runs. Everything is staged and moved into place atomically: a failed install
+cannot leave a half-written executable.
+
+`--name <name>` overrides the extension name. `--no-enable` installs without
+activating it.
+
+Other commands:
+
+```sh
+klava extensions path      # where klava looks, in order
+klava extensions list      # name, status, version, source, path
+klava extensions verify    # re-check recorded checksums
+klava extensions remove <name>
+```
+
+### Manually
+
+Drop an executable into the data directory:
+
+```sh
+mkdir -p ~/.local/share/klava/extensions
+install -m 755 my-extension ~/.local/share/klava/extensions/my-extension
+```
+
+## Where klava looks
+
+Directories are searched in order, and the **first** match for a name wins:
+
+| Order | Directory | Purpose |
+|---|---|---|
+| 1 | `$KLAVA_EXTENSIONS_DIR` | Explicit override. When set, it is the only directory searched. |
+| 2 | `$XDG_DATA_HOME/klava/extensions` (`~/.local/share/klava/extensions`) | Where `extensions install` writes. |
+| 3 | `/usr/local/share/klava/extensions` | Installed system-wide by an admin. |
+| 4 | `/usr/share/klava/extensions` | Distribution packages. |
+
+On Windows the data directory is `%LOCALAPPDATA%\klava\extensions`; on macOS,
+`~/.local/share/klava/extensions` (klava uses the XDG layout on every platform).
 
 A file is picked up when it is a regular executable, is not hidden, and is not
 a `.toml` file. Nothing else is required: no entry point, no registration, no
 recompile.
+
+## Provenance
+
+`install` writes `<name>.source.toml` next to the artifact:
+
+```toml
+source = "cargo:klava-compress@0.1.0"
+version = "0.1.0"
+sha256 = "..."
+installed_at = "2026-10-18T12:00:00+00:00"
+```
+
+`klava extensions verify` re-hashes the artifact and reports a mismatch. A
+changed binary is not blocked at load time — that would cost a full hash on
+every request — but `verify` makes tampering visible.
 
 ## Enable
 

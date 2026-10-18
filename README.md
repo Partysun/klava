@@ -91,9 +91,8 @@ klava config
 
 Platform-specific config file locations:
 
-- **Linux**: `~/.config/klava/config.toml`
-- **macOS**: `~/Library/Application Support/klava/config.toml`
-- **Windows**: `%APPDATA%\klava\config.toml`
+- **Linux and macOS**: `~/.config/klava/config.toml`
+- **Windows**: `%APPDATA%\klava\config\config.toml`
 
 #### Config file
 

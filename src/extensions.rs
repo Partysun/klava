@@ -166,6 +166,8 @@ pub struct InstalledExtension {
     pub config: Value,
     /// Whether to reject the request when this extension fails.
     pub fail_closed: bool,
+    /// Search-path origin, filled in by [`discover_all`].
+    pub origin: Option<&'static str>,
 }
 
 impl InstalledExtension {
@@ -206,17 +208,129 @@ impl InstalledExtension {
     }
 }
 
-/// Directory being scanned, honouring `KLAVA_EXTENSIONS_DIR`.
-pub fn extensions_dir() -> PathBuf {
+/// One directory klava looks in for extensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPath {
+    pub dir: PathBuf,
+    /// Why this directory is in the list.
+    pub origin: &'static str,
+}
+
+/// Data directory for klava, where installed extensions live.
+///
+/// XDG says executables and user data belong under `$XDG_DATA_HOME`, not under
+/// `$XDG_CONFIG_HOME`. Falls back to `~/.local/share/klava` on Unix and
+/// `%LOCALAPPDATA%\klava` on Windows.
+pub fn data_dir() -> PathBuf {
+    if let Some(dir) = dirs::data_local_dir() {
+        return dir.join("klava");
+    }
+    // Last resort: next to the config file, which at least exists.
+    Config::get_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The canonical install target.
+///
+/// `$KLAVA_EXTENSIONS_DIR` wins when set, so a sandboxed or portable setup can
+/// keep both discovery and installation in one place.
+pub fn install_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("KLAVA_EXTENSIONS_DIR")
         && !dir.trim().is_empty()
     {
         return PathBuf::from(dir);
     }
-    Config::get_path()
-        .parent()
-        .map(|p| p.join("extensions"))
-        .unwrap_or_else(|| PathBuf::from("extensions"))
+    data_dir().join("extensions")
+}
+
+/// Every directory klava searches, in priority order.
+///
+/// A name found earlier wins. This is deliberately a list rather than one path
+/// (see `EXTENSIONS.md`):
+///
+/// 1. `$KLAVA_EXTENSIONS_DIR` — explicit override, and the only entry when set.
+/// 2. `<data>/extensions` — where `klava extensions install` writes.
+/// 3. `/usr/local/share/klava/extensions` — installed system-wide by an admin.
+/// 4. `/usr/share/klava/extensions` — distribution packages.
+pub fn search_path() -> Vec<SearchPath> {
+    if let Ok(dir) = std::env::var("KLAVA_EXTENSIONS_DIR")
+        && !dir.trim().is_empty()
+    {
+        return vec![SearchPath {
+            dir: PathBuf::from(dir),
+            origin: "KLAVA_EXTENSIONS_DIR",
+        }];
+    }
+
+    default_search_path()
+}
+
+/// The search path with no environment override applied.
+///
+/// Split out so it can be tested without mutating process-wide state, which is
+/// unsafe under a parallel test runner.
+fn default_search_path() -> Vec<SearchPath> {
+    let mut paths = vec![SearchPath {
+        dir: install_dir(),
+        origin: "data",
+    }];
+
+    for dir in [
+        "/usr/local/share/klava/extensions",
+        "/usr/share/klava/extensions",
+    ] {
+        paths.push(SearchPath {
+            dir: PathBuf::from(dir),
+            origin: "system",
+        });
+    }
+
+    paths
+}
+
+/// The first directory in the search path. Kept for callers that only need one.
+pub fn extensions_dir() -> PathBuf {
+    search_path()
+        .into_iter()
+        .next()
+        .map(|p| p.dir)
+        .unwrap_or_else(install_dir)
+}
+
+/// Every extension across the whole search path.
+///
+/// Names are deduplicated with the search path acting as priority: the first
+/// directory that has a given name wins, and later ones are ignored (not merged).
+pub fn discover_all() -> Vec<InstalledExtension> {
+    discover_in(&search_path())
+}
+
+/// [`discover_all`], against an explicit search path (used by tests).
+pub fn discover_in(search: &[SearchPath]) -> Vec<InstalledExtension> {
+    let mut found: Vec<InstalledExtension> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for entry in search {
+        for ext in discover(&entry.dir) {
+            if seen.insert(ext.name.clone()) {
+                found.push(InstalledExtension {
+                    origin: Some(entry.origin),
+                    ..ext
+                });
+            } else {
+                tracing::debug!(
+                    "extension '{}' in {} is shadowed by an earlier directory",
+                    ext.name,
+                    entry.dir.display()
+                );
+            }
+        }
+    }
+
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
 }
 
 /// Every runnable extension in `dir`, sorted by name.
@@ -273,6 +387,7 @@ pub fn discover(dir: &Path) -> Vec<InstalledExtension> {
             path,
             config,
             fail_closed,
+            origin: None,
         });
     }
 
@@ -335,10 +450,9 @@ pub struct Extensions {
 impl Extensions {
     /// Discover and activate installed extensions.
     pub fn from_config(config: &Config) -> Self {
-        let dir = extensions_dir();
-        let installed = discover(&dir);
+        let installed = discover_all();
         if installed.is_empty() {
-            tracing::debug!("no extensions installed in {}", dir.display());
+            tracing::debug!("no extensions installed");
             return Self { active: Vec::new() };
         }
 
@@ -360,7 +474,7 @@ impl Extensions {
 
     /// Every installed extension, whether enabled or not. Used by the CLI.
     pub fn installed() -> Vec<InstalledExtension> {
-        discover(&extensions_dir())
+        discover_all()
     }
 
     /// Whether any extension is active.
@@ -929,6 +1043,121 @@ mod tests {
         assert!(toml_to_json("this is not toml ][").is_err());
     }
 
+    #[cfg(unix)]
+    fn write_exe(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn discover_ignores_non_executables_and_manifests() {
+        let dir = std::env::temp_dir().join(format!("klava-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("plain.txt"), "x").unwrap();
+        std::fs::write(dir.join("manifest.toml"), "enabled = true\n").unwrap();
+        std::fs::write(dir.join(".hidden"), "x").unwrap();
+        #[cfg(unix)]
+        write_exe(&dir.join("real"));
+
+        let found = discover(&dir);
+        let names: Vec<&str> = found.iter().map(|e| e.name.as_str()).collect();
+        #[cfg(unix)]
+        assert_eq!(names, vec!["real"]);
+        #[cfg(not(unix))]
+        assert!(names.contains(&"plain.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_reads_a_manifest_beside_the_executable() {
+        let dir = std::env::temp_dir().join(format!("klava-man-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_exe(&dir.join("demo"));
+        std::fs::write(
+            dir.join("demo.toml"),
+            "enabled = true\nfail_closed = true\nthreshold = 0.5\n",
+        )
+        .unwrap();
+
+        let found = discover(&dir);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].fail_closed);
+        assert_eq!(found[0].config["threshold"], 0.5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_skips_a_broken_manifest_instead_of_crashing() {
+        let dir = std::env::temp_dir().join(format!("klava-badman-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        write_exe(&dir.join("demo"));
+        std::fs::write(dir.join("demo.toml"), "not valid toml ][").unwrap();
+
+        assert!(discover(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_of_a_missing_directory_is_empty_not_an_error() {
+        let missing = std::env::temp_dir().join("klava-definitely-missing-dir-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(discover(&missing).is_empty());
+    }
+
+    #[test]
+    fn default_search_path_starts_with_the_data_dir_then_system_dirs() {
+        let paths = default_search_path();
+        assert_eq!(paths[0].dir, install_dir());
+        assert_eq!(paths[0].origin, "data");
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.dir == PathBuf::from("/usr/share/klava/extensions")),
+            "distribution path must be searched"
+        );
+        // No directory may appear twice.
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &paths {
+            assert!(
+                seen.insert(entry.dir.clone()),
+                "duplicate {}",
+                entry.dir.display()
+            );
+        }
+    }
+
+    /// The only test that touches `KLAVA_EXTENSIONS_DIR`. Kept single so tests
+    /// that read it cannot race with each other; `default_search_path` covers
+    /// the rest without any environment mutation.
+    #[test]
+    fn search_path_honours_the_override_exclusively() {
+        // SAFETY: no other test in this crate reads or writes this variable
+        // concurrently, and it is restored before returning.
+        let previous = std::env::var("KLAVA_EXTENSIONS_DIR").ok();
+        unsafe { std::env::set_var("KLAVA_EXTENSIONS_DIR", "/tmp/klava-override") };
+
+        let paths = search_path();
+        assert_eq!(paths.len(), 1, "override must replace the whole path");
+        assert_eq!(paths[0].dir, PathBuf::from("/tmp/klava-override"));
+        assert_eq!(paths[0].origin, "KLAVA_EXTENSIONS_DIR");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("KLAVA_EXTENSIONS_DIR", value) },
+            None => unsafe { std::env::remove_var("KLAVA_EXTENSIONS_DIR") },
+        }
+    }
+
     #[test]
     fn nothing_is_enabled_without_explicit_config() {
         let ext = InstalledExtension {
@@ -936,6 +1165,7 @@ mod tests {
             path: PathBuf::from("/bin/true"),
             config: json!({}),
             fail_closed: false,
+            origin: None,
         };
         let config = Config {
             port: 48017,
@@ -951,6 +1181,7 @@ mod tests {
             path: PathBuf::from("/bin/true"),
             config: json!({"enabled": true, "a": 1}),
             fail_closed: false,
+            origin: None,
         };
         let mut config = Config {
             port: 48017,
@@ -972,6 +1203,7 @@ mod tests {
             path: PathBuf::from("/bin/true"),
             config: json!({"a": 1, "b": 2}),
             fail_closed: false,
+            origin: None,
         };
         let mut config = Config {
             port: 48017,
