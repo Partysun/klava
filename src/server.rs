@@ -616,6 +616,38 @@ mod integration_tests {
         create_app(config, client, cors, chain)
     }
 
+    /// Like [`build_proxy_opts`], but with the legacy PII flag kept on so the
+    /// installed PII extension actually runs.
+    fn build_proxy_opts_enable_pii(base_url: &str) -> Router {
+        let mut config = Config {
+            port: 0,
+            verbose: false,
+            enable_pii: true,
+            enable_token_stats: false,
+            active_provider: "fake".to_string(),
+            providers: vec![ProviderConfig {
+                name: "fake".to_string(),
+                provider_type: ProviderType::OpenAICompatible,
+                base_url: Some(base_url.to_string()),
+                chat_completions_path: None,
+                api_key: Some("test-key".to_string()),
+                api_key_name: None,
+                reasoning_model: Some("reasoning-model".to_string()),
+                completion_model: Some("completion-model".to_string()),
+            }],
+            ..Config::default()
+        };
+        config
+            .extensions
+            .settings
+            .insert("klava-pii-guardrail".to_string(), json!({"enabled": true}));
+        let config = Arc::new(config);
+        let client = reqwest::Client::new();
+        let cors = create_cors_layer();
+        let chain = Arc::new(HookChain::new());
+        create_app(config, client, cors, chain)
+    }
+
     async fn send(router: &Router, method: &str, path: &str, body: Value) -> (u16, String) {
         let req = HttpRequest::builder()
             .method(method)
@@ -635,6 +667,67 @@ mod integration_tests {
     /// and the extension is a separate process found by scanning a directory.
     /// The fixture is a shell script, proving any language works.
     #[cfg(unix)]
+    /// The real PII extension, installed as an executable, must redact an
+    /// email before the request reaches upstream. This is the production
+    /// security property end to end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installed_pii_extension_redacts_before_upstream() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let exe = std::env::var("KLAVA_PII_EXT").unwrap_or_default();
+        if exe.is_empty() {
+            eprintln!("skipping: set KLAVA_PII_EXT to the built klava-pii-guardrail binary");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("klava-pii-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let script = dir.join("klava-pii-guardrail");
+        std::fs::copy(&exe, &script).unwrap();
+        for sfx in ["toml", "source.toml"] {
+            let _ = std::fs::remove_file(dir.join(format!("klava-pii-guardrail.{sfx}")));
+        }
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        std::fs::write(dir.join("klava-pii-guardrail.toml"), "enabled = true\n").unwrap();
+
+        // SAFETY: only this test touches the variable, and it restores it below.
+        unsafe { std::env::set_var("KLAVA_EXTENSIONS_DIR", &dir) };
+
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy_opts_enable_pii(&format!("http://127.0.0.1:{port}"));
+
+        let (status, _body) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "contact alice@example.com now"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let sent = log.lock().unwrap();
+        let content = sent[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            content.contains("<EMAIL>"),
+            "PII extension did not redact; upstream saw: {content}"
+        );
+        assert!(!content.contains("alice@"), "email leaked: {content}");
+
+        unsafe { std::env::remove_var("KLAVA_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn an_installed_extension_process_rewrites_the_request() {
         use std::os::unix::fs::PermissionsExt;
