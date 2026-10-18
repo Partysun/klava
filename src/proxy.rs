@@ -75,6 +75,7 @@ pub async fn proxy_anthropic(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     Extension(hook_chain): Extension<Arc<HookChain>>,
+    Extension(extensions): Extension<Arc<crate::extensions::Extensions>>,
     request: Request,
 ) -> Result<Response> {
     let body_bytes = read_body_bytes(request).await?;
@@ -127,6 +128,33 @@ pub async fn proxy_anthropic(
         "Transformed to OpenAI request for model: {}",
         openai_req.model
     );
+
+    // Extension chain. Runs on the normalized OpenAI payload so one extension
+    // serves every client API; see `proxy_openai` for the rationale.
+    let mut openai_req = openai_req;
+    if !extensions.is_empty() {
+        let payload = serde_json::to_value(&openai_req)?;
+        let outcome = crate::extensions::run_request_extensions(
+            &extensions,
+            &client,
+            &config,
+            payload,
+            crate::extensions::reason_from_request(&openai_req),
+            crate::ext_api::SourceApi::Anthropic,
+        )
+        .await?;
+
+        if let Some(response) = outcome.canned_response {
+            return render_canned(
+                response,
+                is_streaming,
+                ClientFormat::Anthropic,
+                &hook_chain,
+                &config,
+            );
+        }
+        openai_req = serde_json::from_value(outcome.payload)?;
+    }
 
     if config.verbose {
         tracing::trace!(
@@ -189,6 +217,7 @@ pub async fn proxy_openai(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     Extension(hook_chain): Extension<Arc<HookChain>>,
+    Extension(extensions): Extension<Arc<crate::extensions::Extensions>>,
     request: Request,
 ) -> Result<Response> {
     let body_bytes = read_body_bytes(request).await?;
@@ -206,11 +235,42 @@ pub async fn proxy_openai(
     let openai_req: openai::OpenAIRequest = serde_json::from_value(data)?;
 
     // Override model based on config (reasoning vs completion model)
-    let openai_req = apply_openai_model_override(
+    let mut openai_req = apply_openai_model_override(
         openai_req,
         config.resolve_reasoning_model(),
         config.resolve_completion_model(),
     );
+
+    // Extension chain: transforms and escalation.
+    //
+    // Escalation may fold reviewer remarks into the conversation, so it runs
+    // here — after model override, before any send — and works for streaming
+    // clients too, because the request body is complete at this point.
+    if !extensions.is_empty() {
+        let payload = serde_json::to_value(&openai_req)?;
+        let outcome = crate::extensions::run_request_extensions(
+            &extensions,
+            &client,
+            &config,
+            payload,
+            crate::extensions::reason_from_request(&openai_req),
+            crate::ext_api::SourceApi::OpenAi,
+        )
+        .await?;
+
+        // `take_over` already produced the answer: render it instead of calling
+        // the provider. Use the original client preference for the shape.
+        if let Some(response) = outcome.canned_response {
+            return render_canned(
+                response,
+                is_streaming,
+                ClientFormat::OpenAi,
+                &hook_chain,
+                &config,
+            );
+        }
+        openai_req = serde_json::from_value(outcome.payload)?;
+    }
 
     // if config.verbose {
     //     tracing::trace!(
@@ -258,6 +318,18 @@ pub async fn proxy_openai(
     Ok(response)
 }
 
+/// Render an already-produced response (escalation `take_over`), honouring the
+/// client's stream preference and the real hook chain and config.
+fn render_canned(
+    value: Value,
+    client_streaming: bool,
+    format: ClientFormat,
+    hook_chain: &HookChain,
+    config: &Config,
+) -> Result<Response> {
+    render_final(value, format, client_streaming, None, hook_chain, config)
+}
+
 /// Max request body we accept from a client. Code-agent clients (opencode,
 /// Claude Code) can send very large conversations with tool results and file
 /// contents; 1 MiB was too small and produced 502s on legitimate requests.
@@ -285,8 +357,10 @@ async fn send_request(
 ) -> Result<reqwest::Response> {
     let request_payload = build_upstream_payload(config, openai_req);
 
-    let data: Value = request_payload.clone();
-    hook_chain.execute(HookStage::BeforeUpstream, data, config)?;
+    // The hook result must be the payload we send: a `BeforeUpstream` hook is
+    // a transform, and discarding its return value silently disabled every
+    // request-side rewrite (guardrails, routing).
+    let request_payload = hook_chain.execute(HookStage::BeforeUpstream, request_payload, config)?;
 
     send_openai_payload(client, config, openai_req, request_payload).await
 }
@@ -294,8 +368,18 @@ async fn send_request(
 /// Serialize a typed request into the upstream JSON payload, applying the
 /// provider-specific tweaks (Qwen incremental output / default system message).
 fn build_upstream_payload(config: &Config, openai_req: &openai::OpenAIRequest) -> Value {
-    let mut request_payload = serde_json::to_value(openai_req).unwrap_or_else(|_| json!({}));
     let url = config.chat_completions_url();
+    build_upstream_payload_for(config, openai_req, &url)
+}
+
+/// Same as [`build_upstream_payload`], for an explicit upstream URL (used when
+/// a nested call targets a different provider).
+fn build_upstream_payload_for(
+    _config: &Config,
+    openai_req: &openai::OpenAIRequest,
+    url: &str,
+) -> Value {
+    let mut request_payload = serde_json::to_value(openai_req).unwrap_or_else(|_| json!({}));
 
     // Special handling for Qwen models that require specific parameters.
     // Thinking stays enabled (these are reasoning models) — we only set
@@ -338,7 +422,27 @@ pub(crate) async fn send_openai_payload(
     openai_req: &openai::OpenAIRequest,
     request_payload: Value,
 ) -> Result<reqwest::Response> {
-    let url = config.chat_completions_url();
+    let provider = config.get_active_provider_config().cloned();
+    match provider {
+        Some(p) => send_openai_payload_via(client, config, &p, openai_req, request_payload).await,
+        None => Err(Error::Internal(format!(
+            "Active provider '{}' not found in configuration",
+            config.active_provider
+        ))),
+    }
+}
+
+/// POST a payload to an explicit provider.
+async fn send_openai_payload_via(
+    client: &Client,
+    config: &Config,
+    provider: &crate::providers::Config,
+    openai_req: &openai::OpenAIRequest,
+    request_payload: Value,
+) -> Result<reqwest::Response> {
+    let url = provider
+        .chat_completions_url()
+        .ok_or_else(|| Error::Internal(format!("provider '{}' has no base URL", provider.name)))?;
     tracing::debug!("Sending request to {} for model: {}", url, openai_req.model);
 
     let mut req_builder = client.post(&url).json(&request_payload);
@@ -353,13 +457,6 @@ pub(crate) async fn send_openai_payload(
             .header("X-OpenRouter-Title", "Klava")
             .header("X-OpenRouter-Categories", "cli-agent-proxy");
     }
-
-    let provider = config.get_active_provider_config().ok_or_else(|| {
-        Error::Internal(format!(
-            "Active provider '{}' not found in configuration",
-            config.active_provider
-        ))
-    })?;
 
     if let Some(headers) = provider.get_auth_headers(config).await? {
         req_builder = req_builder.headers(headers);
@@ -378,8 +475,26 @@ pub(crate) async fn send_openai_request(
     config: &Config,
     openai_req: &openai::OpenAIRequest,
 ) -> Result<reqwest::Response> {
-    let payload = build_upstream_payload(config, openai_req);
-    send_openai_payload(client, config, openai_req, payload).await
+    send_openai_request_via(client, config, openai_req, None).await
+}
+
+/// Send a typed OpenAI request through an explicit provider (or the active one
+/// when `provider` is `None`). Runs no hooks — this is the recursion boundary
+/// used by nested calls such as web search and model escalation.
+pub(crate) async fn send_openai_request_via(
+    client: &Client,
+    config: &Config,
+    openai_req: &openai::OpenAIRequest,
+    provider: Option<&crate::providers::Config>,
+) -> Result<reqwest::Response> {
+    let url = provider
+        .and_then(|p| p.chat_completions_url())
+        .unwrap_or_else(|| config.chat_completions_url());
+    let payload = build_upstream_payload_for(config, openai_req, &url);
+    match provider {
+        Some(p) => send_openai_payload_via(client, config, p, openai_req, payload).await,
+        None => send_openai_payload(client, config, openai_req, payload).await,
+    }
 }
 
 // ===== Web search loop =====
@@ -879,6 +994,7 @@ pub async fn proxy_responses(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     Extension(hook_chain): Extension<Arc<HookChain>>,
+    Extension(extensions): Extension<Arc<crate::extensions::Extensions>>,
     request: Request,
 ) -> Result<Response> {
     let body_bytes = read_body_bytes(request).await?;
@@ -923,6 +1039,32 @@ pub async fn proxy_responses(
         "Transformed to OpenAI request for model: {}",
         openai_req.model
     );
+
+    // Extension chain, on the normalized OpenAI payload (see `proxy_openai`).
+    let mut openai_req = openai_req;
+    if !extensions.is_empty() {
+        let payload = serde_json::to_value(&openai_req)?;
+        let outcome = crate::extensions::run_request_extensions(
+            &extensions,
+            &client,
+            &config,
+            payload,
+            crate::extensions::reason_from_request(&openai_req),
+            crate::ext_api::SourceApi::Responses,
+        )
+        .await?;
+
+        if let Some(response) = outcome.canned_response {
+            return render_canned(
+                response,
+                is_streaming,
+                ClientFormat::Responses,
+                &hook_chain,
+                &config,
+            );
+        }
+        openai_req = serde_json::from_value(outcome.payload)?;
+    }
 
     if config.websearch_available() {
         if is_streaming {

@@ -367,6 +367,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Config { setup } => handle_config_command(setup).await,
         Command::Providers { args } => handle_providers_command(args).await,
+        Command::Extensions { args } => klava::ext_cli::run(&mut config, args),
         Command::Check { provider, model } => {
             if let Some(provider_name) = provider {
                 // Check specific provider

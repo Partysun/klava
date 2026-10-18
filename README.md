@@ -188,7 +188,7 @@ Current vision is:
 - Refactoring -> split codebase into many crates like proxy, cli, providers ...)
 - Add more Guardrails
 - Add Token optimization algorithms. Reduce cost is a crucial goal
-- Creating extensions mechanism as first class citizen.
+- Extensions: installable at runtime, in any language. See [EXTENSIONS.md](EXTENSIONS.md).
 - Add more providers and agents
 - Add benchmark wars between agents
 - Add remote hand control using Telegram and Mobile

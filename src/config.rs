@@ -56,6 +56,31 @@ pub struct Config {
     /// Decision model id used to tune the search settings.
     #[serde(default = "default_search_decide_model")]
     pub search_decide_model: String,
+
+    /// Built-in, always-compiled extensions (see `crate::extensions`).
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
+}
+
+/// Extension settings (`[extensions]`).
+///
+/// Deliberately opaque: klava stores whatever each extension crate declares
+/// under `settings.<name>`, so adding an extension never touches this file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExtensionsConfig {
+    /// Per-extension tables, keyed by whatever the user installed.
+    ///
+    /// Every table may carry `enabled` (the only key the host interprets);
+    /// all other keys are opaque and passed to the extension as-is.
+    #[serde(default)]
+    pub settings: std::collections::BTreeMap<String, serde_json::Value>,
+
+    /// Legacy `enable_pii = false`, expressed without naming an extension.
+    ///
+    /// Handed to every extension as part of its config; only one that cares
+    /// about PII will act on it.
+    #[serde(default)]
+    pub disable_pii: bool,
 }
 
 fn default_enable_pii() -> bool {
@@ -105,6 +130,7 @@ impl Default for Config {
             search_exclude_domains: vec![],
             search_decide: default_search_decide(),
             search_decide_model: default_search_decide_model(),
+            extensions: ExtensionsConfig::default(),
         }
     }
 }
@@ -243,6 +269,20 @@ impl Config {
 
 # Decision model id used to tune the search settings.
 #search_decide_model = "typesafe/jev-1.13"
+
+# ---- Extensions ----------------------------------------------------------
+# klava ships with no extensions. Place an executable in the extensions
+# directory to install one; it is discovered at runtime and needs no rebuild.
+#
+#   ~/.config/klava/extensions/<name>          # the program (any language)
+#   ~/.config/klava/extensions/<name>.toml     # optional manifest
+#
+# klava only interprets `enabled`. Every other key under a settings table is
+# passed to the extension untouched, so klava never needs to know what an
+# extension supports. See EXTENSIONS.md for the protocol and an example.
+#
+# [extensions.settings.<name>]
+# enabled = true
 "#;
 
         fs::write(&path, template)?;
@@ -251,8 +291,22 @@ impl Config {
 
     pub fn load() -> Result<Config> {
         let path = Config::get_path();
-        let cfg: Config = confy::load_path(path)?;
+        let mut cfg: Config = confy::load_path(path)?;
+        cfg.apply_legacy_aliases();
         Ok(cfg)
+    }
+
+    /// Translate deprecated top-level flags into extension behaviour.
+    ///
+    /// `enable_pii` predates the extension system. klava must not name a
+    /// specific extension, so instead of writing into another crate's config
+    /// table this leaves a global switch that the extension chain consults.
+    /// A PII extension reads it as one input; extensions that have nothing to
+    /// do with PII ignore it.
+    fn apply_legacy_aliases(&mut self) {
+        if !self.enable_pii {
+            self.extensions.disable_pii = true;
+        }
     }
 
     pub fn save(&self) -> Result<()> {

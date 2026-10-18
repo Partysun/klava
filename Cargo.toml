@@ -23,6 +23,8 @@ tokio = { version = "1.42", features = [
   "macros",
   "signal",
   "process",
+  "io-util",
+  "time",
 ] }
 
 # Web framework
@@ -82,7 +84,6 @@ inquire = { version = "0.9.4", default-features = false, features = [
   "console",
   "macros",
 ] }
-pii = "0.1.0"
 tokenx-rs = "0.1.0"
 
 # Decision model (System One / jigor) used to tune web-search settings.
@@ -106,7 +107,6 @@ telemetry = []
 decide = ["dep:jigor"]
 qwen-code = ["dep:sha2", "dep:base64", "dep:rand"]
 klava = ["dep:sha2", "dep:base64", "dep:rand"]
-
 # Examples using qwen-code feature
 [[example]]
 name = "qwen_auth_flow"

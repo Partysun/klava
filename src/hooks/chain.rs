@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::error::Result;
-use crate::hooks::pii_guardrail_hook;
 use crate::models::openai;
 use serde_json::Value;
 use tokenx_rs::estimate_token_count;
@@ -113,9 +112,9 @@ pub fn openai_to_anthropic_hook(data: Value, _config: &Config) -> Result<Value> 
 pub fn default_chain(config: &Config) -> HookChain {
     let mut chain = HookChain::new().with_hook(HookStage::RequestReceived, "logging", logging_hook);
 
-    if config.enable_pii {
-        chain = chain.with_hook(HookStage::RequestReceived, "pii", pii_guardrail_hook);
-    }
+    // PII redaction is no longer compiled in; it is an extension that runs in
+    // the extension chain at the request stage. `enable_pii` survives only as a
+    // deprecated flag that is forwarded to installed extensions.
 
     if config.enable_token_stats {
         chain = chain.with_hook(
@@ -240,40 +239,25 @@ mod tests {
     }
 
     #[test]
-    fn test_default_chain_gates_pii_and_token_stats() {
+    fn test_default_chain_gates_token_stats() {
         let enabled = Config::default();
-        assert!(enabled.enable_pii);
         assert!(!enabled.enable_token_stats);
 
-        let chain = default_chain(&enabled);
-        let has_hook = |stage: HookStage, name: &str| {
+        let has_hook = |chain: &HookChain, stage: HookStage, name: &str| {
             chain
                 .hooks
                 .iter()
                 .any(|(s, n, _)| *s == stage && *n == name)
         };
 
-        assert!(has_hook(HookStage::RequestReceived, "pii"));
-        assert!(!has_hook(HookStage::RequestReceived, "calculate_tokens"));
+        let chain = default_chain(&enabled);
+        assert!(!has_hook(&chain, HookStage::RequestReceived, "calculate_tokens"));
 
         let disabled = Config {
-            port: 48017,
-            verbose: false,
-            enable_pii: false,
             enable_token_stats: true,
-            active_provider: "".to_string(),
-            providers: vec![],
             ..Config::default()
         };
         let chain = default_chain(&disabled);
-        let has_hook = |stage: HookStage, name: &str| {
-            chain
-                .hooks
-                .iter()
-                .any(|(s, n, _)| *s == stage && *n == name)
-        };
-
-        assert!(!has_hook(HookStage::RequestReceived, "pii"));
-        assert!(has_hook(HookStage::RequestReceived, "calculate_tokens"));
+        assert!(has_hook(&chain, HookStage::RequestReceived, "calculate_tokens"));
     }
 }

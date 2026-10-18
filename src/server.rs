@@ -29,6 +29,11 @@ pub fn create_app(
     cors: CorsLayer,
     hook_chain: Arc<HookChain>,
 ) -> Router {
+    let extensions = Arc::new(crate::extensions::Extensions::from_config(&config));
+    if !extensions.is_empty() {
+        tracing::info!("Extensions active: {}", extensions.names().join(", "));
+    }
+
     Router::new()
         .route(
             "/v1/messages",
@@ -52,6 +57,7 @@ pub fn create_app(
         // ))
         .layer(Extension(config))
         .layer(Extension(hook_chain))
+        .layer(Extension(extensions))
         .layer(Extension(client))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -621,6 +627,69 @@ mod integration_tests {
         let status = resp.status().as_u16();
         let bytes = to_bytes(resp.into_body(), 8 * 1024 * 1024).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// An extension installed as a real executable, exercised through the proxy.
+    ///
+    /// This is the integration the whole design exists for: klava is not rebuilt,
+    /// and the extension is a separate process found by scanning a directory.
+    /// The fixture is a shell script, proving any language works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_installed_extension_process_rewrites_the_request() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("klava-ext-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let script = dir.join("marker");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+request = json.load(sys.stdin)
+payload = request["payload"]
+for message in reversed(payload.get("messages", [])):
+    if message.get("role") == "user" and isinstance(message.get("content"), str):
+        message["content"] += " [marked]"
+        break
+json.dump({"decision": "replace", "payload": payload}, sys.stdout)
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        std::fs::write(dir.join("marker.toml"), "enabled = true\n").unwrap();
+
+        // SAFETY: only this test touches the variable, and it restores it below.
+        unsafe { std::env::set_var("KLAVA_EXTENSIONS_DIR", &dir) };
+
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let (status, _body) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "m", "messages": [{"role": "user", "content": "hello"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let sent = log.lock().unwrap();
+        let content = sent[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            content.contains("[marked]"),
+            "extension process did not run; upstream saw: {content}"
+        );
+
+        unsafe { std::env::remove_var("KLAVA_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

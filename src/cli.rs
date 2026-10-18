@@ -213,6 +213,28 @@ pub enum Command {
         args: Vec<String>,
     },
 
+    /// List installed extensions and manage their configuration
+    ///
+    /// klava ships with no extensions. Anything executable placed in the
+    /// extensions directory is discovered at runtime; klava only interprets the
+    /// `enabled` key and passes the rest through untouched.
+    #[command(after_help = "Examples:\n  \
+                     klava extensions\n  \
+                     klava extensions list\n  \
+                     klava extensions show <name>\n  \
+                     klava extensions enable <name>\n  \
+                     klava extensions disable <name>\n  \
+                     klava extensions set <name> key=value")]
+    Extensions {
+        /// Subcommand: list (default), show, enable, disable, set
+        #[arg(
+            required = false,
+            trailing_var_arg = true,
+            help = "Action and arguments"
+        )]
+        args: Vec<String>,
+    },
+
     /// Check configuration and provider connectivity
     ///
     /// Sends a small, cheap test request to your configured LLM API
