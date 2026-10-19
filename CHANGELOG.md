@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.23] - 2026-10-19
+
 ### Added
 
 - Extension provisioning hooks. A manifest may declare a `[setup]` table (`args`, `summary`, `network`, `timeout_secs`); klava runs it — the extension's own binary, never a shell — after the extension is enabled. `klava extensions install … --trust` and the first `klava extensions enable` run it, `--no-setup` opts out, and the new `klava extensions setup <name>` runs it on demand (the retry path). The binary, its arguments and the network warning are printed before it runs; without `--trust` and without a terminal, setup is skipped. The hook receives the extension's effective config as JSON in `$KLAVA_EXTENSION_CONFIG`, so it can honour settings such as `model_dir`.
