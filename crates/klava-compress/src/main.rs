@@ -41,6 +41,18 @@ args = ["--fetch-model"]
 summary = "Download the kompress model (~573 MB) into the klava cache"
 network = true
 timeout_secs = 3600
+
+# What this extension accepts. klava prints this table in
+# `klava extensions show klava-compress` and never sends it to the extension.
+[settings]
+enabled = false
+model_dir = ""
+threshold = 0.7
+min_tokens = 200
+max_tokens = 1500
+min_savings = 0.1
+roles = ["tool"]
+skip_structured = true
 "#;
 
 /// Where the model files come from.
@@ -1541,6 +1553,24 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert!(parse_args(&rendered).is_ok());
+    }
+
+    #[test]
+    fn the_manifest_declares_every_setting_with_its_real_default() {
+        // `klava extensions show` prints this table as the documentation, so a
+        // stale default here would lie to the user. Parse it into the real
+        // config type and compare with `Default`.
+        let value: toml::Value = toml::from_str(MANIFEST).unwrap();
+        let declared: CompressConfig = value["settings"].clone().try_into().expect("settings");
+        let real = CompressConfig::default();
+        assert_eq!(declared.threshold, real.threshold);
+        assert_eq!(declared.min_tokens, real.min_tokens);
+        assert_eq!(declared.max_tokens, real.max_tokens);
+        assert_eq!(declared.min_savings, real.min_savings);
+        assert_eq!(declared.roles, real.roles);
+        assert_eq!(declared.skip_structured, real.skip_structured);
+        assert_eq!(declared.model_dir, real.model_dir);
+        assert_eq!(declared.enabled, real.enabled);
     }
 
     #[test]

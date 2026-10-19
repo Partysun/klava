@@ -49,7 +49,8 @@ this order: `--dir`, `model_dir` (from your klava settings, passed to the hook i
 
 ## Configuration
 
-All keys live under `[extensions.settings.klava-compress]` in the klava config:
+All keys live under `[extensions.settings.klava-compress]` in the klava config.
+`klava extensions show klava-compress` prints them with their defaults:
 
 ```toml
 [extensions.settings.klava-compress]

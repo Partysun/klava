@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod anthropic;
 pub mod config;
+pub mod decision;
 pub mod diagnostic;
 pub mod error;
 pub mod ext_api;

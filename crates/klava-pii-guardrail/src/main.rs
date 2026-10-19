@@ -34,6 +34,31 @@ use std::io::{Read, Write};
 /// The protocol version klava sends. We answer whatever we understand.
 const PROTOCOL: u32 = 1;
 
+/// What `--print-manifest` emits, so klava can show what this extension accepts
+/// and how it behaves when it fails.
+///
+/// Declared entities are the default policy only; the crate recognises more
+/// (see its README). Listing all 21 here would bury the useful keys.
+const MANIFEST: &str = r#"# Written by klava from `klava-pii-guardrail --print-manifest`.
+
+# A PII filter that stops filtering without saying so is worse than none:
+# fail closed so a crash blocks the request instead of leaking it.
+fail_closed = true
+
+notice = """
+This extension rewrites the content of your requests before they leave the machine. \
+Any text it detects as personal data is replaced according to `operators`. Keep it \
+enabled: a failure is logged, not silently ignored.
+"""
+
+# What this extension accepts. klava prints this table in
+# `klava extensions show klava-pii-guardrail` and never sends it to the extension.
+[settings]
+enabled = true
+entities = ["Email", "CryptoAddress"]
+operators = { Email = "replace:<EMAIL>", CryptoAddress = "replace:<CryptoAddress>" }
+"#;
+
 /// One request from klava.
 #[derive(Debug, Deserialize)]
 struct HostRequest {
@@ -382,6 +407,16 @@ fn restore_encoded_payloads(value: &mut Value, originals: &[(String, String)]) {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    // `--print-manifest` is how klava learns what this extension declares; it
+    // must answer before any request is read from stdin.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--print-manifest")
+    {
+        print!("{MANIFEST}");
+        return;
+    }
+
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         eprintln!("pii-guardrail: cannot read request: {e}");
@@ -467,6 +502,29 @@ mod tests {
 
     fn ctx_of(payload: Value) -> Value {
         payload
+    }
+
+    #[test]
+    fn the_manifest_declares_the_real_default_policy() {
+        // `klava extensions show` prints this table as the documentation, so a
+        // stale default here would lie to the user.
+        let value: toml::Value = toml::from_str(MANIFEST).expect("manifest must parse");
+        let declared: GuardrailConfig = value["settings"]
+            .clone()
+            .try_into()
+            .expect("settings table");
+        let real = GuardrailConfig::default_policy();
+        assert_eq!(declared.enabled, real.enabled);
+        assert_eq!(declared.entities, real.entities);
+        assert_eq!(declared.operators, real.operators);
+    }
+
+    #[test]
+    fn the_manifest_fails_closed_and_carries_a_notice() {
+        let value: toml::Value = toml::from_str(MANIFEST).expect("manifest must parse");
+        assert_eq!(value["fail_closed"].as_bool(), Some(true));
+        let notice = value["notice"].as_str().expect("notice");
+        assert!(notice.contains("personal data"), "got: {notice}");
     }
 
     fn run(payload: Value, cfg: Option<GuardrailConfig>) -> Option<Value> {

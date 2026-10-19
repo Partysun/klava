@@ -55,9 +55,26 @@ pub struct Config {
     /// the static config values above are used as-is.
     #[serde(default = "default_search_decide")]
     pub search_decide: bool,
-    /// Decision model id used to tune the search settings.
-    #[serde(default = "default_search_decide_model")]
-    pub search_decide_model: String,
+
+    // ---- Decision model ---------------------------------------------------
+    /// The universal decide model id (jigor / System One). Every classifier
+    /// call klava makes — web-search tuning, and any extension that asks for a
+    /// `decide` — uses this one model, so there is a single place to change it.
+    ///
+    /// `search_decide_model` is accepted as a legacy alias when loading.
+    #[serde(default = "default_decide_model", alias = "search_decide_model")]
+    pub decide_model: String,
+
+    /// Require an approved `decide` from an extension before the host performs
+    /// its `nested_call`.
+    ///
+    /// A nested call re-sends the whole conversation to another model, so it is
+    /// the most expensive action an extension can trigger. The extension owns
+    /// the question and the threshold; klava only enforces that some question
+    /// was answered "yes" first. Set to `false` to trust extensions without a
+    /// proof step (the log marks such calls as unverified).
+    #[serde(default = "default_require_decide_for_nested_calls")]
+    pub require_decide_for_nested_calls: bool,
 
     /// Built-in, always-compiled extensions (see `crate::extensions`).
     #[serde(default)]
@@ -109,8 +126,12 @@ fn default_search_decide() -> bool {
     true
 }
 
-fn default_search_decide_model() -> String {
-    "typesafe/jev-1.13".to_string()
+fn default_decide_model() -> String {
+    crate::decision::DEFAULT_DECIDE_MODEL.to_string()
+}
+
+fn default_require_decide_for_nested_calls() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -131,7 +152,8 @@ impl Default for Config {
             search_include_domains: vec![],
             search_exclude_domains: vec![],
             search_decide: default_search_decide(),
-            search_decide_model: default_search_decide_model(),
+            decide_model: default_decide_model(),
+            require_decide_for_nested_calls: default_require_decide_for_nested_calls(),
             extensions: ExtensionsConfig::default(),
         }
     }
@@ -270,8 +292,16 @@ impl Config {
 # Let a decision model tune the search settings for each query (default: true).
 #search_decide = true
 
-# Decision model id used to tune the search settings.
-#search_decide_model = "typesafe/jev-1.13"
+# ---- Decision model ------------------------------------------------------
+# One decide model (jigor / System One) serves every classifier call klava
+# makes: web-search tuning, and any extension that asks for a `decide`.
+# Change it here once. Extensions own their questions and thresholds.
+#decide_model = "typesafe/jev-1.13"
+
+# Require an approved decide before an extension's nested call runs (default:
+# true). The extension supplies the question and threshold; klava only checks
+# that one was answered "yes". false marks such calls as unverified in the log.
+#require_decide_for_nested_calls = true
 
 # ---- Extensions ----------------------------------------------------------
 # klava ships with no extensions. Install one with:
@@ -458,6 +488,17 @@ impl Config {
             .or_else(|| self.resolve_completion_model())
     }
 
+    /// The decide model used by every classifier call (search tuning and the
+    /// nested-call gate). Empty falls back to the built-in default.
+    pub fn resolve_decide_model(&self) -> String {
+        let chosen = self.decide_model.trim();
+        if chosen.is_empty() {
+            crate::decision::DEFAULT_DECIDE_MODEL.to_string()
+        } else {
+            chosen.to_string()
+        }
+    }
+
     /// Whether web search should be active for this setup: enabled in config,
     /// the active provider is the klava gateway, and klava is authenticated
     /// (saved `klava login` session or an explicit `KLAVA_API_KEY`-style key).
@@ -483,6 +524,45 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.active_provider, "");
         assert_eq!(config.providers.len(), 0);
+    }
+
+    #[test]
+    fn the_decide_model_is_shared_and_the_nested_call_proof_is_on_by_default() {
+        let config = Config::default();
+        assert!(config.require_decide_for_nested_calls);
+        assert_eq!(
+            config.resolve_decide_model(),
+            crate::decision::DEFAULT_DECIDE_MODEL
+        );
+    }
+
+    #[test]
+    fn decide_model_is_universal_and_falls_back_to_the_default() {
+        let mut config = Config {
+            decide_model: "custom/decider".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(config.resolve_decide_model(), "custom/decider");
+
+        config.decide_model = "  ".to_string();
+        assert_eq!(
+            config.resolve_decide_model(),
+            crate::decision::DEFAULT_DECIDE_MODEL
+        );
+    }
+
+    #[test]
+    fn legacy_search_decide_model_is_accepted_as_an_alias() {
+        let config: Config = toml::from_str(
+            r#"
+port = 48017
+active_provider = "x"
+search_decide_model = "legacy/decider"
+"#,
+        )
+        .expect("legacy config parses");
+        assert_eq!(config.decide_model, "legacy/decider");
+        assert_eq!(config.resolve_decide_model(), "legacy/decider");
     }
 
     #[test]

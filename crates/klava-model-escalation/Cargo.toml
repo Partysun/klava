@@ -14,3 +14,7 @@ path = "src/main.rs"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The manifest tests parse `--print-manifest` output the way klava will.
+toml = "1"

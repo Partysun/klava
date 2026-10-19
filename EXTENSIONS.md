@@ -45,6 +45,7 @@ klava extensions path      # where klava looks, in order
 klava extensions list      # name, status, setup, version, source, path
 klava extensions verify    # re-check recorded checksums
 klava extensions setup <name>   # run the [setup] hook
+klava extensions refresh-manifest <name>  # re-ask the binary for its manifest
 klava extensions remove <name>  # also removes <name>.toml, .source.toml, .setup.toml
 ```
 
@@ -109,8 +110,11 @@ or `klava extensions enable my-extension`. The lookup order is:
 ## Manifest
 
 Optional, and entirely owned by the extension. klava reads `enabled`,
-`fail_closed`, `timeout_secs`, and the `[setup]` table; everything else is passed
-straight through in the request's `config` field.
+`fail_closed`, `timeout_secs`, `notice`, and the `[setup]` and `[settings]`
+tables; everything else is passed straight through in the request's `config`
+field. The last two are **host-only**: klava strips them before handing the
+config to the extension (see [Declaring settings](#declaring-settings)) — as it
+does `setup`, which is already host-only.
 
 ```toml
 enabled = true
@@ -118,9 +122,47 @@ fail_closed = false     # false: a failure is logged and the request continues
 timeout_secs = 20       # default 20; the child is killed after this
 threshold = 0.7         # your own key, opaque to klava
 
+notice = "Costs money: each call bills a second model."   # shown on enable
+
 [setup]                 # optional provisioning hook; see below
 args = ["--fetch-model"]
+
+[settings]              # what this extension accepts; see below
+threshold = 0.7
 ```
+
+`notice` is a warning shown, wrapped, by `klava extensions enable`,
+`extensions install` and `extensions show`. Use it for the things a user must
+know *after* installing: money, data leaving the machine, a destructive default.
+
+### Declaring settings
+
+A manifest may list the keys the extension accepts, with their defaults:
+
+```toml
+[settings]
+enabled = false
+threshold = 0.7
+roles = ["tool"]
+```
+
+klava does not interpret these values. It uses the table to make
+`klava extensions show <name>` useful — each declared key is printed with its
+default and the value currently in effect — and strips `[settings]` before
+sending the config, so declaring a key never changes what the extension
+receives. Keeping the declared defaults equal to the extension's real defaults
+is the extension's job; each shipped extension has a test that compares the
+manifest against its `serde` defaults.
+
+Without a `[settings]` table, `show` can only print what is currently set, and
+says so. This is the case for every extension installed before the table
+existed; `klava extensions refresh-manifest <name>` re-asks the binary for its
+manifest and updates it in place (unlike `install`, which never overwrites an
+existing manifest).
+
+The easiest way to emit a manifest is `--print-manifest`: klava runs
+`<binary> --print-manifest` once at install time and stores valid TOML beside
+the artifact as `<name>.toml`.
 
 ### Provisioning: `[setup]`
 
@@ -188,7 +230,31 @@ klava writes exactly one JSON object to stdin and closes it:
   "reason": "user",
   "source_api": "openai",
   "model": "…",
-  "nested_calls_used": 0
+  "nested_calls_used": 0,
+  "require_decide": true
+}
+```
+
+The first run has no `decide`. If the extension asks for one, the host re-runs
+it with the answer added:
+
+```json
+{
+  "protocol": 1,
+  "config": { "enabled": true },
+  "payload": { "model": "…", "messages": [] },
+  "reason": "user",
+  "source_api": "openai",
+  "model": "…",
+  "nested_calls_used": 0,
+  "require_decide": true,
+  "decide": {
+    "answers": { "needs_help": { "type": "noul", "noul": 0.91 } },
+    "approve": true,
+    "probability": 0.91,
+    "cost_usd": 0.000021,
+    "model": "typesafe/jev-1.13"
+  }
 }
 ```
 
@@ -201,6 +267,8 @@ klava writes exactly one JSON object to stdin and closes it:
 | `source_api` | `openai`, `anthropic`, or `responses`. |
 | `model` | The model the request will use. |
 | `nested_calls_used` | Nested calls already made for this request. |
+| `require_decide` | Whether the host will only accept a `nested_call` after an approved `decide`. |
+| `decide` | Present only on a re-run after a `decide`; absent on the first run. |
 
 ### Response
 
@@ -216,6 +284,7 @@ Write one JSON object to stdout and exit 0:
 | `replace` | Use `payload` instead. | `payload` |
 | `append` | Add `messages` to the conversation. | `messages` |
 | `deny` | Reject the request. | `reason`, optional `fail_closed` |
+| `decide` | Ask the host's decide model a typed question; the extension is re-run with the answer. | `decide` |
 | `nested_call` | Ask klava to run a second model and fold the answer in. | `nested_call` |
 
 An unknown `decision`, or `replace` without a `payload`, is treated as
@@ -242,6 +311,78 @@ original model continues) or `take_over` (the answer is returned to the client
 as the assistant turn). The extension never makes the call itself: credentials,
 routing, timeouts and the recursion boundary stay in klava, so an extension
 cannot recurse.
+
+### Asking the decide model: `decision: "decide"`
+
+klava owns the **decide model** (a System One classifier via `jigor`) and the
+credentials it needs. Any extension can ask for a judgment without linking
+klava, holding a key, or knowing which backend serves the model. The extension
+owns the question and the evidence; klava owns the model, the timeout, the
+retry policy and the cost accounting.
+
+```json
+{
+  "decision": "decide",
+  "decide": {
+    "state": { "context": "…bounded evidence the classifier should judge…" },
+    "questions": [
+      { "id": "needs_stronger_model", "type": "noul", "instructions": "Is …?" }
+    ],
+    "threshold": 0.8,
+    "approve_question": "needs_stronger_model"
+  }
+}
+```
+
+The host answers by **re-running the same extension** with `decide` filled in:
+
+```json
+{
+  "decide": {
+    "answers": { "needs_stronger_model": { "type": "noul", "noul": 0.91 } },
+    "approve": true,
+    "probability": 0.91,
+    "cost_usd": 0.000021,
+    "model": "typesafe/jev-1.13"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `state` | Any JSON value. The classifier judges it as text. |
+| `questions` | Up to 16 typed questions: `noul` (yes/no), `choice` (one of `criteria` keys), `score` (an ordered `criteria` list). |
+| `threshold` | `noul` probability at or above which `approve` is true. |
+| `approve_question` | Question that decides `approve`. Defaults to the first `noul`. |
+| `answers` | Every requested answer, in the System One wire shape. |
+| `approve` | Whether the approve question cleared the threshold. |
+| `cost_usd` | Billed cost of the classification call, when reported. |
+
+Each extension gets **at most two decide rounds per client request**, so a
+classifier loop cannot run away. A failed call (no key, network, timeout,
+malformed answer) is logged and the extension is **not** re-run — treat a
+missing `decide` as "no".
+
+The request carries `require_decide`, the host's nested-call policy, so an
+extension can align with it. The host's switch is authoritative:
+
+```toml
+# Require an approved decide before any nested_call (default: true).
+require_decide_for_nested_calls = true
+
+# One decision model for web-search tuning and every extension `decide`.
+decide_model = "typesafe/jev-1.13"
+```
+
+When `require_decide_for_nested_calls = true`, a `nested_call` with no approved
+`decide` in the same request is refused and the turn stays on the cheap model.
+When it is `false`, such calls still run but are logged as `UNVERIFIED`.
+
+The gate fails **closed**: only an explicit `approve: true` allows the spend.
+`klava-model-escalation` builds a bounded excerpt (a message window and a
+character budget, never the whole payload) and asks one `noul` question, so the
+cost of saying "no" is one small classification call — logged next to the
+decision.
 
 ### stderr
 
@@ -287,10 +428,11 @@ klava extensions enable my-extension
 
 ```sh
 klava extensions                        # list: name, status, setup, version, source
-klava extensions show <name>            # status, setup state, path, effective config
+klava extensions show <name>            # status, notice, declared settings, effective config
 klava extensions install <source> --trust
 klava extensions install <source> --trust --no-setup   # enable, but do not provision
 klava extensions setup <name>           # run the [setup] hook now (re-runs it)
+klava extensions refresh-manifest <name>  # re-ask the binary for its manifest
 klava extensions enable <name> [--trust|--no-setup]
 klava extensions disable <name>
 klava extensions set <name> key=value

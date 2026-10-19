@@ -1,6 +1,6 @@
 //! Decision model: tuning search settings with a System One classifier.
 //!
-//! The decision model (`jigor`, model `search_decide_model`) answers a small
+//! The decision model (`jigor`, the universal `decide_model`) answers a small
 //! set of bounded questions about the query — how fresh, how broad, how much
 //! context — and this module maps the typed answers onto [`SearchSettings`].
 //!
@@ -13,6 +13,7 @@
 //! [`tokio::task::spawn_blocking`] with a short timeout.
 
 use crate::config::Config;
+use crate::decision::api_key;
 use crate::search::settings::{Breadth, ContextSize, Engine, SearchSettings};
 use jigor::{Answer, KlavaBackend};
 use std::collections::HashMap;
@@ -31,28 +32,6 @@ const Q_ENGINE: &str = "engine_family";
 /// Question id: is the query about Russia / Russian-language sources?
 const Q_RUSSIA: &str = "russia_region";
 
-/// Klava API key for the decision call. The gateway key is the same one the
-/// `klava` provider uses: the env var named by the provider's `api_key_name`
-/// (e.g. `KLAVA_API_KEY`), the provider's `api_key` field, or the saved
-/// `klava login` credentials.
-fn api_key(config: &Config) -> Option<String> {
-    config
-        .resolve_api_key()
-        .or_else(|| std::env::var("KLAVA_API_KEY").ok())
-        .or_else(|| {
-            #[cfg(feature = "klava")]
-            {
-                let mut auth = crate::klava_auth::KlavaAuth::new();
-                auth.get_api_key().ok()
-            }
-            #[cfg(not(feature = "klava"))]
-            {
-                None
-            }
-        })
-        .filter(|k| !k.is_empty())
-}
-
 /// Decide and apply tuning for `query`, starting from `base`.
 ///
 /// Returns `base` unchanged on any failure. Never panics, never blocks the
@@ -62,7 +41,7 @@ pub async fn tune(config: &Config, query: &str, base: SearchSettings) -> SearchS
         return base;
     }
 
-    let model = config.search_decide_model.clone();
+    let model = config.resolve_decide_model();
     let Some(key) = api_key(config) else {
         tracing::debug!("web search: no klava key available; skipping decision model");
         return base;

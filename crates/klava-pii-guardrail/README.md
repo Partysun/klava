@@ -21,7 +21,8 @@ klava extensions install ~/.cargo/bin/klava-pii-guardrail --trust
 ## Configuration
 
 All keys live under `[extensions.settings.klava-pii-guardrail]` in the klava
-config:
+config. `klava extensions show klava-pii-guardrail` prints them with their
+defaults:
 
 ```toml
 [extensions.settings.klava-pii-guardrail]
@@ -52,8 +53,18 @@ Entity names: `Email`, `Phone`, `IpAddress`, `Ipv6`, `CreditCard`, `Iban`,
   structural escapes (`\n`, `\t`) can never be corrupted.
 - Inline base64 payloads (`data:` URLs, Anthropic image sources) are masked
   before analysis, so a crypto-address-shaped run inside an image is untouched.
-- Fails **open**: an analysis error leaves the text unchanged; it never blocks
-  the request.
+- Two failure layers, deliberately different:
+  - **Inside a run**, an analysis error leaves the text unchanged rather than
+    blanking a request the model could still use.
+  - **At the host level**, the manifest declares `fail_closed = true`: if this
+    process crashes, times out, or answers with malformed output, klava rejects
+    the request instead of sending it unfiltered. A PII filter that silently
+    stops filtering is worse than a visible failure.
+
+  Opting out of the second layer (`fail_closed = false` in
+  `~/.local/share/klava/extensions/klava-pii-guardrail.toml`) means an internal
+  crash would let unredacted text through. Do it only if you would rather have
+  the request go out than fail.
 
 See [klava's EXTENSIONS.md](https://github.com/Partysun/klava/blob/master/EXTENSIONS.md)
 for the wire protocol.

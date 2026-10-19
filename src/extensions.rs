@@ -60,6 +60,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STDOUT: usize = 8 * 1024 * 1024;
 const MAX_STDERR: usize = 64 * 1024;
 
+/// How many times one extension may re-run with a decide answer in a single
+/// client request. Bounds a classifier loop an extension could otherwise cause.
+const MAX_DECIDE_ROUNDS: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Wire protocol
 // ---------------------------------------------------------------------------
@@ -81,11 +85,18 @@ pub struct ExtensionRequest {
     pub model: String,
     /// Nested calls already made for this client request.
     pub nested_calls_used: u32,
+    /// Whether the host will accept a `nested_call` only after an approved
+    /// `decide`. The extension asks for the judgment only when this is true, so
+    /// there is one policy switch (the host's) rather than two.
+    pub require_decide: bool,
+    /// Set on the second run of an extension that asked for a `decide` call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide: Option<crate::ext_api::DecideResult>,
 }
 
 /// What an extension may reply, on stdout, as one JSON object.
 ///
-/// `decision` is one of `continue`, `replace`, `append`, `deny`, or
+/// `decision` is one of `continue`, `replace`, `append`, `deny`, `decide`, or
 /// `nested_call`. Unknown decisions are treated as `continue`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtensionResponse {
@@ -99,6 +110,8 @@ pub struct ExtensionResponse {
     pub reason: Option<String>,
     #[serde(default)]
     pub fail_closed: bool,
+    #[serde(default)]
+    pub decide: Option<crate::ext_api::DecideRequest>,
     #[serde(default)]
     pub nested_call: Option<NestedCall>,
 }
@@ -131,6 +144,10 @@ impl ExtensionResponse {
             "append" => Decision::Append(self.messages.unwrap_or_default()),
             "deny" => Decision::Deny {
                 reason: self.reason.unwrap_or_else(|| "denied by extension".into()),
+            },
+            "decide" => match self.decide {
+                Some(request) => Decision::Decide(request),
+                None => Decision::Continue,
             },
             "nested_call" => match self.nested_call {
                 Some(call) => Decision::NestedCall(NestedCallRequest {
@@ -194,8 +211,21 @@ impl InstalledExtension {
     /// `disable_pii` is the legacy `enable_pii = false` flag. It is passed to
     /// every extension because the host does not know which one cares; the rest
     /// ignore it.
+    ///
+    /// Host-only manifest keys (`[settings]` and `notice`, which describe the
+    /// extension to klava, and `[setup]`, which names its provisioning hook) are
+    /// removed: they tell klava what the extension accepts and how to install
+    /// it, they are not configuration the extension asked for.
     pub fn effective_config(&self, config: &Config) -> Value {
         let mut effective = self.config.clone();
+        if let Some(map) = effective.as_object_mut() {
+            map.remove(SETTINGS_KEY);
+            map.remove(NOTICE_KEY);
+            map.remove("setup");
+            // The manifest's `fail_closed` is a host policy, not an extension
+            // setting; `policy:` already reports it.
+            map.remove("fail_closed");
+        }
         if let Some(user) = config.extensions.settings.get(&self.name) {
             merge(&mut effective, user);
         }
@@ -205,6 +235,32 @@ impl InstalledExtension {
             map.insert("disable_pii".into(), Value::Bool(true));
         }
         effective
+    }
+
+    /// What this extension accepts, as declared by its manifest's `[settings]`.
+    ///
+    /// Empty when the extension declares nothing (or has no manifest), which is
+    /// every extension installed before manifests carried this.
+    pub fn declared_settings(&self) -> Vec<DeclaredSetting> {
+        let Some(table) = self.config.get(SETTINGS_KEY).and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .map(|(key, value)| DeclaredSetting {
+                key: key.clone(),
+                default: value.clone(),
+            })
+            .collect()
+    }
+
+    /// A warning the extension wants the user to read before enabling it.
+    pub fn notice(&self) -> Option<&str> {
+        self.config
+            .get(NOTICE_KEY)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
     }
 
     /// How to provision this extension, from the manifest's `[setup]` table.
@@ -287,6 +343,27 @@ pub struct SetupSpec {
 /// Default time a setup hook may run. Large downloads need minutes, not the
 /// 20 seconds a request gets.
 pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Manifest key declaring the settings the extension accepts.
+///
+/// Stripped from the config handed to the extension: it is documentation for
+/// the user and the host, not a setting.
+pub const SETTINGS_KEY: &str = "settings";
+
+/// Manifest key carrying a warning shown before the extension is enabled.
+///
+/// Same rule as [`SETTINGS_KEY`]: host-only, never sent to the extension.
+pub const NOTICE_KEY: &str = "notice";
+
+/// One setting an extension declares, with its default.
+///
+/// The value is the extension's own default, opaque to klava: it is printed as
+/// documentation and never interpreted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeclaredSetting {
+    pub key: String,
+    pub default: Value,
+}
 
 /// One directory klava looks in for extensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +648,11 @@ impl Extensions {
     ///
     /// Later extensions see earlier extensions' output. A nested call may need a
     /// nested model call, so this takes the HTTP client.
+    ///
+    /// An extension may ask the host to run the **decide model** over state it
+    /// supplies (`decision: "decide"`). The host answers by re-running that same
+    /// extension with `decide` filled in, so the question and the evidence stay
+    /// in the extension while the model, credentials and cost stay in klava.
     pub async fn on_request(
         &self,
         client: &reqwest::Client,
@@ -583,72 +665,141 @@ impl Extensions {
 
         for ext in &self.active {
             let name = ext.name.as_str();
-            let request = ExtensionRequest {
-                protocol: 1,
-                config: ext.effective_config(config),
-                payload: payload.clone(),
-                reason,
-                source_api,
-                model: payload
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                nested_calls_used,
-            };
+            let mut decide_result: Option<crate::ext_api::DecideResult> = None;
+            let mut decide_rounds = 0usize;
 
-            let response = match run_extension(ext, &request).await {
-                Ok(response) => response,
-                Err(e) => {
-                    if ext.fail_closed {
-                        return Err(crate::error::Error::Transform(format!(
-                            "extension '{name}' failed: {e}"
-                        )));
-                    }
-                    tracing::warn!("extension '{name}' failed, payload unchanged: {e}");
-                    continue;
-                }
-            };
+            loop {
+                let request = ExtensionRequest {
+                    protocol: 1,
+                    config: ext.effective_config(config),
+                    payload: payload.clone(),
+                    reason,
+                    source_api,
+                    model: payload
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    nested_calls_used,
+                    require_decide: config.require_decide_for_nested_calls,
+                    decide: decide_result.clone(),
+                };
 
-            // The extension may override its own failure policy for this call.
-            let fail_closed = response.fail_closed || ext.fail_closed;
-            let decision = response.into_decision();
+                let response = match run_extension(ext, &request).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        if ext.fail_closed {
+                            return Err(crate::error::Error::Transform(format!(
+                                "extension '{name}' failed: {e}"
+                            )));
+                        }
+                        tracing::warn!("extension '{name}' failed, payload unchanged: {e}");
+                        break;
+                    }
+                };
 
-            match decision {
-                Decision::Continue => {}
-                Decision::Replace(next) => payload = next,
-                Decision::Append(messages) => {
-                    if let Some(list) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-                        list.extend(messages);
+                // The extension may override its own failure policy for this call.
+                let fail_closed = response.fail_closed || ext.fail_closed;
+                let decision = response.into_decision();
+
+                match decision {
+                    Decision::Continue => break,
+                    Decision::Replace(next) => {
+                        payload = next;
+                        break;
                     }
-                }
-                Decision::Deny { reason } => {
-                    if fail_closed {
-                        return Err(crate::error::Error::Transform(format!(
-                            "extension '{name}' denied the request: {reason}"
-                        )));
+                    Decision::Append(messages) => {
+                        if let Some(list) =
+                            payload.get_mut("messages").and_then(Value::as_array_mut)
+                        {
+                            list.extend(messages);
+                        }
+                        break;
                     }
-                    tracing::warn!("extension '{name}' denied but is fail-open; continuing");
-                }
-                Decision::NestedCall(req) => {
-                    match nested_call(client, config, payload, &req).await? {
-                        NestedOutcome::Appended(next) => {
-                            payload = next;
-                            nested_calls_used += 1;
-                            tracing::debug!(
-                                "{name}: {nested_calls_used} nested call(s) used this request"
+                    Decision::Deny { reason } => {
+                        if fail_closed {
+                            return Err(crate::error::Error::Transform(format!(
+                                "extension '{name}' denied the request: {reason}"
+                            )));
+                        }
+                        tracing::warn!("extension '{name}' denied but is fail-open; continuing");
+                        break;
+                    }
+                    Decision::Decide(request) => {
+                        if decide_rounds >= MAX_DECIDE_ROUNDS {
+                            tracing::warn!(
+                                "extension '{name}' asked for decide {} times in one request; \
+                                 leaving the request unchanged",
+                                decide_rounds
+                            );
+                            break;
+                        }
+                        decide_rounds += 1;
+
+                        match crate::decision::ask(config, &request).await {
+                            Ok(result) => {
+                                tracing::info!(
+                                    "extension '{name}' decide: {} question(s), approve={} p={:?} model={}",
+                                    result.answers.len(),
+                                    result.approve,
+                                    result.probability,
+                                    result.model
+                                );
+                                if let Some(cost) = result.cost_usd {
+                                    tracing::info!("extension '{name}' decide cost: ${cost:.6}");
+                                }
+                                decide_result = Some(result);
+                                // Re-run the extension with its answer.
+                            }
+                            Err(e) => {
+                                tracing::warn!("extension '{name}' decide failed: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Decision::NestedCall(req) => {
+                        // A nested call is the most expensive thing an
+                        // extension can trigger. By default the extension must
+                        // have asked the decide model and received "yes" in
+                        // this request; klava never invents the question.
+                        if config.require_decide_for_nested_calls
+                            && !decide_result.as_ref().is_some_and(|d| d.approve)
+                        {
+                            tracing::warn!(
+                                "extension '{name}' requested a nested call to {} without an \
+                                 approved decide; staying on the cheap model",
+                                req.model
+                            );
+                            break;
+                        }
+                        if !config.require_decide_for_nested_calls {
+                            tracing::warn!(
+                                "extension '{name}' nested call to {} runs UNVERIFIED \
+                                 (require_decide_for_nested_calls = false)",
+                                req.model
                             );
                         }
-                        NestedOutcome::TakenOver {
-                            payload: next,
-                            response,
-                        } => {
-                            return Ok(RequestOutcome {
+
+                        match nested_call(client, config, payload, &req).await? {
+                            NestedOutcome::Appended(next) => {
+                                payload = next;
+                                nested_calls_used += 1;
+                                tracing::debug!(
+                                    "{name}: {nested_calls_used} nested call(s) used this request"
+                                );
+                            }
+                            NestedOutcome::TakenOver {
                                 payload: next,
-                                canned_response: Some(response),
-                            });
+                                response,
+                            } => {
+                                return Ok(RequestOutcome {
+                                    payload: next,
+                                    canned_response: Some(response),
+                                });
+                            }
+                            NestedOutcome::Failed(next) => payload = next,
                         }
-                        NestedOutcome::Failed(next) => payload = next,
+                        break;
                     }
                 }
             }
@@ -1065,6 +1216,75 @@ mod tests {
     }
 
     #[test]
+    fn response_decide_carries_the_extension_question() {
+        let d = response(
+            r#"{"decision":"decide","decide":{
+                "state":{"error":"disk full"},
+                "questions":[{"id":"need_help","type":"noul","instructions":"Needs help?"}],
+                "threshold":0.7
+            }}"#,
+        )
+        .into_decision();
+        match d {
+            Decision::Decide(req) => {
+                assert_eq!(req.questions.len(), 1);
+                assert_eq!(req.questions[0].id, "need_help");
+                assert_eq!(req.threshold, 0.7);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_decide_without_a_request_continues() {
+        assert_eq!(
+            response(r#"{"decision":"decide"}"#).into_decision(),
+            Decision::Continue
+        );
+    }
+
+    #[test]
+    fn decide_result_is_omitted_from_the_first_request() {
+        let req = ExtensionRequest {
+            protocol: 1,
+            config: json!({}),
+            payload: json!({}),
+            reason: RequestReason::User,
+            source_api: SourceApi::OpenAi,
+            model: "m".into(),
+            nested_calls_used: 0,
+            require_decide: true,
+            decide: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("decide").is_none());
+    }
+
+    #[test]
+    fn decide_result_is_sent_on_the_second_run() {
+        let req = ExtensionRequest {
+            protocol: 1,
+            config: json!({}),
+            payload: json!({}),
+            reason: RequestReason::User,
+            source_api: SourceApi::OpenAi,
+            model: "m".into(),
+            nested_calls_used: 0,
+            require_decide: true,
+            decide: Some(crate::ext_api::DecideResult {
+                answers: std::collections::HashMap::new(),
+                approve: true,
+                probability: Some(0.91),
+                cost_usd: Some(0.00002),
+                model: "typesafe/jev-1.13".into(),
+            }),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["decide"]["approve"], true);
+        assert_eq!(v["decide"]["probability"], 0.91);
+    }
+
+    #[test]
     fn response_nested_call_defaults_to_append_mode() {
         let d = response(
             r#"{"decision":"nested_call","nested_call":{"model":"strong","instruction":"look"}}"#,
@@ -1117,9 +1337,12 @@ mod tests {
             source_api: SourceApi::Anthropic,
             model: "m".into(),
             nested_calls_used: 0,
+            require_decide: true,
+            decide: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["protocol"], 1);
+        assert_eq!(v["require_decide"], true);
         assert_eq!(v["reason"], "continuation");
         assert_eq!(v["source_api"], "anthropic");
     }
@@ -1134,6 +1357,119 @@ mod tests {
     #[test]
     fn broken_manifest_is_rejected() {
         assert!(toml_to_json("this is not toml ][").is_err());
+    }
+
+    /// A malformed decide request is rejected before any model call, the
+    /// extension runs exactly once, and the payload is untouched. This is the
+    /// deterministic half of the round-trip: validation happens in the host.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_malformed_decide_is_rejected_without_spending() {
+        let dir = std::env::temp_dir().join(format!("klava-decide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("runs.log");
+        let path = dir.join("asker");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf 'run\\n' >> '{log}'\n\
+                 echo '{{\"decision\":\"decide\",\"decide\":{{\"state\":{{}},\"questions\":[]}}}}'\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        let extensions = Extensions {
+            active: vec![InstalledExtension {
+                name: "asker".into(),
+                path,
+                config: json!({}),
+                fail_closed: false,
+                origin: None,
+            }],
+        };
+        let config = Config::default();
+        let payload = json!({"model": "weak", "messages": []});
+        let outcome = extensions
+            .on_request(
+                &reqwest::Client::new(),
+                &config,
+                payload.clone(),
+                RequestReason::User,
+                SourceApi::OpenAi,
+            )
+            .await
+            .expect("request runs");
+        assert_eq!(outcome.payload, payload);
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().lines().count(),
+            1,
+            "an invalid decide must not re-run the extension"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An extension that always asks for a nested call must not get one
+    /// without an approved decide while the host policy requires it. The
+    /// refusal happens before any provider is resolved, so this test never
+    /// touches the network.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unapproved_nested_call_is_refused_by_host_policy() {
+        let dir = std::env::temp_dir().join(format!("klava-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("always-nested");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncat >/dev/null\necho '{\"decision\":\"nested_call\",\"nested_call\":{\"model\":\"strong\"}}'\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+
+        let extensions = Extensions {
+            active: vec![InstalledExtension {
+                name: "always-nested".into(),
+                path,
+                config: json!({}),
+                fail_closed: false,
+                origin: None,
+            }],
+        };
+        let config = Config {
+            require_decide_for_nested_calls: true,
+            ..Config::default()
+        };
+        let payload = json!({"model": "weak", "messages": [{"role": "user", "content": "hi"}]});
+
+        let outcome = extensions
+            .on_request(
+                &reqwest::Client::new(),
+                &config,
+                payload.clone(),
+                RequestReason::User,
+                SourceApi::OpenAi,
+            )
+            .await
+            .expect("request runs");
+
+        assert_eq!(outcome.payload, payload, "payload must be unchanged");
+        assert!(outcome.canned_response.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1310,5 +1646,105 @@ mod tests {
         assert_eq!(eff["a"], 1);
         assert_eq!(eff["b"], 9);
         assert_eq!(eff["c"], 3);
+    }
+
+    #[test]
+    fn host_only_manifest_keys_never_reach_the_extension() {
+        let ext = InstalledExtension {
+            name: "x".into(),
+            path: PathBuf::from("/bin/true"),
+            config: json!({
+                "enabled": true,
+                "fail_closed": true,
+                "notice": "read me",
+                "setup": {"args": ["--fetch"]},
+                "settings": {"threshold": 0.7},
+                "threshold": 0.5,
+            }),
+            fail_closed: true,
+            origin: None,
+        };
+        let config = Config {
+            port: 48017,
+            ..Config::default()
+        };
+        let eff = ext.effective_config(&config);
+
+        assert_eq!(eff["threshold"], 0.5, "a real setting survives");
+        for key in ["settings", "notice", "setup", "fail_closed"] {
+            assert!(
+                eff.get(key).is_none(),
+                "host-only key '{key}' must not be sent: {eff}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_settings_are_listed_with_their_defaults() {
+        let ext = InstalledExtension {
+            name: "x".into(),
+            path: PathBuf::from("/bin/true"),
+            config: json!({"settings": {"threshold": 0.7, "roles": ["tool"]}}),
+            fail_closed: false,
+            origin: None,
+        };
+        let declared = ext.declared_settings();
+        assert_eq!(declared.len(), 2);
+        let threshold = declared.iter().find(|s| s.key == "threshold").unwrap();
+        assert_eq!(threshold.default, json!(0.7));
+        let roles = declared.iter().find(|s| s.key == "roles").unwrap();
+        assert_eq!(roles.default, json!(["tool"]));
+    }
+
+    #[test]
+    fn an_extension_that_declares_nothing_has_no_settings_list() {
+        let ext = InstalledExtension {
+            name: "x".into(),
+            path: PathBuf::from("/bin/true"),
+            config: json!({"enabled": true}),
+            fail_closed: false,
+            origin: None,
+        };
+        assert!(ext.declared_settings().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_settings_table_is_ignored_rather_than_fatal() {
+        let ext = InstalledExtension {
+            name: "x".into(),
+            path: PathBuf::from("/bin/true"),
+            config: json!({"settings": "not a table"}),
+            fail_closed: false,
+            origin: None,
+        };
+        assert!(ext.declared_settings().is_empty());
+        assert!(
+            ext.effective_config(&Config::default())
+                .get("settings")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_notice_is_trimmed_or_absent() {
+        let with = InstalledExtension {
+            name: "x".into(),
+            path: PathBuf::from("/bin/true"),
+            config: json!({"notice": "\n  costs money  \n"}),
+            fail_closed: false,
+            origin: None,
+        };
+        assert_eq!(with.notice(), Some("costs money"));
+
+        for blank in [json!({"notice": "   "}), json!({"notice": 5}), json!({})] {
+            let ext = InstalledExtension {
+                name: "x".into(),
+                path: PathBuf::from("/bin/true"),
+                config: blank,
+                fail_closed: false,
+                origin: None,
+            };
+            assert!(ext.notice().is_none());
+        }
     }
 }

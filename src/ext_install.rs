@@ -706,9 +706,27 @@ fn adopt_manifest(binary: &Path, name: &str, dest_dir: &Path) {
     if manifest.exists() {
         return;
     }
+    write_manifest(binary, name, &manifest);
+}
 
+/// Re-probe an installed binary and rewrite its manifest in place.
+///
+/// Separate from `adopt_manifest` because it deliberately overwrites: it is the
+/// explicit user request to refresh an extension installed before its manifest
+/// declared anything. Returns false when no valid manifest was printed, so the
+/// caller can leave the old file alone.
+fn refresh_manifest(binary: &Path, name: &str, dest_dir: &Path) -> bool {
+    let manifest = dest_dir.join(format!("{name}.toml"));
+    if !binary.exists() {
+        return false;
+    }
+    write_manifest(binary, name, &manifest)
+}
+
+/// Probe, validate, and atomically write `manifest`. Returns whether it landed.
+fn write_manifest(binary: &Path, name: &str, manifest: &Path) -> bool {
     let Some(text) = probe_manifest(binary) else {
-        return;
+        return false;
     };
 
     // `toml::from_str`, not `str::parse`: `Value`'s `FromStr` impl in toml 1.x
@@ -717,12 +735,15 @@ fn adopt_manifest(binary: &Path, name: &str, dest_dir: &Path) {
     match toml::from_str::<toml::Value>(&text) {
         Ok(_) => {
             let temp = manifest.with_extension("toml.tmp");
-            if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, &manifest).is_err() {
+            if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, manifest).is_err() {
                 let _ = std::fs::remove_file(&temp);
+                return false;
             }
+            true
         }
         Err(e) => {
             tracing::debug!("extension '{name}': --print-manifest produced invalid TOML: {e}");
+            false
         }
     }
 }
@@ -873,6 +894,37 @@ fn commit(
         name: final_name,
         path: destination,
         record,
+    })
+}
+
+/// What [`refresh_manifest_for`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refreshed {
+    /// A manifest was written.
+    pub wrote: bool,
+    /// An existing manifest was replaced, so hand edits to it are gone.
+    pub replaced: bool,
+}
+
+/// Re-probe an installed extension and rewrite its manifest beside it.
+///
+/// Nothing is written when the binary has nothing valid to say; the old file,
+/// if any, is left untouched. This deliberately overwrites, which is why the
+/// caller reports whether the file was replaced.
+pub fn refresh_manifest_for(name: &str) -> Result<Refreshed> {
+    let found = extensions::discover_all()
+        .into_iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| anyhow::anyhow!("no extension named '{name}' installed"))?;
+    let dir = found
+        .path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", found.path.display()))?;
+    let replaced = dir.join(format!("{name}.toml")).exists();
+
+    Ok(Refreshed {
+        wrote: refresh_manifest(&found.path, name, dir),
+        replaced,
     })
 }
 
@@ -1134,6 +1186,54 @@ mod tests {
 
         let text = std::fs::read_to_string(&manifest).unwrap();
         assert!(text.contains("edited by the user"), "got: {text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_manifest_overwrites_an_existing_one_only_when_asked() {
+        let root = std::env::temp_dir().join(format!("klava-probe-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = fake_binary(&root, "demo", r#"printf '[settings]\nthreshold = 0.7\n'"#);
+        let manifest = root.join("demo.toml");
+        std::fs::write(&manifest, "enabled = true\n").unwrap();
+
+        // The install path still refuses to touch an existing manifest.
+        adopt_manifest(&binary, "demo", &root);
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("enabled")
+        );
+
+        // The explicit refresh replaces it with what the binary declares now.
+        assert!(refresh_manifest(&binary, "demo", &root));
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains("[settings]"), "got: {text}");
+        assert!(text.contains("0.7"), "got: {text}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_that_gets_nothing_keeps_the_old_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("klava-probe-refresh-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = fake_binary(&root, "demo", "exit 0");
+        let manifest = root.join("demo.toml");
+        std::fs::write(&manifest, "enabled = true # keep me\n").unwrap();
+
+        assert!(!refresh_manifest(&binary, "demo", &root));
+        assert!(
+            std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("keep me")
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

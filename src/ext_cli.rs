@@ -32,12 +32,13 @@ pub fn run(config: &mut Config, args: Vec<String>) -> Result<()> {
             show(config, name)
         }
         "setup" => setup(config, rest),
+        "refresh-manifest" => refresh_manifest(rest),
         "enable" => set_enabled(config, rest, true),
         "disable" => set_enabled(config, rest, false),
         "set" => set_key(config, rest),
         other => bail!(
             "unknown action '{other}'; expected list, path, install, remove, verify, \
-             show, setup, enable, disable or set"
+             show, setup, refresh-manifest, enable, disable or set"
         ),
     }
 }
@@ -165,6 +166,9 @@ fn install(config: &mut Config, rest: &[String]) -> Result<()> {
         // opts out. Re-discover so the spec comes from the artifact that just
         // landed, not a stale listing.
         if let Some(ext) = find(&installed.name) {
+            if let Some(notice) = ext.notice() {
+                print_notice(notice);
+            }
             run_setup(config, &ext, flags.consent, Request::IfNeeded);
         }
     } else {
@@ -231,6 +235,46 @@ fn setup(config: &mut Config, rest: &[String]) -> Result<()> {
         SetupOutcome::Failed { message } => bail!("setup failed: {message}"),
         _ => Ok(()),
     }
+}
+
+/// `klava extensions refresh-manifest <name>`
+///
+/// Re-asks an installed binary for `--print-manifest` and rewrites the stored
+/// manifest. This is how an extension installed before its manifest declared
+/// `[settings]`/`[setup]` picks them up without a reinstall.
+fn refresh_manifest(rest: &[String]) -> Result<()> {
+    let name = rest
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: klava extensions refresh-manifest <name>"))?;
+    if rest.len() > 1 {
+        bail!("refresh-manifest takes exactly one extension name");
+    }
+
+    let outcome = ext_install::refresh_manifest_for(name)?;
+    if outcome.wrote {
+        println!(
+            "{} manifest for '{}' from `--print-manifest`",
+            "Refreshed".green(),
+            name
+        );
+        if outcome.replaced {
+            println!(
+                "{}",
+                format!(
+                    "  any hand edits to {name}.toml were replaced; settings in {} are untouched",
+                    Config::get_path().display()
+                )
+                .dimmed()
+            );
+        }
+        println!("  run 'klava extensions show {name}' to see what it declares");
+    } else {
+        println!(
+            "{} produced no manifest; the existing one (if any) is unchanged",
+            name
+        );
+    }
+    Ok(())
 }
 
 /// `klava extensions remove <name>`
@@ -389,6 +433,29 @@ fn setup_detail(ext: &InstalledExtension) -> String {
     }
 }
 
+/// Print an extension's notice as wrapped, indented warning lines.
+fn print_notice(notice: &str) {
+    const WIDTH: usize = 88;
+    let mut line = String::new();
+    let flush = |text: &mut String| {
+        if !text.is_empty() {
+            println!("  {} {}", "!".yellow().bold(), text.yellow());
+            text.clear();
+        }
+    };
+
+    for word in notice.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > WIDTH {
+            flush(&mut line);
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    flush(&mut line);
+}
+
 fn show(config: &Config, name: &str) -> Result<()> {
     let ext = find(name).ok_or_else(|| anyhow::anyhow!("no extension named '{name}' installed"))?;
 
@@ -411,13 +478,96 @@ fn show(config: &Config, name: &str) -> Result<()> {
         }
     );
     println!("  setup:  {}", setup_detail(&ext));
+
+    if let Some(notice) = ext.notice() {
+        println!();
+        print_notice(notice);
+    }
+
+    let declared = ext.declared_settings();
+    if declared.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "Settings: the manifest declares none, so klava cannot list the \
+             keys this extension accepts."
+                .dimmed()
+        );
+        println!(
+            "{}",
+            "          Its keys are still passed through unchanged; see the \
+             extension's own documentation."
+                .dimmed()
+        );
+    } else {
+        let current = config.extensions.settings.get(&ext.name);
+        // A key the user set that the manifest never declares is usually a
+        // typo (`threashold`), which would otherwise be silently ignored by an
+        // extension that deserialises strictly. Worth pointing at.
+        let unknown: Vec<&str> = current
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.keys()
+                    .map(String::as_str)
+                    .filter(|key| !declared.iter().any(|s| s.key == *key))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        println!();
+        println!(
+            "Settings (default from the manifest, {} = yours):",
+            "*".yellow()
+        );
+        let width = declared.iter().map(|s| s.key.len()).max().unwrap_or(0);
+        for setting in &declared {
+            let key = format!("{:width$}", setting.key);
+            let user = current.and_then(|value| value.get(&setting.key));
+            match user {
+                Some(value) => println!("  {} {} = {}", "*".yellow().bold(), key, render(value)),
+                None => println!("    {} = {}", key, render(&setting.default).dimmed()),
+            }
+        }
+
+        if !unknown.is_empty() {
+            println!(
+                "{}",
+                format!(
+                    "  not declared by this manifest (typo?): {}",
+                    unknown.join(", ")
+                )
+                .yellow()
+            );
+        }
+    }
+
     println!();
     println!("Effective configuration:");
     println!(
         "{}",
         serde_json::to_string_pretty(&effective(config, &ext))?
     );
+    println!();
+    println!(
+        "{}",
+        format!("Set one with: klava extensions set {} key=value", ext.name).dimmed()
+    );
     Ok(())
+}
+
+/// Compact one-line rendering for the settings table.
+fn render(value: &Value) -> String {
+    let text = match value {
+        Value::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    };
+    // Keep the column readable; the effective table below has the full form.
+    if text.chars().count() > 60 {
+        let head: String = text.chars().take(57).collect();
+        format!("{head}...")
+    } else {
+        text
+    }
 }
 
 fn set_enabled(config: &mut Config, rest: &[String], enabled: bool) -> Result<()> {
@@ -451,6 +601,12 @@ fn set_enabled(config: &mut Config, rest: &[String], enabled: bool) -> Result<()
         },
         ext.name
     );
+
+    // A notice is the extension's own warning (cost, data leaving the machine).
+    // Print it right after activation, when it matters and cannot be missed.
+    if enabled && let Some(notice) = ext.notice() {
+        print_notice(notice);
+    }
 
     // Provision on enable, not on disable: a model download is only meaningful
     // for an extension that is about to run.

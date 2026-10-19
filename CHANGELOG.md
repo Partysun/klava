@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.2.24] - 2026-10-19
+
+### Added
+
+- The decide model is now a **host capability any extension can call**: `decision: "decide"` carries typed `noul`/`choice`/`score` questions and an arbitrary state, and the host answers by re-running that same extension with `decide` filled in. klava owns the model, credentials, timeout and cost accounting; the extension owns the question and the evidence. Each extension gets at most two decide rounds per request, and every call is bounded to 16 questions. This removes the previous coupling where the host hard-coded an escalation question and built escalation-specific evidence.
+- `decide_model` is the single config key for every classifier call (web-search tuning and extension `decide`). `search_decide_model` is still accepted as a legacy alias on load.
+- `require_decide_for_nested_calls` (default `true`) makes the host refuse a `nested_call` from an extension that has not received an approved `decide` in the same request. The flag is sent to extensions as `require_decide` so they ask for the judgment when the host will require it; `false` still runs such calls but logs them as `UNVERIFIED`.
+- `examples/nested_gate_probe.rs` measures the decide gate against real agent states, including the repeated-identical-result patterns that made the old extension escalate.
+- `klava extensions show <name>` now lists the settings the extension **accepts**, with each default and the value currently in effect, before the effective config. The list comes from a new optional `[settings]` table in the manifest, so klava still interprets nothing: it prints the keys and strips the table before the config reaches the extension. Extensions without the table (anything installed before it existed) get an honest "the manifest declares none" message and can be updated in place with the new `klava extensions refresh-manifest <name>`.
+- A manifest may declare `notice`, a warning shown (wrapped) by `install`, `enable` and `show`. `klava-model-escalation` uses it to state, before the first request, that escalation bills a second and deliberately more expensive model per token, that a looping session can burn a balance quickly, and that `max_escalations = 1` is the safe starting point. Its README carries the same warning in a callout.
+- `klava-pii-guardrail` and `klava-model-escalation` now answer `--print-manifest`, declaring their settings and — for the guardrail — `fail_closed = true`. Previously they had no manifest at all, so klava could not show their keys and, worse, treated them as fail-open.
+
+### Changed
+
+- The decide model is no longer search-specific in name or ownership: `src/decision.rs` is the shared host API, and `src/search/decide.rs` only maps its typed answers onto search settings.
+- `install` now validates a `--print-manifest` result through `toml::from_str` (the same parser the runtime uses) and writes it atomically, so a binary that prints invalid TOML leaves no partial file.
+- `klava-pii-guardrail` fails **closed** at the host level: if it crashes, times out, or answers with malformed output, the request is rejected rather than sent unfiltered. Within a run, an analysis error still leaves the text untouched. The README explains the two layers and how to opt out.
+
 ## [0.2.23] - 2026-10-19
 
 ### Added

@@ -251,7 +251,7 @@ pub enum Command {
                      klava extensions enable <name>\n  \
                      klava extensions remove <name>")]
     Extensions {
-        /// Subcommand: list (default), path, install, remove, verify, show, setup, enable, disable, set
+        /// Subcommand: list (default), path, install, remove, verify, show, setup, refresh-manifest, enable, disable, set
         #[arg(
             required = false,
             trailing_var_arg = true,
