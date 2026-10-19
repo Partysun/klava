@@ -28,6 +28,8 @@ const Q_CONTEXT: &str = "context";
 const Q_BREADTH: &str = "breadth";
 /// Question id: which search family fits?
 const Q_ENGINE: &str = "engine_family";
+/// Question id: is the query about Russia / Russian-language sources?
+const Q_RUSSIA: &str = "russia_region";
 
 /// Klava API key for the decision call. The gateway key is the same one the
 /// `klava` provider uses: the env var named by the provider's `api_key_name`
@@ -135,8 +137,17 @@ fn questions() -> Vec<jigor::Question> {
         ),
         jigor::choice(
             Q_ENGINE,
-            "Which retrieval style fits this query best?",
-            &["web_fast", "web_deep", "auto"],
+            "Which retrieval style fits this query best? Choose `yandex` only when \
+             the query is specifically about Russia or CIS institutions and local \
+             sources; a query merely written in Russian is not a reason.",
+            &["web_fast", "web_deep", "yandex", "auto"],
+        ),
+        jigor::noul(
+            Q_RUSSIA,
+            "Is this query specifically about Russia or the CIS — Russian law, \
+             government, companies, products, local services, or events there? \
+             Answer no when it is about another country or a global topic, even \
+             if the query is written in Russian.",
         ),
     ]
 }
@@ -156,8 +167,26 @@ fn apply(mut base: SearchSettings, answers: &HashMap<String, Answer>) -> SearchS
         base.max_results = score_to_breadth(*score).max_results();
     }
 
-    if let Some(Answer::Choice { choice, .. }) = answers.get(Q_ENGINE) {
-        base.engine = Engine::parse(choice);
+    // An explicit engine in the config is a user choice, not a hint: the
+    // decision model only fills in the family when the config left it on
+    // `auto` (e.g. `search_engine = "yandex"` must reach the backend as-is).
+    if base.engine == Engine::Auto {
+        let russia = matches!(
+            answers.get(Q_RUSSIA),
+            Some(Answer::Noul { probability }) if *probability >= 0.6
+        );
+        let family = match answers.get(Q_ENGINE) {
+            Some(Answer::Choice { choice, .. }) => Engine::parse(choice),
+            _ => Engine::Auto,
+        };
+        // `web_fast`/`web_deep` describe retrieval depth, not a provider, so
+        // the region signal outranks them. Only a provider the model names
+        // explicitly (currently `yandex`) outranks the region signal.
+        base.engine = if family == Engine::Yandex || russia {
+            Engine::Yandex
+        } else {
+            family
+        };
     }
 
     // Freshness biases breadth up when the model was neutral on it.
@@ -229,6 +258,108 @@ mod tests {
     }
 
     #[test]
+    fn apply_keeps_explicit_engine() {
+        let a = answers(vec![(
+            Q_ENGINE,
+            Answer::Choice {
+                choice: "web_deep".to_string(),
+                confidence: 0.9,
+                probabilities: HashMap::new(),
+            },
+        )]);
+        let base = SearchSettings {
+            engine: Engine::Yandex,
+            ..SearchSettings::default()
+        };
+        assert_eq!(apply(base, &a).engine, Engine::Yandex);
+    }
+
+    #[test]
+    fn apply_tunes_engine_only_from_auto() {
+        let a = answers(vec![(
+            Q_ENGINE,
+            Answer::Choice {
+                choice: "web_deep".to_string(),
+                confidence: 0.9,
+                probabilities: HashMap::new(),
+            },
+        )]);
+        let out = apply(SearchSettings::default(), &a);
+        assert_eq!(out.engine, Engine::WebDeep);
+    }
+
+    fn choice_engine(value: &str) -> Answer {
+        Answer::Choice {
+            choice: value.to_string(),
+            confidence: 0.9,
+            probabilities: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn apply_region_heuristic_selects_yandex() {
+        let a = answers(vec![
+            (Q_RUSSIA, Answer::Noul { probability: 0.9 }),
+            (Q_ENGINE, choice_engine("auto")),
+        ]);
+        assert_eq!(apply(SearchSettings::default(), &a).engine, Engine::Yandex);
+    }
+
+    #[test]
+    fn apply_region_outranks_depth_family() {
+        let a = answers(vec![
+            (Q_RUSSIA, Answer::Noul { probability: 0.9 }),
+            (Q_ENGINE, choice_engine("web_deep")),
+        ]);
+        assert_eq!(apply(SearchSettings::default(), &a).engine, Engine::Yandex);
+    }
+
+    #[test]
+    fn apply_region_absent_keeps_depth_family() {
+        let a = answers(vec![(Q_ENGINE, choice_engine("web_deep"))]);
+        assert_eq!(apply(SearchSettings::default(), &a).engine, Engine::WebDeep);
+    }
+
+    #[test]
+    fn apply_region_heuristic_uses_default_threshold() {
+        let low = answers(vec![(Q_RUSSIA, Answer::Noul { probability: 0.2 })]);
+        assert_eq!(apply(SearchSettings::default(), &low).engine, Engine::Auto);
+        let high = answers(vec![(Q_RUSSIA, Answer::Noul { probability: 0.8 })]);
+        assert_eq!(
+            apply(SearchSettings::default(), &high).engine,
+            Engine::Yandex
+        );
+    }
+
+    #[test]
+    fn apply_explicit_yandex_family_answer() {
+        let a = answers(vec![(Q_ENGINE, choice_engine("yandex"))]);
+        assert_eq!(apply(SearchSettings::default(), &a).engine, Engine::Yandex);
+    }
+
+    #[test]
+    fn apply_region_heuristic_never_overrides_explicit_engine() {
+        let a = answers(vec![
+            (Q_RUSSIA, Answer::Noul { probability: 0.99 }),
+            (Q_ENGINE, choice_engine("yandex")),
+        ]);
+        let base = SearchSettings {
+            engine: Engine::WebFast,
+            ..SearchSettings::default()
+        };
+        assert_eq!(apply(base, &a).engine, Engine::WebFast);
+    }
+
+    #[test]
+    fn question_set_includes_region_signal() {
+        let qs = questions();
+        assert!(qs.iter().any(|q| q.id == Q_RUSSIA));
+        let engine = qs.iter().find(|q| q.id == Q_ENGINE).unwrap();
+        let criteria = engine.criteria.as_ref().unwrap();
+        assert!(criteria.get("yandex").is_some());
+    }
+
+    #[test]
     fn apply_freshness_biases_breadth_when_unset() {
         let a = answers(vec![(Q_FRESHNESS, Answer::Noul { probability: 0.9 })]);
         let out = apply(SearchSettings::default(), &a);
@@ -258,7 +389,7 @@ mod tests {
     #[test]
     fn question_set_is_bounded_and_typed() {
         let qs = questions();
-        assert_eq!(qs.len(), 4);
+        assert_eq!(qs.len(), 5);
         let kinds: Vec<&str> = qs.iter().map(|q| q.kind.as_str()).collect();
         assert!(kinds.contains(&"noul"));
         assert!(kinds.contains(&"choice"));

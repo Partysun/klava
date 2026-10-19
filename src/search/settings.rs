@@ -2,17 +2,17 @@
 //! search backend fields.
 //!
 //! Users configure search with klava vocabulary (`web_fast`, `web_deep`,
-//! `web_native`, `auto`) and a context size (`low`/`medium`/`high`). This
-//! module is the single place that translates those knobs into the concrete
-//! fields the search backend understands, and that clamps user/decision
-//! values into their legal ranges.
+//! `web_native`, `yandex`, `auto`) and a context size
+//! (`low`/`medium`/`high`). This module is the single place that translates
+//! those knobs into the concrete fields the search backend understands, and
+//! that clamps user/decision values into their legal ranges.
 
 use serde_json::{Value, json};
 
 /// Search engine family, in klava vocabulary.
 ///
-/// The klava names (`web_fast`, `web_deep`, `web_native`) are the user- and
-/// decision-facing vocabulary. Each maps onto the backend's own
+/// The klava names (`web_fast`, `web_deep`, `web_native`, `yandex`) are the
+/// user- and decision-facing vocabulary. Each maps onto the backend's own
 /// engine-plus-mode pair; the raw engine names are also accepted so a config
 /// can select a specific backend directly. [`Engine::Auto`] leaves the choice
 /// to the backend.
@@ -34,6 +34,8 @@ pub enum Engine {
     Parallel,
     /// Perplexity.
     Perplexity,
+    /// Yandex Search, executed and synthesized by the klava gateway.
+    Yandex,
 }
 
 impl Engine {
@@ -48,6 +50,7 @@ impl Engine {
             "firecrawl" => Engine::Firecrawl,
             "parallel" => Engine::Parallel,
             "perplexity" => Engine::Perplexity,
+            "yandex" => Engine::Yandex,
             _ => Engine::Auto,
         }
     }
@@ -63,6 +66,7 @@ impl Engine {
             Engine::Firecrawl => "firecrawl",
             Engine::Parallel => "parallel",
             Engine::Perplexity => "perplexity",
+            Engine::Yandex => "yandex",
         }
     }
 
@@ -78,6 +82,7 @@ impl Engine {
             Engine::Firecrawl => (Some("firecrawl"), None),
             Engine::Parallel => (Some("parallel"), None),
             Engine::Perplexity => (Some("perplexity"), None),
+            Engine::Yandex => (Some("yandex"), None),
         }
     }
 }
@@ -205,6 +210,8 @@ mod tests {
         assert_eq!(Engine::parse("WEB_DEEP"), Engine::WebDeep);
         assert_eq!(Engine::parse("native"), Engine::WebNative);
         assert_eq!(Engine::parse("exa"), Engine::Exa);
+        assert_eq!(Engine::parse("yandex"), Engine::Yandex);
+        assert_eq!(Engine::parse("YANDEX"), Engine::Yandex);
         assert_eq!(Engine::parse("auto"), Engine::Auto);
         assert_eq!(Engine::parse("nonsense"), Engine::Auto);
     }
@@ -220,6 +227,7 @@ mod tests {
             Engine::Firecrawl,
             Engine::Parallel,
             Engine::Perplexity,
+            Engine::Yandex,
         ] {
             assert_eq!(Engine::parse(e.as_str()), e);
         }
@@ -233,6 +241,7 @@ mod tests {
         assert_eq!(Engine::WebNative.wire(), (Some("native"), None));
         assert_eq!(Engine::Exa.wire(), (Some("exa"), None));
         assert_eq!(Engine::Parallel.wire(), (Some("parallel"), None));
+        assert_eq!(Engine::Yandex.wire(), (Some("yandex"), None));
     }
 
     #[test]
@@ -288,6 +297,18 @@ mod tests {
             s.web_search_options(),
             json!({"search_context_size": "high"})
         );
+    }
+
+    #[test]
+    fn plugin_carries_yandex_engine() {
+        let s = SearchSettings {
+            engine: Engine::Yandex,
+            ..SearchSettings::default()
+        };
+        let p = s.plugin();
+        assert_eq!(p["id"], json!("web"));
+        assert_eq!(p["engine"], json!("yandex"));
+        assert!(p.get("mode").is_none());
     }
 
     #[test]

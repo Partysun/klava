@@ -568,7 +568,7 @@ async fn proxy_native_search(
     query: &str,
     client_streaming: bool,
 ) -> Result<Response> {
-    let settings = search::resolve_settings(config, query).await;
+    let settings = search::resolve_settings(config, query, None).await;
     tracing::info!(
         "Web search [1]: query={:?} engine={} context={} max_results={}",
         query,
@@ -633,6 +633,9 @@ async fn proxy_with_search(
     responses_req: Option<&crate::models::responses::ResponsesRequest>,
 ) -> Result<Response> {
     search::inject_tool(&mut openai_req);
+    // The user's own wording for this turn, so an explicit "use Yandex" is
+    // not lost when the harness model rewrites the search query.
+    let user_context = search::user_context(&openai_req);
     // The loop inspects tool calls, which requires a non-streaming upstream
     // response. The client's stream preference is honored when rendering.
     openai_req.stream = Some(false);
@@ -686,7 +689,8 @@ async fn proxy_with_search(
 
         let mut results: Vec<(search::SearchCall, String)> = Vec::with_capacity(searches.len());
         for call in searches {
-            let settings = search::resolve_settings(config, &call.query).await;
+            let settings =
+                search::resolve_settings(config, &call.query, user_context.as_deref()).await;
             tracing::info!(
                 "Web search [{}]: query={:?} engine={} context={} max_results={}",
                 rounds,

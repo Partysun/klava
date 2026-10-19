@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Yandex is selected automatically only when the query is specifically about Russia/CIS (law, government, companies, products, local services, events) or the user asks for it by name ("search this on Yandex", "найди в яндексе"). Writing in Russian is **not** a signal: a Russian-language question about a global topic stays on the default engine. Explicit "do not use Yandex" wins over both automatic signals. The provider-named-in-text check reads the user's own turn, not the model-rewritten query, and only conversation history of the current turn is consulted.
+- `search_engine = "yandex"` selects the Yandex Search provider. klava sends the search request to the klava gateway with `plugins[0].engine = "yandex"`; the gateway runs Yandex Search, synthesizes an answer from the results, and returns the usual annotated completion, so the existing search loop, streaming splice, and Claude Code native `web_search` blocks work unchanged. Requires the klava provider (web search is already gated on it) and a gateway with Yandex configured.
+
+### Changed
+
+- An explicit `search_engine` is no longer overridden by the per-query decision model: the `engine_family` answer only applies when the config (or `--search-engine`) leaves the engine on `auto`. `web_fast`/`web_deep` describe retrieval depth, so a Russia/CIS query selects Yandex over them while keeping the model's context/breadth tuning.
+
 ## [0.2.21] - 2026-10-16
 
 ### Fixed
@@ -10,7 +21,7 @@
 
 ### Added
 
-- Web search for launched agents: `klava launch --search` gives the agent a search tool that klava runs itself through the klava gateway (no agent-side setup); `--search-model MODEL` selects the model used for searches (implies `--search`). Search behavior is configurable via `enable_websearch`, `search_engine` (`web_fast`/`web_deep`/`web_native`/`auto`), `search_context` (`low`/`medium`/`high`), `search_max_results`, `search_prompt`, `search_include_domains`/`search_exclude_domains`, and `search_decide`/`search_decide_model` for model-decided per-query tuning.
+- Web search for launched agents: `klava launch --search` gives the agent a search tool that klava runs itself through the klava gateway (no agent-side setup); `--search-model MODEL` selects the model used for searches (implies `--search`). Search behavior is configurable via `enable_websearch`, `search_engine` (`web_fast`/`web_deep`/`web_native`/`yandex`/`auto`), `search_context` (`low`/`medium`/`high`), `search_max_results`, `search_prompt`, `search_include_domains`/`search_exclude_domains`, and `search_decide`/`search_decide_model` for model-decided per-query tuning.
 - Managed services carry the search flag: systemd units and launchd plists render `--search` when web search is enabled, so the background proxy exposes the search tool to every agent that connects to it.
 
 ### Fixed

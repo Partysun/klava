@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::models::openai;
 use crate::search::{
     SearchCall, TOOL_NAME, append_search_results, execute, extract_query, inject_tool,
-    resolve_settings,
+    resolve_settings, user_context,
 };
 use async_stream::stream;
 use bytes::Bytes;
@@ -61,6 +61,7 @@ pub fn drive(
     mut openai_req: openai::OpenAIRequest,
     first_response: reqwest::Response,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>> {
+    let user_context = user_context(&openai_req);
     Box::pin(stream! {
         inject_tool(&mut openai_req);
 
@@ -160,7 +161,8 @@ pub fn drive(
                 rounds += 1;
                 let mut results: Vec<(SearchCall, String)> = Vec::new();
                 for call in &searches {
-                    let settings = resolve_settings(&config, &call.query).await;
+                    let settings =
+                        resolve_settings(&config, &call.query, user_context.as_deref()).await;
                     tracing::info!(
                         "Web search [{}]: query={:?} engine={} context={} max_results={}",
                         rounds,

@@ -11,6 +11,7 @@
 //! it is billed the same way as any other request and no gateway identity
 //! leaks into names or messages.
 
+pub mod routing;
 pub mod settings;
 pub mod stream;
 pub mod wire;
@@ -211,21 +212,79 @@ pub fn settings_from_config(config: &Config) -> SearchSettings {
     .clamped()
 }
 
-/// Resolve the settings for one query: config defaults, optionally tuned by
-/// the decision model. Fail-open — any decision failure keeps the defaults.
-pub async fn resolve_settings(config: &Config, query: &str) -> SearchSettings {
+/// The user's own wording for the current turn: the last user message of an
+/// outgoing request. Used only to detect an explicitly named search provider;
+/// conversation history is not consulted so an old "use Yandex" (or "don't")
+/// cannot leak into a later turn.
+pub fn user_context(req: &openai::OpenAIRequest) -> Option<String> {
+    let message = req.messages.iter().rev().find(|m| m.role == "user")?;
+    let text = match message.content.as_ref()? {
+        openai::MessageContent::Text(text) => text.clone(),
+        openai::MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|part| match part {
+                openai::ContentPart::Text { text } => Some(text.as_str()),
+                openai::ContentPart::ImageUrl { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Resolve the settings for one query.
+///
+/// `context` is the user's own wording for this turn (see [`user_context`]),
+/// so an explicit "use Yandex" is honored even when the model rewrites the
+/// query into a neutral one.
+///
+/// Precedence, highest first:
+/// 1. an explicit `search_engine` in the config (never overridden);
+/// 2. a provider named by the user or the query ("search this on Yandex");
+/// 3. the decision model, which may refine `auto` into a family or select
+///    Yandex for a Russia/CIS query.
+///
+/// Every step is fail-open: any decision failure keeps the settings resolved
+/// so far, so a search still runs.
+pub async fn resolve_settings(
+    config: &Config,
+    query: &str,
+    context: Option<&str>,
+) -> SearchSettings {
     let base = settings_from_config(config);
+    let context: Vec<&str> = context.into_iter().collect();
+    let veto = routing::vetoed(query, &context);
+    let base = if base.engine == settings::Engine::Auto {
+        match routing::explicit_engine_in(query, &context) {
+            Some(engine) => SearchSettings { engine, ..base },
+            None => base,
+        }
+    } else {
+        base
+    };
+
+    // `decide::apply` only rewrites the engine while it is `auto`, so tuning
+    // still refines context/breadth for a provider selected above.
     if !config.search_decide {
         return base;
     }
     #[cfg(feature = "decide")]
-    {
-        decide::tune(config, query, base).await
-    }
+    let tuned = decide::tune(config, query, base.clone()).await;
     #[cfg(not(feature = "decide"))]
-    {
+    let tuned = {
         let _ = query;
-        base
+        base.clone()
+    };
+
+    // A user veto ("don't use Yandex") suppresses an engine the decision model
+    // inferred; an explicit config value is still the operator's choice.
+    if veto && tuned.engine == settings::Engine::Yandex {
+        SearchSettings {
+            engine: settings::Engine::Auto,
+            ..tuned
+        }
+    } else {
+        tuned
     }
 }
 
@@ -516,13 +575,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_settings_honors_provider_named_in_query() {
+        let config = Config {
+            search_decide: false,
+            search_engine: "auto".to_string(),
+            ..Config::default()
+        };
+        let s = resolve_settings(&config, "search this on yandex", None).await;
+        assert_eq!(s.engine, settings::Engine::Yandex);
+
+        let other = resolve_settings(&config, "latest rust release", None).await;
+        assert_eq!(other.engine, settings::Engine::Auto);
+    }
+
+    #[tokio::test]
+    async fn resolve_settings_honors_provider_named_by_the_user() {
+        let config = Config {
+            search_decide: false,
+            search_engine: "auto".to_string(),
+            ..Config::default()
+        };
+        // The model rewrote the query into something neutral, but the user
+        // asked for Yandex by name.
+        let s = resolve_settings(
+            &config,
+            "latest stable Rust release",
+            Some("do one web search with yandex please"),
+        )
+        .await;
+        assert_eq!(s.engine, settings::Engine::Yandex);
+    }
+
+    #[tokio::test]
+    async fn resolve_settings_honors_user_veto() {
+        let config = Config {
+            search_decide: false,
+            search_engine: "auto".to_string(),
+            ..Config::default()
+        };
+        let s = resolve_settings(
+            &config,
+            "latest rust release on yandex",
+            Some("don't use yandex for this"),
+        )
+        .await;
+        assert_eq!(s.engine, settings::Engine::Auto);
+    }
+
+    #[test]
+    fn user_context_takes_the_last_user_message() {
+        let req = openai::OpenAIRequest {
+            model: "m".to_string(),
+            messages: vec![
+                openai::Message {
+                    role: "user".to_string(),
+                    content: Some(openai::MessageContent::Text("old turn".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                openai::Message {
+                    role: "assistant".to_string(),
+                    content: Some(openai::MessageContent::Text("answer".to_string())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                openai::Message {
+                    role: "user".to_string(),
+                    content: Some(openai::MessageContent::Parts(vec![
+                        openai::ContentPart::Text {
+                            text: "use yandex".to_string(),
+                        },
+                    ])),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stop: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            extra: json!({}),
+        };
+        assert_eq!(user_context(&req).as_deref(), Some("use yandex"));
+    }
+
+    #[tokio::test]
+    async fn resolve_settings_keeps_explicit_config_engine() {
+        let config = Config {
+            search_decide: false,
+            search_engine: "web_fast".to_string(),
+            ..Config::default()
+        };
+        let s = resolve_settings(&config, "search this on yandex", None).await;
+        assert_eq!(s.engine, settings::Engine::WebFast);
+    }
+
+    #[tokio::test]
     async fn resolve_settings_returns_config_defaults_without_decide() {
         let config = Config {
             search_decide: false,
             search_max_results: 6,
             ..Config::default()
         };
-        let s = resolve_settings(&config, "anything").await;
+        let s = resolve_settings(&config, "anything", None).await;
         assert_eq!(s.max_results, 6);
     }
 }

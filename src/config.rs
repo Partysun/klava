@@ -31,7 +31,9 @@ pub struct Config {
     #[serde(default)]
     pub search_model: Option<String>,
     /// Search backend family (klava vocabulary): `web_fast`, `web_deep`,
-    /// `web_native`, or `auto`. Maps to the internal engine/mode pair.
+    /// `web_native`, `yandex`, or `auto`. Maps to the internal engine/mode
+    /// pair. `yandex` runs through the klava gateway (Yandex Search + a
+    /// synthesis completion) and is only available with the klava provider.
     #[serde(default = "default_search_engine")]
     pub search_engine: String,
     /// How much page context to pull into the answer: `low`, `medium`, `high`.
@@ -246,7 +248,8 @@ impl Config {
 # Model used to run the search. Defaults to the active completion model.
 #search_model = ""
 
-# Search backend family: "auto", "web_fast", "web_deep" or "web_native".
+# Search backend family: "auto", "web_fast", "web_deep", "web_native" or
+# "yandex" (Yandex Search via the klava gateway).
 #search_engine = "auto"
 
 # How much page context to pull into the answer: "low", "medium" or "high".
