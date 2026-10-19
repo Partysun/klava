@@ -11,6 +11,10 @@
 
 - An explicit `search_engine` is no longer overridden by the per-query decision model: the `engine_family` answer only applies when the config (or `--search-engine`) leaves the engine on `auto`. `web_fast`/`web_deep` describe retrieval depth, so a Russia/CIS query selects Yandex over them while keeping the model's context/breadth tuning.
 
+### Fixed
+
+- Source distributions are now built from git (`sdist-generator = "git"`) so the workspace extension crates under `crates/` are included. maturin's cargo sdist drops `workspace.members` while the shipped `Cargo.lock` still lists those members, so `maturin build` from the sdist failed with `cannot update the lock file ... because --locked was passed`.
+
 ## [0.2.21] - 2026-10-16
 
 ### Fixed

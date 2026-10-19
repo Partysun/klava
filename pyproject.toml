@@ -26,3 +26,7 @@ bindings = "bin"
 manifest-path = "Cargo.toml"
 strip = true
 locked = true
+# Include the workspace crates in the sdist. maturin rewrites Cargo.toml and
+# drops `workspace.members`, so a Cargo.lock built from this workspace needs
+# every member present or `cargo metadata --locked` fails in the sdist.
+sdist-generator = "git"
