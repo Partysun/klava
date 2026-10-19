@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Model escalation extension for klava: detect a stuck agent and route to a stronger model."
+readme = "README.md"
 
 [[bin]]
 name = "klava-model-escalation"

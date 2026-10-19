@@ -1123,7 +1123,7 @@ mod tests {
         assert!(
             paths
                 .iter()
-                .any(|p| p.dir == PathBuf::from("/usr/share/klava/extensions")),
+                .any(|p| p.dir == *"/usr/share/klava/extensions"),
             "distribution path must be searched"
         );
         // No directory may appear twice.

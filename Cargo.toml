@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Partysun/klava"
@@ -14,7 +14,7 @@ serde_json = "1"
 
 [package]
 name = "klava"
-version = "0.2.21"
+version = "0.2.22"
 edition = "2024"
 authors = ["Iurii Zatsepin (https://zatsepin.dev)"]
 description = "Klava is a CLI tool for using code agents with any provider. Use Claude Code with your OpenAI-compatible provider. Make code agents more secure by filtering out leaked secret keys and cryptographic keys from your filesystem."

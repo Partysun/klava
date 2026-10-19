@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "PII guardrail extension for klava: span-based detection and redaction in tool output."
+readme = "README.md"
 
 [[bin]]
 name = "klava-pii-guardrail"

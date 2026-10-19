@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Context compression extension for klava: drop low-value tokens from tool output with kompress."
+readme = "README.md"
 
 [[bin]]
 name = "klava-compress"

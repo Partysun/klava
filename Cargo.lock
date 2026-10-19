@@ -1365,7 +1365,7 @@ dependencies = [
 
 [[package]]
 name = "klava"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "klava-compress"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ort",
  "serde",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "klava-model-escalation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "klava-pii-guardrail"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pii",
  "serde",
