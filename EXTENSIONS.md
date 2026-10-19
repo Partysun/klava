@@ -34,15 +34,18 @@ it runs. Everything is staged and moved into place atomically: a failed install
 cannot leave a half-written executable.
 
 `--name <name>` overrides the extension name. `--no-enable` installs without
-activating it.
+activating it. `--no-setup` enables it but skips its provisioning hook (see
+[Provisioning](#provisioning-setup)); an extension with a hook and no model yet
+is `pending` in `klava extensions list`.
 
 Other commands:
 
 ```sh
 klava extensions path      # where klava looks, in order
-klava extensions list      # name, status, version, source, path
+klava extensions list      # name, status, setup, version, source, path
 klava extensions verify    # re-check recorded checksums
-klava extensions remove <name>
+klava extensions setup <name>   # run the [setup] hook
+klava extensions remove <name>  # also removes <name>.toml, .source.toml, .setup.toml
 ```
 
 ### Manually
@@ -106,15 +109,67 @@ or `klava extensions enable my-extension`. The lookup order is:
 ## Manifest
 
 Optional, and entirely owned by the extension. klava reads `enabled`,
-`fail_closed`, and `timeout_secs`; everything else is passed straight through in
-the request's `config` field.
+`fail_closed`, `timeout_secs`, and the `[setup]` table; everything else is passed
+straight through in the request's `config` field.
 
 ```toml
 enabled = true
 fail_closed = false     # false: a failure is logged and the request continues
 timeout_secs = 20       # default 20; the child is killed after this
 threshold = 0.7         # your own key, opaque to klava
+
+[setup]                 # optional provisioning hook; see below
+args = ["--fetch-model"]
 ```
+
+### Provisioning: `[setup]`
+
+Some extensions need a large asset that should not be part of the download or
+of every request — `klava-compress` needs a ~573 MB model. Such an extension
+declares how to provision itself:
+
+```toml
+[setup]
+args = ["--fetch-model"]            # argv for this extension's own binary
+summary = "Download the model (~573 MB)"   # shown before it runs
+network = true                      # shown as a network-download warning
+timeout_secs = 3600                 # default 300; the hook is killed after this
+```
+
+The hook is the extension binary itself with `args`, never a shell command. klava
+runs it **after the extension is enabled**, not while installing:
+
+* `klava extensions install <source> --trust` → runs it after enabling,
+* `klava extensions enable <name>` → runs it on first activation or after the
+  binary changes,
+* `klava extensions setup <name>` → always runs it (the retry path).
+
+Consent works like this: `--trust`/`--yes`/`-y` on `install` or `enable`
+authorises the hook; `--no-setup` opts out; an interactive `enable` without
+either asks. The binary, its arguments, and the network warning are printed
+before anything runs. Without a terminal and without `--trust`, setup is skipped
+and the retry command is printed — an unattended run never starts a download.
+
+The hook inherits the extension's **effective config** (manifest merged with
+`[extensions.settings.<name>]`) as JSON in `$KLAVA_EXTENSION_CONFIG`, so it can
+honour settings such as where to put the asset.
+
+A successful run is recorded in `<name>.setup.toml` next to the artifact:
+
+```toml
+args = ["--fetch-model"]
+artifact_sha256 = "df6e..."          # from `<name>.source.toml`, when present
+ran_at = "2026-10-19T14:40:00+03:00"
+```
+
+klava re-runs the hook when the arguments or the artifact change, so an upgrade
+provisions itself again, and it never records a failed run. While a hook runs,
+`.<name>.setup.lock` keeps a second concurrent setup from writing the same
+files; a lock older than the hook's timeout is treated as abandoned.
+
+Setup is best effort: a failed hook leaves the extension **enabled** and failing
+open, with a message naming the retry command. `klava extensions list` shows a
+`SETUP` column — `none`, `pending`, `done`, `stale` — and `show` explains it.
 
 ## Protocol
 
@@ -231,12 +286,23 @@ klava extensions enable my-extension
 ## CLI
 
 ```sh
-klava extensions              # list installed extensions
-klava extensions show <name>  # status, path, effective config
-klava extensions enable <name>
+klava extensions                        # list: name, status, setup, version, source
+klava extensions show <name>            # status, setup state, path, effective config
+klava extensions install <source> --trust
+klava extensions install <source> --trust --no-setup   # enable, but do not provision
+klava extensions setup <name>           # run the [setup] hook now (re-runs it)
+klava extensions enable <name> [--trust|--no-setup]
 klava extensions disable <name>
 klava extensions set <name> key=value
+klava extensions verify
+klava extensions remove <name>
 ```
 
 `set` parses values as JSON when it can, so `threshold=0.7` and
 `roles=["tool"]` both work.
+
+`install` adopts a manifest the extension prints: after a `cargo:`/`npm:`
+install, klava runs `<binary> --print-manifest` once and stores valid TOML as
+`<name>.toml` (an existing manifest is never overwritten). That is how a
+package-manager install learns about a `[setup]` hook it could not carry.
+

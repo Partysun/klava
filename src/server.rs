@@ -227,7 +227,11 @@ mod tests {
         let occupied_port = occupied.local_addr().unwrap().port();
 
         let (listener, port) = bind_listener(occupied_port).await.unwrap();
-        assert_eq!(port, occupied_port + 1);
+        // `port + 1` may itself be taken by a parallel test's ephemeral socket,
+        // so the contract is "the next port that is actually free", not
+        // "exactly one more".
+        assert_ne!(port, occupied_port);
+        assert!(port > occupied_port);
         assert_eq!(listener.local_addr().unwrap().port(), port);
         drop(listener);
     }

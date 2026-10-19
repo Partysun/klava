@@ -6,6 +6,8 @@
 
 use crate::config::Config;
 use crate::ext_install::{self, Source, SourceRecord};
+use crate::ext_setup::{self, Consent, Request, SetupOutcome};
+use crate::ext_setup_store;
 use crate::extensions::{self, InstalledExtension};
 use anyhow::{Result, bail};
 use colored::Colorize;
@@ -29,12 +31,13 @@ pub fn run(config: &mut Config, args: Vec<String>) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: klava extensions show <name>"))?;
             show(config, name)
         }
+        "setup" => setup(config, rest),
         "enable" => set_enabled(config, rest, true),
         "disable" => set_enabled(config, rest, false),
         "set" => set_key(config, rest),
         other => bail!(
             "unknown action '{other}'; expected list, path, install, remove, verify, \
-             show, enable, disable or set"
+             show, setup, enable, disable or set"
         ),
     }
 }
@@ -61,17 +64,17 @@ fn path() -> Result<()> {
     Ok(())
 }
 
-/// `klava extensions install <source> [--name N] [--trust]`
+/// `klava extensions install <source> [--name N] [--trust] [--no-setup] [--no-enable]`
 fn install(config: &mut Config, rest: &[String]) -> Result<()> {
+    let flags = ext_setup::take_flags(rest);
+
     let mut source: Option<String> = None;
     let mut name: Option<String> = None;
-    let mut trust = false;
     let mut enable = true;
 
-    let mut args = rest.iter();
+    let mut args = flags.rest.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--trust" | "-y" | "--yes" => trust = true,
             "--no-enable" => enable = false,
             "--name" | "-n" => {
                 name = Some(
@@ -92,13 +95,16 @@ fn install(config: &mut Config, rest: &[String]) -> Result<()> {
 
     let raw = source.ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: klava extensions install <source>\n\
+            "usage: klava extensions install <source> [--trust] [--no-setup] [--no-enable]\n\
              \n\
              sources:\n  \
              ./path or /abs/path      a local executable\n  \
              cargo:<crate>[@ver]      cargo install\n  \
              cargo-git:<url>[#rev]    cargo install from git\n  \
-             npm:<pkg>[@ver]          npm pack, take the bin"
+             npm:<pkg>[@ver]          npm pack, take the bin\n\
+             \n\
+             --trust also consents to the extension's [setup] hook (e.g. a model\n\
+             download); --no-setup installs and enables without running it."
         )
     })?;
 
@@ -110,7 +116,7 @@ fn install(config: &mut Config, rest: &[String]) -> Result<()> {
     println!("Target:  {}", dest.display());
 
     // The trust gate. Installing runs third-party code, so say so plainly.
-    if !trust {
+    if !flags.trust {
         use std::io::{IsTerminal, Write};
         if !std::io::stdin().is_terminal() {
             bail!(
@@ -153,6 +159,14 @@ fn install(config: &mut Config, rest: &[String]) -> Result<()> {
         set_in_memory(config, &installed.name, "enabled", Value::Bool(true))?;
         config.save()?;
         println!("  enabled in {}", Config::get_path().display());
+
+        // `--trust` (or `--yes`) already means "install and run this", so it is
+        // the consent for the manifest's setup hook too; `--no-setup` still
+        // opts out. Re-discover so the spec comes from the artifact that just
+        // landed, not a stale listing.
+        if let Some(ext) = find(&installed.name) {
+            run_setup(config, &ext, flags.consent, Request::IfNeeded);
+        }
     } else {
         println!(
             "  run 'klava extensions enable {}' to activate it",
@@ -160,6 +174,63 @@ fn install(config: &mut Config, rest: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Run an extension's setup hook and report a failure as a warning, not an error.
+///
+/// The extension is enabled regardless: it fails open at request time, and a
+/// failed download should not undo an otherwise successful install.
+fn run_setup(
+    config: &Config,
+    ext: &InstalledExtension,
+    consent: Consent,
+    request: Request,
+) -> SetupOutcome {
+    let outcome = ext_setup::run_with(ext, consent, request, Some(&ext.effective_config(config)));
+    if outcome == SetupOutcome::Declined && ext.setup_spec().is_some() {
+        println!(
+            "  setup was not run; do it later with: {}",
+            format!("klava extensions setup {}", ext.name).cyan()
+        );
+    }
+    outcome
+}
+
+/// `klava extensions setup <name>` — run the provisioning hook on demand.
+///
+/// This is the retry path: after a failed or skipped download, and for an
+/// extension installed before it grew a setup hook.
+fn setup(config: &mut Config, rest: &[String]) -> Result<()> {
+    let mut name: Option<String> = None;
+
+    for arg in rest {
+        match arg.as_str() {
+            "--yes" | "-y" => {}
+            other if other.starts_with('-') => bail!("unknown flag '{other}'"),
+            other => {
+                if name.is_some() {
+                    bail!("setup takes exactly one extension name");
+                }
+                name = Some(other.to_string());
+            }
+        }
+    }
+
+    let name = name.ok_or_else(|| anyhow::anyhow!("usage: klava extensions setup <name>"))?;
+    let ext =
+        find(&name).ok_or_else(|| anyhow::anyhow!("no extension named '{name}' is installed"))?;
+
+    if ext.setup_spec().is_none() {
+        println!("{} declares no setup hook; nothing to do", name);
+        return Ok(());
+    }
+
+    // Asking for setup explicitly is the consent *and* an override of "already
+    // done": this is the documented way to re-run a hook.
+    match run_setup(config, &ext, Consent::Granted, Request::Always) {
+        SetupOutcome::Failed { message } => bail!("setup failed: {message}"),
+        _ => Ok(()),
+    }
 }
 
 /// `klava extensions remove <name>`
@@ -258,8 +329,8 @@ fn list(config: &Config) -> Result<()> {
     }
 
     println!(
-        "{:<20} {:<9} {:<10} {:<16} PATH",
-        "NAME", "STATUS", "VERSION", "SOURCE"
+        "{:<20} {:<9} {:<8} {:<10} {:<16} PATH",
+        "NAME", "STATUS", "SETUP", "VERSION", "SOURCE"
     );
     for ext in &all {
         let status = if is_enabled(config, ext) {
@@ -267,6 +338,7 @@ fn list(config: &Config) -> Result<()> {
         } else {
             "disabled".yellow().to_string()
         };
+        let setup = setup_label(ext);
         let dir = ext.path.parent().unwrap_or(std::path::Path::new("."));
         let record = SourceRecord::load(dir, &ext.name);
         let version = record
@@ -278,9 +350,10 @@ fn list(config: &Config) -> Result<()> {
             .map(|r| r.source.clone())
             .unwrap_or_else(|| ext.origin.unwrap_or("-").to_string());
         println!(
-            "{:<20} {:<9} {:<10} {:<16} {}",
+            "{:<20} {:<9} {:<8} {:<10} {:<16} {}",
             ext.name,
             status,
+            setup,
             version,
             source,
             ext.path.display()
@@ -291,6 +364,29 @@ fn list(config: &Config) -> Result<()> {
     println!("Config: {}", Config::get_path().display());
     println!("Keys:   [extensions.settings.<name>]");
     Ok(())
+}
+
+/// One short word for the `list` table.
+fn setup_label(ext: &InstalledExtension) -> &'static str {
+    ext_setup_store::state(ext).label()
+}
+
+/// A one-line explanation for `show`.
+fn setup_detail(ext: &InstalledExtension) -> String {
+    match ext_setup_store::state(ext) {
+        ext_setup_store::State::NoHook => {
+            "none (the manifest declares no [setup] hook)".to_string()
+        }
+        ext_setup_store::State::Pending => format!(
+            "pending: {}",
+            format!("klava extensions setup {}", ext.name).cyan()
+        ),
+        ext_setup_store::State::Done { at } => format!("done (at {at})"),
+        ext_setup_store::State::Stale => format!(
+            "stale: ran for an earlier build or argument list; {}",
+            format!("klava extensions setup {}", ext.name).cyan()
+        ),
+    }
 }
 
 fn show(config: &Config, name: &str) -> Result<()> {
@@ -314,6 +410,7 @@ fn show(config: &Config, name: &str) -> Result<()> {
             "fail-open"
         }
     );
+    println!("  setup:  {}", setup_detail(&ext));
     println!();
     println!("Effective configuration:");
     println!(
@@ -324,9 +421,25 @@ fn show(config: &Config, name: &str) -> Result<()> {
 }
 
 fn set_enabled(config: &mut Config, rest: &[String], enabled: bool) -> Result<()> {
-    let name = rest
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: klava extensions enable|disable <name>"))?;
+    let flags = ext_setup::take_flags(rest);
+
+    // `--no-setup` and `--trust` describe provisioning, which only happens when
+    // an extension turns on. Accepting them on `disable` would suggest they do
+    // something.
+    if !enabled && flags.consent != Consent::Ask {
+        bail!("--no-setup/--trust only apply to enable");
+    }
+
+    let mut name: Option<&String> = None;
+    for arg in &flags.rest {
+        if arg.starts_with('-') {
+            bail!("unknown flag '{arg}'");
+        }
+        name = Some(arg);
+    }
+
+    let name =
+        name.ok_or_else(|| anyhow::anyhow!("usage: klava extensions enable|disable <name>"))?;
     let ext = find(name).ok_or_else(|| anyhow::anyhow!("no extension named '{name}' installed"))?;
     write_key(config, &ext.name, "enabled", Value::Bool(enabled))?;
     println!(
@@ -338,6 +451,12 @@ fn set_enabled(config: &mut Config, rest: &[String], enabled: bool) -> Result<()
         },
         ext.name
     );
+
+    // Provision on enable, not on disable: a model download is only meaningful
+    // for an extension that is about to run.
+    if enabled {
+        run_setup(config, &ext, flags.consent, Request::IfNeeded);
+    }
     Ok(())
 }
 

@@ -691,6 +691,99 @@ fn install_npm(
     )
 }
 
+/// Ask a freshly installed binary for a manifest and store it beside it.
+///
+/// The manifest is the extension's own business, but its `[setup]` hook is how
+/// klava learns to provision the extension after install. A package-manager
+/// install only copies the executable, so the only way to see a manifest the
+/// author shipped is to let the binary print it.
+///
+/// Best effort by design: a missing flag, a timeout, invalid TOML or a non-zero
+/// exit all mean "no manifest", never a failed install. An existing manifest —
+/// including one the user edited — is never overwritten.
+fn adopt_manifest(binary: &Path, name: &str, dest_dir: &Path) {
+    let manifest = dest_dir.join(format!("{name}.toml"));
+    if manifest.exists() {
+        return;
+    }
+
+    let Some(text) = probe_manifest(binary) else {
+        return;
+    };
+
+    // `toml::from_str`, not `str::parse`: `Value`'s `FromStr` impl in toml 1.x
+    // rejects every document ("unexpected content"), which silently discarded
+    // every manifest a binary printed.
+    match toml::from_str::<toml::Value>(&text) {
+        Ok(_) => {
+            let temp = manifest.with_extension("toml.tmp");
+            if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, &manifest).is_err() {
+                let _ = std::fs::remove_file(&temp);
+            }
+        }
+        Err(e) => {
+            tracing::debug!("extension '{name}': --print-manifest produced invalid TOML: {e}");
+        }
+    }
+}
+
+/// Run `<binary> --print-manifest` with a short deadline.
+///
+/// This happens once, at install time, so a binary that does not support the
+/// flag costs one cheap process. Anything the binary prints on stderr is
+/// dropped: a binary that does not know the flag usually complains there.
+fn probe_manifest(binary: &Path) -> Option<String> {
+    use std::io::Read;
+
+    const CAP: u64 = 64 * 1024;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut child = crate::utils::spawn_retrying_busy(
+        std::process::Command::new(binary)
+            .arg("--print-manifest")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    )
+    .ok()?;
+
+    // Read on a thread: waiting first would deadlock if the binary ever printed
+    // more than a pipe buffer. The cap keeps a runaway binary harmless.
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        stdout.take(CAP).read_to_end(&mut out).ok().map(|_| out)
+    });
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => {
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+    let out = reader.join().ok()??;
+    if !status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(out).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
 /// Run a children command, printing exactly what will run first.
 fn run_visible(command: &mut Command) -> Result<()> {
     use colored::Colorize;
@@ -760,6 +853,12 @@ fn commit(
             &staged_manifest,
             dest_dir.join(format!("{final_name}.toml")),
         );
+    } else {
+        // `cargo install` and `npm pack` only carry the executable out of the
+        // package, so a manifest declared by the extension itself is lost. Ask
+        // the binary for one; a binary that does not answer leaves no manifest,
+        // which is the same state as before this probe existed.
+        adopt_manifest(&destination, &final_name, dest_dir);
     }
 
     let sha256 = sha256_of(&destination)?;
@@ -800,7 +899,7 @@ pub fn remove(name: &str) -> Result<PathBuf> {
     std::fs::remove_file(&found.path)
         .with_context(|| format!("cannot remove {}", found.path.display()))?;
 
-    for suffix in ["toml", "source.toml"] {
+    for suffix in ["toml", "source.toml", "setup.toml"] {
         let path = dir.join(format!("{name}.{suffix}"));
         let _ = std::fs::remove_file(path);
     }
@@ -943,6 +1042,98 @@ mod tests {
         let dest = root.join("dest");
         let error = install(&Source::Local(root.clone()), &dest, None).unwrap_err();
         assert!(error.to_string().contains("no executable"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    fn fake_binary(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_printed_manifest_is_adopted_next_to_the_binary() {
+        let root = std::env::temp_dir().join(format!("klava-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = fake_binary(
+            &root,
+            "demo",
+            r#"printf '[setup]\nargs = ["--fetch"]\nnetwork = true\n'"#,
+        );
+
+        adopt_manifest(&binary, "demo", &root);
+
+        let text = std::fs::read_to_string(root.join("demo.toml")).expect("manifest written");
+        let parsed: toml::Value = toml::from_str(&text).expect("valid toml");
+        assert_eq!(parsed["setup"]["args"][0].as_str(), Some("--fetch"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_does_not_know_the_flag_yields_no_manifest() {
+        let root = std::env::temp_dir().join(format!("klava-probe-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Exit 0 with no output: the common "unknown argument, ignored" shape.
+        let binary = fake_binary(&root, "demo", "exit 0");
+
+        adopt_manifest(&binary, "demo", &root);
+
+        assert!(!root.join("demo.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_printed_toml_is_discarded() {
+        let root = std::env::temp_dir().join(format!("klava-probe-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = fake_binary(&root, "demo", "printf 'not = = toml'");
+
+        adopt_manifest(&binary, "demo", &root);
+
+        assert!(!root.join("demo.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_probe_never_writes_a_manifest() {
+        let root = std::env::temp_dir().join(format!("klava-probe-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = fake_binary(&root, "demo", "printf '[setup]' && exit 1");
+
+        adopt_manifest(&binary, "demo", &root);
+
+        assert!(!root.join("demo.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_manifest_is_never_overwritten_by_the_probe() {
+        let root = std::env::temp_dir().join(format!("klava-probe-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let binary = fake_binary(&root, "demo", r#"printf '[setup]\nargs = ["--new"]\n'"#);
+        let manifest = root.join("demo.toml");
+        std::fs::write(&manifest, "enabled = true # edited by the user\n").unwrap();
+
+        adopt_manifest(&binary, "demo", &root);
+
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains("edited by the user"), "got: {text}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

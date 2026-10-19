@@ -6,6 +6,8 @@ pub mod error;
 pub mod ext_api;
 pub mod ext_cli;
 pub mod ext_install;
+pub mod ext_setup;
+pub mod ext_setup_store;
 pub mod extensions;
 pub mod hooks;
 pub mod models;

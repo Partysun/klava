@@ -15,14 +15,37 @@ never compiled into the klava binary. Installing needs no rebuild of klava.
 ```sh
 cargo install klava-compress
 
-# Fetch the model into the cache (kompress-fp32.onnx + tokenizer.json):
-crates/klava-compress/scripts/fetch-model.sh
-
+# Install it; klava asks the binary for its [setup] hook and fetches the model:
 klava extensions install ~/.cargo/bin/klava-compress --trust
 ```
 
+The `--trust` above also consents to the model download, which runs right after
+the extension is enabled (see [Model](#model)). To install and enable without
+downloading anything, or to fetch later:
+
+```sh
+klava extensions install ~/.cargo/bin/klava-compress --trust --no-setup
+klava extensions setup klava-compress
+```
+
+`--no-setup` leaves the extension `pending`; it fails open until the model
+arrives. The same hook can be run by hand:
+
+```sh
+klava-compress --fetch-model              # into the cache
+klava-compress --fetch-model --dir /models
+```
+
+The download resumes a partial `.part` file, so an interrupted 573 MB fetch does
+not start over.
+
+### Model
+
 The model lands in `$XDG_CACHE_HOME/klava/kompress` (default
-`~/.cache/klava/kompress`) and is never committed.
+`~/.cache/klava/kompress`) and is never committed. The directory is resolved in
+this order: `--dir`, `model_dir` (from your klava settings, passed to the hook in
+`$KLAVA_EXTENSION_CONFIG`), `$KLAVA_COMPRESS_MODEL_DIR`, then the cache.
+`scripts/fetch-model.sh` does the same with `curl` and remains for manual use.
 
 ## Configuration
 

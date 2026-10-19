@@ -6,6 +6,7 @@ use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use uuid::Uuid;
 
 /// Anthropic message ID prefix (`msg_`).
@@ -219,6 +220,32 @@ pub fn generate_diff(old_json: &str, new_json: &str, path: &Path) -> String {
     }
 
     output
+}
+
+/// Spawn a child, retrying while the OS reports `ETXTBSY` ("Text file busy").
+///
+/// A just-written executable can fail to start with `ExecutableFileBusy` when
+/// another thread happens to `fork` while the file is still open for writing:
+/// the forked child inherits the writable descriptor and the kernel then
+/// refuses `execve`. The window is microseconds, and `Command::spawn` does not
+/// retry it, so a short bounded retry is the standard cure.
+pub fn spawn_retrying_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
+    /// ~200 ms in total; nobody holds an executable open that long.
+    const ATTEMPTS: u32 = 40;
+
+    let mut attempt = 0;
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt + 1 < ATTEMPTS =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Ask user for approval

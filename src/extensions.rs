@@ -206,7 +206,87 @@ impl InstalledExtension {
         }
         effective
     }
+
+    /// How to provision this extension, from the manifest's `[setup]` table.
+    ///
+    /// klava runs the hook once, right after the extension is enabled: some
+    /// extensions need a model or another large asset that should not be
+    /// downloaded by the install itself. A bad table is a warning, never a
+    /// failure — the extension still loads.
+    pub fn setup_spec(&self) -> Option<SetupSpec> {
+        let table = self.config.get("setup")?.as_object()?;
+
+        let args: Vec<String> = match table.get("args") {
+            Some(Value::Array(items)) => {
+                let parsed: Option<Vec<String>> = items
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                match parsed {
+                    Some(args) => args,
+                    None => {
+                        tracing::warn!(
+                            "extension '{}': setup.args must be an array of strings; skipping setup",
+                            self.name
+                        );
+                        return None;
+                    }
+                }
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "extension '{}': setup.args must be an array of strings; skipping setup",
+                    self.name
+                );
+                return None;
+            }
+            None => Vec::new(),
+        };
+
+        let summary = table
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let network = table
+            .get("network")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timeout = table
+            .get("timeout_secs")
+            .and_then(Value::as_u64)
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_SETUP_TIMEOUT.as_secs());
+
+        Some(SetupSpec {
+            args,
+            summary,
+            network,
+            timeout: Duration::from_secs(timeout),
+        })
+    }
 }
+
+/// One extension's provisioning hook, as declared by its manifest.
+///
+/// The hook is the extension's own executable with these arguments, so the
+/// trust already granted by `install --trust` covers it exactly: no shell, no
+/// arbitrary command string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupSpec {
+    /// Arguments passed to the extension binary itself.
+    pub args: Vec<String>,
+    /// One line describing what setup does, shown before it runs.
+    pub summary: String,
+    /// Whether setup accesses the network; `--trust` is its consent.
+    pub network: bool,
+    /// How long setup may run.
+    pub timeout: Duration,
+}
+
+/// Default time a setup hook may run. Large downloads need minutes, not the
+/// 20 seconds a request gets.
+pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// One directory klava looks in for extensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,13 +677,26 @@ async fn run_extension(
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_TIMEOUT);
 
-    let mut child = tokio::process::Command::new(&ext.path)
+    let mut command = tokio::process::Command::new(&ext.path);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", ext.path.display()))?;
+        .kill_on_drop(true);
+
+    // `ETXTBSY` can appear when a concurrently forked child still holds the
+    // freshly written binary open; see `utils::spawn_retrying_busy`.
+    let mut attempt = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt + 1 < 40 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(e) => return Err(format!("cannot start {}: {e}", ext.path.display())),
+        }
+    };
 
     let mut stdin = child.stdin.take().ok_or("extension has no stdin")?;
     let mut stdout = child.stdout.take().ok_or("extension has no stdout")?;

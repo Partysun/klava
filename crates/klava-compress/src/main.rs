@@ -27,6 +27,25 @@ use tokenizers::Tokenizer;
 /// The protocol version klava sends. We answer whatever we understand.
 const PROTOCOL: u32 = 1;
 
+/// Everything `--fetch-model` needs, as klava records it in the manifest.
+///
+/// This is what `--print-manifest` emits, so the host can learn how to provision
+/// the model without knowing anything about this extension.
+const MANIFEST: &str = r#"# Written by klava from `klava-compress --print-manifest`.
+#
+# The model is a ~573 MB download, so it is not fetched at install time on
+# klava's behalf: klava runs this hook after the extension is enabled.
+
+[setup]
+args = ["--fetch-model"]
+summary = "Download the kompress model (~573 MB) into the klava cache"
+network = true
+timeout_secs = 3600
+"#;
+
+/// Where the model files come from.
+const MODEL_BASE_URL: &str = "https://huggingface.co/chopratejas/kompress-v2-base/resolve/main";
+
 /// Model file names inside `model_dir`.
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const MODEL_FILE: &str = "kompress-fp32.onnx";
@@ -139,7 +158,9 @@ impl CompressConfig {
         if let Ok(dir) = std::env::var("KLAVA_COMPRESS_MODEL_DIR")
             && !dir.trim().is_empty()
         {
-            return PathBuf::from(dir);
+            // Same expansion as `model_dir`: `~/x` must mean the same thing
+            // whichever way it was set.
+            return PathBuf::from(shellexpand(&dir));
         }
         cache_root().join("kompress")
     }
@@ -377,10 +398,308 @@ impl Compressor {
 }
 
 // ---------------------------------------------------------------------------
+// Provisioning: the model is a large download, so it is fetched on demand.
+// ---------------------------------------------------------------------------
+
+/// Files the model consists of, as (remote path, local file name).
+const MODEL_FILES: [(&str, &str); 2] = [
+    ("onnx/kompress-fp32.onnx", MODEL_FILE),
+    ("tokenizer.json", TOKENIZER_FILE),
+];
+
+/// What the process was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    /// Read one request on stdin and answer it (the extension protocol).
+    Serve,
+    /// Download the model into `dir` (or the default cache when `None`).
+    FetchModel { dir: Option<PathBuf> },
+    /// Print the manifest klava should store beside this binary.
+    PrintManifest,
+    /// Print usage.
+    Help,
+}
+
+fn parse_args(args: &[String]) -> Result<Mode, String> {
+    let mut mode = Mode::Serve;
+    let mut dir: Option<PathBuf> = None;
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--fetch-model" => mode = Mode::FetchModel { dir: None },
+            "--print-manifest" => mode = Mode::PrintManifest,
+            "-h" | "--help" => mode = Mode::Help,
+            "--dir" => {
+                let value = iter.next().ok_or("--dir needs a value")?;
+                dir = Some(PathBuf::from(shellexpand(value)));
+            }
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+    }
+
+    // `--dir` only means something together with `--fetch-model`.
+    if let Some(dir) = dir {
+        match mode {
+            Mode::FetchModel { .. } => mode = Mode::FetchModel { dir: Some(dir) },
+            _ => return Err("--dir is only valid with --fetch-model".into()),
+        }
+    }
+
+    Ok(mode)
+}
+
+/// Where klava hands the hook its effective config (manifest merged with the
+/// user's settings). Must match `ext_setup_store::CONFIG_ENV` in klava.
+const CONFIG_ENV: &str = "KLAVA_EXTENSION_CONFIG";
+
+/// Resolve the download directory the same way the runtime resolves `model_dir`.
+///
+/// An explicit `--dir` wins; otherwise the config klava passed in
+/// `$KLAVA_EXTENSION_CONFIG`; otherwise `KLAVA_COMPRESS_MODEL_DIR`, else the
+/// cache directory. All of it goes through [`CompressConfig::resolved_model_dir`]
+/// so a fetch and a later run cannot disagree about where the model lives:
+/// downloading 573 MB into a directory the runtime never reads is worse than not
+/// downloading at all.
+///
+/// `config_json` is a parameter rather than an environment read so this stays
+/// testable without mutating process-wide state.
+fn provision_dir(explicit: Option<&Path>, config_json: Option<&str>) -> PathBuf {
+    if let Some(dir) = explicit {
+        return dir.to_path_buf();
+    }
+    // A malformed config must not stop provisioning: the default config resolves
+    // to the cache, which is what the runtime would use for the same input.
+    let config = config_json
+        .and_then(|text| serde_json::from_str::<CompressConfig>(text).ok())
+        .unwrap_or_default();
+    config.resolved_model_dir()
+}
+
+/// How to open a `.part` file for the body we are about to receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartMode {
+    /// No usable prefix: start the file over.
+    Truncate,
+    /// The server answered the range request: continue after the prefix.
+    Append,
+}
+
+/// Truncate when starting over, append when resuming.
+///
+/// Never both: appending after the server ignored our `Range` glues a fresh body
+/// onto a stale prefix, which yields a file of the right length and the wrong
+/// bytes.
+fn part_mode(offset: u64) -> PartMode {
+    if offset == 0 {
+        PartMode::Truncate
+    } else {
+        PartMode::Append
+    }
+}
+
+/// Download `remote` to `dest`, resuming a partial `.part` file.
+fn fetch_one(remote: &str, dest: &Path) -> Result<(), String> {
+    let url = format!("{MODEL_BASE_URL}/{remote}");
+    let part = dest.with_extension("part");
+
+    let mut offset = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+
+    // A finished file is never downloaded again: the model is ~573 MB.
+    if let Ok(meta) = std::fs::metadata(dest)
+        && meta.len() > 0
+    {
+        println!("have  {} ({} bytes)", dest.display(), meta.len());
+        return Ok(());
+    }
+
+    let agent = ureq::Agent::config_builder()
+        // A big file on a slow link: no deadline at all. `timeout_recv_body` is a
+        // budget for the whole body, not an idle timeout, so any fixed value
+        // fails on a link slower than size/budget.
+        .timeout_global(None)
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .timeout_recv_body(None)
+        .max_redirects(10)
+        .build();
+    let agent = ureq::Agent::new_with_config(agent);
+
+    let mut request = agent.get(&url);
+    if offset > 0 {
+        request = request.header("Range", format!("bytes={offset}-"));
+        println!("resume {} at {offset} bytes", dest.display());
+    } else {
+        println!("fetch {}", dest.display());
+    }
+
+    let response = match request.call() {
+        Ok(response) => response,
+        // 416 also means the `.part` is *larger* than the remote file, which
+        // would be a corrupt file promoted into place. Drop it and let the next
+        // run start clean instead of guessing.
+        Err(ureq::Error::StatusCode(416)) if offset > 0 => {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "{url} rejected the resume at {offset} bytes; removed {} — run again to \
+                 download it from scratch",
+                part.display()
+            ));
+        }
+        Err(ureq::Error::StatusCode(code)) => {
+            return Err(format!("{url} returned HTTP {code}"));
+        }
+        Err(e) => return Err(format!("cannot fetch {url}: {e}")),
+    };
+
+    // The server may ignore `Range`; then the whole body arrives and any `.part`
+    // prefix is stale.
+    if offset > 0 && response.status() != 206 {
+        offset = 0;
+        println!("server ignored the range; starting over");
+    }
+
+    // `content-length` is the length of *this* body: the whole file on a 200,
+    // the remainder on a 206. Counting from the post-reset offset gives the
+    // total the finished file must have.
+    let expected_total = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|len| offset + len);
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(part_mode(offset) == PartMode::Truncate)
+        .append(part_mode(offset) == PartMode::Append)
+        .open(&part)
+        .map_err(|e| format!("cannot open {}: {e}", part.display()))?;
+
+    let mut reader = response.into_body().into_reader();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut written = offset;
+    let mut last_report = written;
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("download of {} failed: {e}", dest.display()))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|e| format!("cannot write {}: {e}", part.display()))?;
+        written += read as u64;
+
+        // Report every 32 MiB so a long download does not look hung.
+        if written - last_report >= 32 * 1024 * 1024 {
+            last_report = written;
+            println!("  {} MiB", written / (1024 * 1024));
+        }
+    }
+    file.flush()
+        .map_err(|e| format!("cannot flush {}: {e}", part.display()))?;
+    drop(file);
+
+    // A short body becomes a silently broken ONNX file: keep the `.part` so the
+    // next run resumes instead of starting the 573 MB over.
+    if let Some(expected) = expected_total
+        && written != expected
+    {
+        return Err(format!(
+            "{} is incomplete: {written} of {expected} bytes; kept {} to resume",
+            dest.display(),
+            part.display()
+        ));
+    }
+
+    std::fs::rename(&part, dest).map_err(|e| {
+        format!(
+            "cannot move {} into place at {}: {e}",
+            part.display(),
+            dest.display()
+        )
+    })?;
+    println!("done  {} ({written} bytes)", dest.display());
+    Ok(())
+}
+
+/// `--fetch-model`: download every model file into the resolved directory.
+fn fetch_model(explicit: Option<&Path>, config_json: Option<&str>) -> Result<(), String> {
+    let dir = provision_dir(explicit, config_json);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+
+    println!("model dir: {}", dir.display());
+    for (remote, name) in MODEL_FILES {
+        fetch_one(remote, &dir.join(name))?;
+    }
+
+    println!();
+    println!("Model ready in: {}", dir.display());
+    Ok(())
+}
+
+/// Usage, matching what `--help` prints.
+fn usage() -> String {
+    format!(
+        "klava-compress {version}
+
+Context-compression extension for klava.
+
+Usage:
+  klava-compress                  # serve one JSON request on stdin (klava does this)
+  klava-compress --fetch-model    # download the model (~573 MB)
+  klava-compress --print-manifest # print the manifest klava stores beside this binary
+
+Options:
+  --fetch-model        Download {} and {} into the model directory.
+  --dir <DIR>          With --fetch-model: download into DIR instead of the cache.
+  -h, --help           Show this help.
+
+The model directory is, in order: --dir, model_dir from
+$KLAVA_EXTENSION_CONFIG (set by klava when it runs the setup hook, with the
+manifest merged with your settings), $KLAVA_COMPRESS_MODEL_DIR,
+$XDG_CACHE_HOME/klava/kompress, ~/.cache/klava/kompress.
+",
+        TOKENIZER_FILE,
+        MODEL_FILE,
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Entry point: speak the protocol once per process.
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = match parse_args(&args) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("klava-compress: {e}");
+            eprintln!();
+            eprint!("{}", usage());
+            std::process::exit(2);
+        }
+    };
+
+    match mode {
+        Mode::Serve => serve(),
+        Mode::PrintManifest => print!("{MANIFEST}"),
+        Mode::Help => print!("{}", usage()),
+        Mode::FetchModel { dir } => {
+            if let Err(e) = fetch_model(dir.as_deref(), std::env::var(CONFIG_ENV).ok().as_deref()) {
+                eprintln!("klava-compress: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// The extension protocol: one request in, one response out.
+fn serve() {
     // Diagnostics go to stderr, which klava forwards to its log.
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
@@ -1137,5 +1456,140 @@ mod tests {
         .unwrap();
         assert_eq!(req.config["enabled"], true);
         assert!(req.payload["messages"].is_array());
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_arguments_means_serve() {
+        assert_eq!(parse_args(&[]).unwrap(), Mode::Serve);
+    }
+
+    #[test]
+    fn fetch_model_is_recognised() {
+        assert_eq!(
+            parse_args(&args(&["--fetch-model"])).unwrap(),
+            Mode::FetchModel { dir: None }
+        );
+    }
+
+    #[test]
+    fn fetch_model_accepts_a_directory() {
+        assert_eq!(
+            parse_args(&args(&["--fetch-model", "--dir", "/tmp/models"])).unwrap(),
+            Mode::FetchModel {
+                dir: Some(PathBuf::from("/tmp/models"))
+            }
+        );
+    }
+
+    #[test]
+    fn print_manifest_is_recognised() {
+        assert_eq!(
+            parse_args(&args(&["--print-manifest"])).unwrap(),
+            Mode::PrintManifest
+        );
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected() {
+        let error = parse_args(&args(&["--wat"])).unwrap_err();
+        assert!(error.contains("unknown argument"), "got: {error}");
+    }
+
+    #[test]
+    fn a_directory_without_fetch_model_is_rejected() {
+        let error = parse_args(&args(&["--dir", "/tmp/x"])).unwrap_err();
+        assert!(error.contains("--fetch-model"), "got: {error}");
+    }
+
+    #[test]
+    fn a_directory_without_a_value_is_rejected() {
+        let error = parse_args(&args(&["--fetch-model", "--dir"])).unwrap_err();
+        assert!(error.contains("needs a value"), "got: {error}");
+    }
+
+    #[test]
+    fn help_is_recognised() {
+        assert_eq!(parse_args(&args(&["--help"])).unwrap(), Mode::Help);
+        assert_eq!(parse_args(&args(&["-h"])).unwrap(), Mode::Help);
+    }
+
+    #[test]
+    fn the_manifest_is_valid_toml_with_a_setup_hook() {
+        let value: toml::Value = toml::from_str(MANIFEST).expect("manifest must parse");
+        let args = value["setup"]["args"]
+            .as_array()
+            .expect("setup.args is an array");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].as_str(), Some("--fetch-model"));
+        assert_eq!(value["setup"]["network"].as_bool(), Some(true));
+        assert!(value["setup"]["timeout_secs"].as_integer().unwrap() >= 60);
+    }
+
+    #[test]
+    fn the_manifest_hook_is_one_of_our_own_arguments() {
+        // The host runs the manifest's `args` against this binary. If that ever
+        // stopped being a valid argument the hook would silently do nothing.
+        let value: toml::Value = toml::from_str(MANIFEST).unwrap();
+        let rendered: Vec<String> = value["setup"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(parse_args(&rendered).is_ok());
+    }
+
+    #[test]
+    fn provision_dir_prefers_an_explicit_directory() {
+        assert_eq!(
+            provision_dir(Some(Path::new("/tmp/explicit")), None),
+            PathBuf::from("/tmp/explicit")
+        );
+    }
+
+    #[test]
+    fn provision_dir_defaults_to_the_runtime_cache_directory() {
+        // Same path the runtime reads from; a fetch must land where a later run
+        // looks.
+        let expected = CompressConfig::default().resolved_model_dir();
+        assert_eq!(provision_dir(None, None), expected);
+    }
+
+    #[test]
+    fn provision_dir_honours_model_dir_from_the_host_config() {
+        // klava passes the merged settings in $KLAVA_EXTENSION_CONFIG. If the
+        // fetch ignored `model_dir` it would download 573 MB into a directory
+        // the runtime never reads.
+        assert_eq!(
+            provision_dir(None, Some(r#"{"model_dir":"/tmp/m"}"#)),
+            PathBuf::from("/tmp/m")
+        );
+    }
+
+    #[test]
+    fn provision_dir_falls_back_when_the_host_config_is_unreadable() {
+        assert_eq!(
+            provision_dir(None, Some("not json")),
+            CompressConfig::default().resolved_model_dir()
+        );
+    }
+
+    #[test]
+    fn a_fresh_download_truncates_and_a_resume_appends() {
+        // Appending after the server ignored our Range glued a fresh body onto a
+        // stale prefix: right length, wrong bytes.
+        assert_eq!(part_mode(0), PartMode::Truncate);
+        assert_eq!(part_mode(5), PartMode::Append);
+    }
+
+    #[test]
+    fn model_files_cover_both_required_names() {
+        let names: Vec<&str> = MODEL_FILES.iter().map(|(_, local)| *local).collect();
+        assert!(names.contains(&TOKENIZER_FILE));
+        assert!(names.contains(&MODEL_FILE));
     }
 }

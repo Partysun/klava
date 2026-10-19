@@ -4,16 +4,25 @@
 
 ### Added
 
+- Extension provisioning hooks. A manifest may declare a `[setup]` table (`args`, `summary`, `network`, `timeout_secs`); klava runs it — the extension's own binary, never a shell — after the extension is enabled. `klava extensions install … --trust` and the first `klava extensions enable` run it, `--no-setup` opts out, and the new `klava extensions setup <name>` runs it on demand (the retry path). The binary, its arguments and the network warning are printed before it runs; without `--trust` and without a terminal, setup is skipped. The hook receives the extension's effective config as JSON in `$KLAVA_EXTENSION_CONFIG`, so it can honour settings such as `model_dir`.
+- Setup state is recorded in `<name>.setup.toml` next to the artifact (`args`, `artifact_sha256`, `ran_at`); a later enable skips an unchanged hook, and a changed argument list or a new artifact re-runs it. Failed runs are not recorded. `klava extensions list` gained a `SETUP` column (`none`/`pending`/`done`/`stale`) and `show` explains it.
+- `install` asks a freshly installed executable for `<binary> --print-manifest` and stores valid TOML as its manifest, so a `cargo:`/`npm:` install can learn about a `[setup]` hook that the package itself could not carry. An existing manifest is never overwritten, and a missing flag, timeout or invalid TOML simply means "no manifest".
+- `klava-compress --fetch-model` downloads the kompress model itself (resumable, with the directory resolved exactly as the runtime resolves `model_dir`), and `--print-manifest` exposes its `[setup]` hook. The model no longer needs a separate shell script.
 - Yandex is selected automatically only when the query is specifically about Russia/CIS (law, government, companies, products, local services, events) or the user asks for it by name ("search this on Yandex", "найди в яндексе"). Writing in Russian is **not** a signal: a Russian-language question about a global topic stays on the default engine. Explicit "do not use Yandex" wins over both automatic signals. The provider-named-in-text check reads the user's own turn, not the model-rewritten query, and only conversation history of the current turn is consulted.
 - `search_engine = "yandex"` selects the Yandex Search provider. klava sends the search request to the klava gateway with `plugins[0].engine = "yandex"`; the gateway runs Yandex Search, synthesizes an answer from the results, and returns the usual annotated completion, so the existing search loop, streaming splice, and Claude Code native `web_search` blocks work unchanged. Requires the klava provider (web search is already gated on it) and a gateway with Yandex configured.
 
 ### Changed
 
 - An explicit `search_engine` is no longer overridden by the per-query decision model: the `engine_family` answer only applies when the config (or `--search-engine`) leaves the engine on `auto`. `web_fast`/`web_deep` describe retrieval depth, so a Russia/CIS query selects Yandex over them while keeping the model's context/breadth tuning.
+- `klava extensions enable`/`install` accept `--trust`/`--yes`/`-y` and `--no-setup` through one parser; `--trust` on `install` now also consents to the extension's setup hook (previously it only consented to installing and running it).
 
 ### Fixed
 
+- A printed manifest was always discarded: `str::parse::<toml::Value>()` uses toml 1.x's `FromStr` for `Value`, which rejects every document ("unexpected content, expected nothing"), so `[setup]` hooks were never seen after an install. Parsing now goes through `toml::from_str`.
+- The kompress downloader no longer caps the whole body at 300 s (`timeout_recv_body` is a total budget, not an idle timeout) and no longer advertises gzip, whose `content-length` describes the compressed body and would break both resume and the size check. A server that ignores `Range` now truncates the partial file instead of appending to a stale prefix, a 416 resume removes the unusable `.part` instead of promoting it, and a short body is reported as incomplete rather than installed.
+- `klava-compress` expands `~` in `$KLAVA_COMPRESS_MODEL_DIR` the same way it does in `model_dir`, so a fetch and a later run cannot disagree about where the model lives.
 - Source distributions are now built from git (`sdist-generator = "git"`) so the workspace extension crates under `crates/` are included. maturin's cargo sdist drops `workspace.members` while the shipped `Cargo.lock` still lists those members, so `maturin build` from the sdist failed with `cannot update the lock file ... because --locked was passed`.
+- A just-installed or just-updated executable can fail to start with `Text file busy` (os error 26) when another thread forked while the file was still open. Extension startup, `--print-manifest` probing and the setup hook now retry that transient error briefly instead of reporting the extension as broken.
 
 ## [0.2.21] - 2026-10-16
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Fetch the kompress model into the cache directory klava reads.
 #
+# Manual fallback for `klava-compress --fetch-model`, which is what klava runs
+# as the extension's [setup] hook (`klava extensions setup klava-compress`).
+# This script needs only curl; use it when the binary cannot be run.
+#
 # Usage: ./scripts/fetch-model.sh [destination]
 #
 # Default destination: $XDG_CACHE_HOME/klava/kompress (else ~/.cache/klava/kompress)
@@ -44,5 +48,5 @@ echo
 echo "Model ready in: ${dest}"
 echo "Enable it in klava's config:"
 echo
-echo "  [extensions.settings.kompress]"
+echo "  [extensions.settings.klava-compress]"
 echo "  enabled = true"

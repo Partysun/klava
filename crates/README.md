@@ -80,12 +80,13 @@ Drops low-value tokens from tool output using
 # 1. Build the extension (klava is untouched):
 cargo build --release -p klava-compress
 
-# 2. Fetch the model into the cache:
-crates/klava-compress/scripts/fetch-model.sh
-
-# 3. Install it (writes to ~/.local/share/klava/extensions):
+# 2. Install it (writes to ~/.local/share/klava/extensions). klava asks the
+#    binary for its [setup] hook and downloads the model after enabling it:
 klava extensions install target/release/klava-compress --trust
 ```
+
+Add `--no-setup` to skip the download and run `klava extensions setup
+klava-compress` later; `klava-compress --fetch-model` does the same by hand.
 
 The model lands in `$XDG_CACHE_HOME/klava/kompress` (default
 `~/.cache/klava/kompress`) and is never committed.

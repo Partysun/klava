@@ -235,7 +235,8 @@ pub enum Command {
     ///
     /// klava ships with no extensions. An extension is an executable discovered
     /// at runtime; klava only interprets the `enabled` key and passes the rest
-    /// through untouched.
+    /// through untouched. An extension may declare a `[setup]` hook in its
+    /// manifest; `--trust` consents to running it after the extension is enabled.
     #[command(after_help = "Examples:\n  \
                      klava extensions\n  \
                      klava extensions path\n  \
@@ -243,12 +244,14 @@ pub enum Command {
                      klava extensions install cargo:klava-compress --trust\n  \
                      klava extensions install cargo-path:./my-crate --trust\n  \
                      klava extensions install npm:my-ext --trust\n  \
+                     klava extensions install cargo:klava-compress --trust --no-setup\n  \
                      klava extensions list\n  \
                      klava extensions verify\n  \
+                     klava extensions setup klava-compress\n  \
                      klava extensions enable <name>\n  \
                      klava extensions remove <name>")]
     Extensions {
-        /// Subcommand: list (default), path, install, remove, verify, show, enable, disable, set
+        /// Subcommand: list (default), path, install, remove, verify, show, setup, enable, disable, set
         #[arg(
             required = false,
             trailing_var_arg = true,
