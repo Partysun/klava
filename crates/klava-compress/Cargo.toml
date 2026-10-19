@@ -1,0 +1,21 @@
+[package]
+name = "klava-compress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Context compression extension for klava: drop low-value tokens from tool output with kompress."
+
+[[bin]]
+name = "klava-compress"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+  "ndarray",
+  "download-binaries",
+  "std",
+] }

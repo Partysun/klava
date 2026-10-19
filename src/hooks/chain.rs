@@ -251,13 +251,21 @@ mod tests {
         };
 
         let chain = default_chain(&enabled);
-        assert!(!has_hook(&chain, HookStage::RequestReceived, "calculate_tokens"));
+        assert!(!has_hook(
+            &chain,
+            HookStage::RequestReceived,
+            "calculate_tokens"
+        ));
 
         let disabled = Config {
             enable_token_stats: true,
             ..Config::default()
         };
         let chain = default_chain(&disabled);
-        assert!(has_hook(&chain, HookStage::RequestReceived, "calculate_tokens"));
+        assert!(has_hook(
+            &chain,
+            HookStage::RequestReceived,
+            "calculate_tokens"
+        ));
     }
 }
