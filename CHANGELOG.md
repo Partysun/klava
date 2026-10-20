@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-20
+
 ### Added
 
 - **`[[models]]` replaces `[[providers]]` + `active_provider`.** Every model is one self-contained entry (`name`, `type`, `base_url`, `api_key`/`api_key_name`, optional `chat_completions_path` and `upstream_model`), so a model name — not a provider — is the unit of routing. `active_provider` is replaced by the top-level `completion_model` and `reasoning_model`, which name entries.
