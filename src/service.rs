@@ -66,7 +66,7 @@ pub fn exe_path() -> PathBuf {
 /// providers read their credentials from their own local auth stores.
 fn env_entries(config: &Config) -> Vec<(String, String)> {
     config
-        .providers
+        .models
         .iter()
         .filter(|p| matches!(p.provider_type, klava::providers::Type::OpenAICompatible))
         .filter_map(|p| {
@@ -857,26 +857,18 @@ mod tests {
     #[test]
     fn env_entries_only_include_set_vars() {
         let config = Config {
-            providers: vec![
-                klava::providers::Config {
+            models: vec![
+                klava::providers::Model {
                     name: "with-env".into(),
                     provider_type: klava::providers::Type::OpenAICompatible,
-                    base_url: None,
-                    chat_completions_path: None,
-                    api_key: None,
                     api_key_name: Some("KLAVA_TEST_AUTH_KEY_A".into()),
-                    reasoning_model: None,
-                    completion_model: None,
+                    ..klava::providers::Model::default()
                 },
-                klava::providers::Config {
+                klava::providers::Model {
                     name: "no-env".into(),
                     provider_type: klava::providers::Type::OpenAICompatible,
-                    base_url: None,
-                    chat_completions_path: None,
                     api_key: Some("inline".into()),
-                    api_key_name: None,
-                    reasoning_model: None,
-                    completion_model: None,
+                    ..klava::providers::Model::default()
                 },
             ],
             ..Config::default()

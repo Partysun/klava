@@ -47,6 +47,7 @@ pub fn create_app(
             "/v1/responses",
             axum::routing::post(crate::proxy::proxy_responses),
         )
+        .route("/v1/models", get(list_models))
         .merge(create_health_router())
         // .layer(axum::middleware::from_fn(
         //     |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {
@@ -61,6 +62,30 @@ pub fn create_app(
         .layer(Extension(client))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
+}
+
+/// `GET /v1/models` — the models agents may name.
+///
+/// Lists every distinct `[[models]]` name, so a harness can discover the real
+/// model ids klava routes instead of the synthetic proxy name.
+async fn list_models(Extension(config): Extension<Arc<Config>>) -> axum::Json<serde_json::Value> {
+    let data: Vec<serde_json::Value> = config
+        .model_names()
+        .into_iter()
+        .map(|name| {
+            serde_json::json!({
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": config
+                    .pick(&name)
+                    .map(|m| m.description().to_string())
+                    .unwrap_or_else(|| "klava".to_string()),
+            })
+        })
+        .collect();
+
+    axum::Json(serde_json::json!({ "object": "list", "data": data }))
 }
 
 /// Logging output mode for the proxy server.
@@ -170,27 +195,31 @@ pub async fn run_server(
     tracing::info!("Starting Klava Proxy v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Port: {}", config.port);
 
-    // Get the active provider config for logging
-    if let Some(active_config) = config.get_active_provider_config() {
-        if let Some(ref url) = config.resolve_base_url() {
-            tracing::info!("Upstream URL: {}", url);
-        }
-
-        if let Some(ref model) = config.resolve_reasoning_model() {
-            tracing::info!("Reasoning Model Override: {}", model);
-        }
-
-        if let Some(ref model) = config.resolve_completion_model() {
-            tracing::info!("Completion Model Override: {}", model);
-        }
-
-        if active_config.api_key.is_some() {
-            tracing::info!("API Key: configured");
-        } else if config.resolve_api_key().is_some() {
-            tracing::info!("API Key: configured (via env var)");
-        } else {
-            tracing::info!("API Key: not set (using unauthenticated endpoint)");
-        }
+    // Log the routable models, one line each.
+    for name in config.model_names() {
+        let Some(model) = config.pick(&name) else {
+            continue;
+        };
+        let pool = config.pool(&name).len();
+        tracing::info!(
+            "Model: {} -> {} (upstream {}), {} entr{}",
+            name,
+            model
+                .chat_completions_url()
+                .unwrap_or_else(|| "no URL".to_string()),
+            model.upstream_model(),
+            pool,
+            if pool == 1 { "y" } else { "ies" },
+        );
+    }
+    if config.model_names().is_empty() {
+        tracing::warn!("No models configured - run 'klava providers add'");
+    }
+    if let Some(ref model) = config.resolve_reasoning_model() {
+        tracing::info!("Reasoning Model: {}", model);
+    }
+    if let Some(ref model) = config.resolve_completion_model() {
+        tracing::info!("Completion Model: {}", model);
     }
 
     let cors = create_cors_layer();
@@ -597,19 +626,29 @@ mod integration_tests {
         let config = Arc::new(Config {
             port: 0,
             verbose: false,
-            enable_pii: false,
             enable_token_stats: false,
-            active_provider: "fake".to_string(),
-            providers: vec![ProviderConfig {
-                name: "fake".to_string(),
-                provider_type,
-                base_url: Some(base_url.to_string()),
-                chat_completions_path: None,
-                api_key: Some("test-key".to_string()),
-                api_key_name: None,
-                reasoning_model: Some("reasoning-model".to_string()),
-                completion_model: Some("completion-model".to_string()),
-            }],
+            completion_model: Some("completion-model".to_string()),
+            reasoning_model: Some("reasoning-model".to_string()),
+            models: vec![
+                ProviderConfig {
+                    name: "completion-model".to_string(),
+                    provider_type: provider_type.clone(),
+                    base_url: Some(base_url.to_string()),
+                    chat_completions_path: None,
+                    api_key: Some("test-key".to_string()),
+                    api_key_name: None,
+                    ..ProviderConfig::default()
+                },
+                ProviderConfig {
+                    name: "reasoning-model".to_string(),
+                    provider_type,
+                    base_url: Some(base_url.to_string()),
+                    chat_completions_path: None,
+                    api_key: Some("test-key".to_string()),
+                    api_key_name: None,
+                    ..ProviderConfig::default()
+                },
+            ],
             enable_websearch,
             search_decide: false,
             ..Config::default()
@@ -620,24 +659,22 @@ mod integration_tests {
         create_app(config, client, cors, chain)
     }
 
-    /// Like [`build_proxy_opts`], but with the legacy PII flag kept on so the
-    /// installed PII extension actually runs.
-    fn build_proxy_opts_enable_pii(base_url: &str) -> Router {
+    /// Like [`build_proxy_opts`], but with the installed PII extension enabled
+    /// in its own settings, which is the only thing that makes it run.
+    fn build_proxy_opts_with_pii_extension(base_url: &str) -> Router {
         let mut config = Config {
             port: 0,
             verbose: false,
-            enable_pii: true,
             enable_token_stats: false,
-            active_provider: "fake".to_string(),
-            providers: vec![ProviderConfig {
+            completion_model: Some("fake".to_string()),
+            models: vec![ProviderConfig {
                 name: "fake".to_string(),
                 provider_type: ProviderType::OpenAICompatible,
                 base_url: Some(base_url.to_string()),
                 chat_completions_path: None,
                 api_key: Some("test-key".to_string()),
                 api_key_name: None,
-                reasoning_model: Some("reasoning-model".to_string()),
-                completion_model: Some("completion-model".to_string()),
+                ..ProviderConfig::default()
             }],
             ..Config::default()
         };
@@ -704,7 +741,7 @@ mod integration_tests {
 
         let log = Arc::new(Mutex::new(vec![]));
         let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
-        let router = build_proxy_opts_enable_pii(&format!("http://127.0.0.1:{port}"));
+        let router = build_proxy_opts_with_pii_extension(&format!("http://127.0.0.1:{port}"));
 
         let (status, _body) = send(
             &router,
@@ -808,6 +845,67 @@ json.dump({"decision": "replace", "payload": payload}, sys.stdout)
         // The completion model override was applied before forwarding upstream.
         let sent = log.lock().unwrap();
         assert_eq!(sent[0]["model"], "completion-model");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_names_a_model_routes_to_it() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "reasoning-model", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // The named model wins over the completion default.
+        let sent = log.lock().unwrap();
+        assert_eq!(sent[0]["model"], "reasoning-model");
+    }
+
+    #[tokio::test]
+    async fn the_response_carries_the_model_name_the_client_sent() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "reasoning-model", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "reasoning-model");
+    }
+
+    #[tokio::test]
+    async fn the_models_endpoint_lists_the_configured_names() {
+        let port = spawn_fake_upstream(FakeMode::ChatJson, Arc::new(Mutex::new(vec![]))).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["completion-model", "reasoning-model"]);
     }
 
     #[tokio::test]

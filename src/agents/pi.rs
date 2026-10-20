@@ -70,22 +70,28 @@ impl PiRunner {
         Self::agent_dir().map(|dir| dir.join("settings.json"))
     }
 
-    /// Model ids exposed to pi for the active klava provider:
-    /// the completion model first, then the reasoning model
-    /// (deduplicated, so agents that use one model for both get a
-    /// single entry). Falls back to "klava". The klava proxy maps
-    /// incoming model ids to the configured models, so these only
-    /// affect what pi displays and lets the user pick via /model.
+    /// Model ids exposed to pi for the active klava provider: the two active
+    /// models first, then every other configured model name (deduplicated).
+    /// Pi shows these ids and lets the user pick one via /model; klava routes
+    /// a request by the name it carries, so the real names work as sent.
     fn active_model_ids() -> Vec<String> {
         let mut ids = Vec::new();
         if let Ok(config) = crate::config::Config::load() {
-            if let Some(model) = config.resolve_completion_model() {
-                ids.push(model);
-            }
-            if let Some(model) = config.resolve_reasoning_model()
-                && !ids.contains(&model)
+            for model in [
+                config.resolve_completion_model(),
+                config.resolve_reasoning_model(),
+            ]
+            .into_iter()
+            .flatten()
             {
-                ids.push(model);
+                if !ids.contains(&model) {
+                    ids.push(model);
+                }
+            }
+            for model in config.model_names() {
+                if !ids.contains(&model) {
+                    ids.push(model);
+                }
             }
         }
         if ids.is_empty() {

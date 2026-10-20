@@ -78,7 +78,10 @@ pub fn logging_hook(data: Value, _config: &Config) -> Result<Value> {
 /// Hook: Log provider and model information from request data
 pub fn provider_model_logging_hook(data: Value, config: &Config) -> Result<Value> {
     let model_info = data.get("model").and_then(|val| val.as_str()).unwrap_or("");
-    let provider_info = &config.active_provider;
+    let provider_info = config
+        .pick(config.completion_model.as_deref().unwrap_or_default())
+        .map(|m| m.description().to_string())
+        .unwrap_or_else(|| "none".to_string());
 
     tracing::info!("Provider: {}, Model: {}", provider_info, model_info);
 
@@ -106,15 +109,14 @@ pub fn openai_to_anthropic_hook(data: Value, _config: &Config) -> Result<Value> 
 
 /// Default hook chain with logging at all stages.
 ///
-/// Heavy hooks (PII scan, token estimation) are registered only when the
-/// corresponding config option is enabled, keeping the default hot path
-/// lightweight — the PII analyzer is expensive on large payloads.
+/// Token estimation is registered only when `enable_token_stats` is set,
+/// keeping the default hot path lightweight — it prices every message.
 pub fn default_chain(config: &Config) -> HookChain {
     let mut chain = HookChain::new().with_hook(HookStage::RequestReceived, "logging", logging_hook);
 
-    // PII redaction is no longer compiled in; it is an extension that runs in
-    // the extension chain at the request stage. `enable_pii` survives only as a
-    // deprecated flag that is forwarded to installed extensions.
+    // PII redaction is not compiled in: it is an extension that runs in the
+    // extension chain at the request stage, configured by that extension's own
+    // settings (`klava extensions show klava-pii-guardrail`).
 
     if config.enable_token_stats {
         chain = chain.with_hook(

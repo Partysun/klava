@@ -59,6 +59,7 @@ pub fn drive(
     client: Client,
     config: Arc<Config>,
     mut openai_req: openai::OpenAIRequest,
+    entry: crate::providers::Model,
     first_response: reqwest::Response,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>> {
     let user_context = user_context(&openai_req);
@@ -71,7 +72,14 @@ pub fn drive(
 
         loop {
             if !first {
-                match crate::proxy::send_openai_request(&client, &config, &openai_req).await {
+                match crate::proxy::send_openai_request_via(
+                    &client,
+                    &config,
+                    &openai_req,
+                    Some(&entry),
+                )
+                .await
+                {
                     Ok(resp) => response = Some(resp),
                     Err(e) => {
                         yield Err(e);

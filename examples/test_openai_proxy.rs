@@ -33,10 +33,7 @@ async fn main() -> anyhow::Result<()> {
     // Create a config with environment variable overrides applied
     let mut config = Config {
         port: persistent.port,
-        active_provider: persistent.active_provider.clone(),
-        providers: persistent.providers.clone(),
         verbose: persistent.verbose,
-        enable_pii: persistent.enable_pii,
         enable_token_stats: persistent.enable_token_stats,
         ..persistent.clone()
     };
@@ -44,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     // Validate config and run interactive setup if needed
     if let Err(e) = config.validate_complete() {
         eprintln!("Configuration validation failed: {}", e);
-        eprintln!("Please run 'cargo run --bin klava setup' to configure your provider");
+        eprintln!("Please run 'klava providers add' to configure your models");
         return Err(anyhow::anyhow!("Configuration error: {}", e));
     }
 

@@ -296,7 +296,6 @@ An unknown `decision`, or `replace` without a `payload`, is treated as
 {
   "decision": "nested_call",
   "nested_call": {
-    "provider": "klava",
     "model": "~anthropic/claude-opus-latest",
     "mode": "append",
     "system": "You are a senior reviewer.",
@@ -305,6 +304,10 @@ An unknown `decision`, or `replace` without a `payload`, is treated as
   }
 }
 ```
+
+`model` names a `[[models]]` entry in the user's config, which carries the
+connection (type, URL, key) for the call. A name that is not configured falls
+back to the user's default completion model, as does an omitted `model`.
 
 `mode` is `append` (default; the answer is added as a user message and the
 original model continues) or `take_over` (the answer is returned to the client
@@ -371,6 +374,8 @@ extension can align with it. The host's switch is authoritative:
 require_decide_for_nested_calls = true
 
 # One decision model for web-search tuning and every extension `decide`.
+# It names exactly one [[models]] entry; the jigor backend (klava /
+# openrouter / cloudflare) is detected from that entry's type and base URL.
 decide_model = "typesafe/jev-1.13"
 ```
 

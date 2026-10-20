@@ -67,11 +67,11 @@ pub enum Command {
         #[arg(long, help = "Generate config without starting agents")]
         config: bool,
 
-        /// Set the active provider before launching
+        /// Use a configured model for this launch
         #[arg(
             long,
-            value_name = "PROVIDER",
-            help = "Set the active provider (e.g., qwen, openrouter)"
+            value_name = "MODEL",
+            help = "Use a configured [[models]] name for this launch (e.g. ~deepseek/deepseek-flash-latest)"
         )]
         provider: Option<String>,
 
@@ -213,20 +213,26 @@ pub enum Command {
         setup: bool,
     },
 
-    /// Manage API providers
+    /// Set up providers and their models
     ///
-    /// Switch between providers or manage provider-specific authentication.
+    /// `klava providers` lists the configured models (and offers the wizard
+    /// when there are none). The wizard logs in to a provider, lists its
+    /// models, checks the connection and writes the ones you pick.
     #[command(after_help = "Examples:\n  \
-                     klava providers\n  \
-                     klava providers set qwen-code\n  \
-                     klava providers qwen-code login\n  \
-                     klava providers qwen-code status")]
+                     klava providers                     # list, or start the wizard\n  \
+                     klava providers add                 # pick a provider interactively\n  \
+                     klava providers add openrouter      # Klava, OpenRouter, Cloudflare, Qwen, custom\n  \
+                     klava providers check               # one tiny request per model\n  \
+                     klava providers set                 # choose the default model\n  \
+                     klava providers remove <model>\n  \
+                     klava login                         # Klava device login\n  \
+                     klava providers qwen-code login")]
     Providers {
-        /// Raw provider arguments for custom parsing
+        /// Raw arguments for custom parsing
         #[arg(
             required = false,
             trailing_var_arg = true,
-            help = "Provider name or subcommands"
+            help = "Subcommand or model name"
         )]
         args: Vec<String>,
     },
@@ -260,16 +266,16 @@ pub enum Command {
         args: Vec<String>,
     },
 
-    /// Check configuration and provider connectivity
+    /// Check configuration and model connectivity
     ///
-    /// Sends a small, cheap test request to your configured LLM API
+    /// Sends a small, cheap test request to every configured model
     /// to verify everything is working.
     #[command(after_help = "Examples:\n  \
                      klava check\n  \
-                     klava check --provider openrouter")]
+                     klava check --provider ~deepseek/deepseek-flash-latest")]
     Check {
-        /// Provider to check (defaults to active provider)
-        #[arg(long, value_name = "PROVIDER", help = "Provider to check")]
+        /// Only check entries with this model name (defaults to all)
+        #[arg(long, value_name = "MODEL", help = "Model name to check")]
         provider: Option<String>,
 
         /// Model to use for the check

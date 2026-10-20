@@ -119,8 +119,9 @@ pub struct ExtensionResponse {
 /// Parameters for a nested model call, as an extension expresses them.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NestedCall {
+    /// Name of the `[[models]]` entry to call. Omitted or not configured
+    /// falls back to the completion model.
     #[serde(default)]
-    pub provider: Option<String>,
     pub model: String,
     /// `append` (default) or `take_over`.
     #[serde(default)]
@@ -151,7 +152,6 @@ impl ExtensionResponse {
             },
             "nested_call" => match self.nested_call {
                 Some(call) => Decision::NestedCall(NestedCallRequest {
-                    provider: call.provider,
                     model: call.model,
                     mode: match call.mode.as_deref() {
                         Some("take_over") => FoldMode::TakeOver,
@@ -206,11 +206,7 @@ impl InstalledExtension {
     }
 
     /// The settings table handed to the extension: manifest, then user
-    /// overrides, then the host's own globals.
-    ///
-    /// `disable_pii` is the legacy `enable_pii = false` flag. It is passed to
-    /// every extension because the host does not know which one cares; the rest
-    /// ignore it.
+    /// overrides.
     ///
     /// Host-only manifest keys (`[settings]` and `notice`, which describe the
     /// extension to klava, and `[setup]`, which names its provisioning hook) are
@@ -228,11 +224,6 @@ impl InstalledExtension {
         }
         if let Some(user) = config.extensions.settings.get(&self.name) {
             merge(&mut effective, user);
-        }
-        if config.extensions.disable_pii
-            && let Some(map) = effective.as_object_mut()
-        {
-            map.insert("disable_pii".into(), Value::Bool(true));
         }
         effective
     }
@@ -964,10 +955,10 @@ async fn nested_call(
     payload: Value,
     req: &NestedCallRequest,
 ) -> Result<NestedOutcome> {
-    let Some(provider) = resolve_provider(config, req.provider.as_deref()) else {
+    let Some(entry) = resolve_model(config, req) else {
         tracing::warn!(
-            "nested call: provider {:?} not found, staying on {}",
-            req.provider,
+            "nested call: model {:?} not found, staying on {}",
+            req.model,
             req.model
         );
         return Ok(NestedOutcome::Failed(payload));
@@ -976,7 +967,7 @@ async fn nested_call(
     // Reuse the conversation, swap the model, add the reviewer system prompt.
     // Tools are dropped: a reviewer must not act.
     let mut nested = payload.clone();
-    nested["model"] = json!(req.model);
+    nested["model"] = json!(entry.upstream_model());
     nested["stream"] = json!(false);
     nested["tools"] = Value::Null;
     nested["tool_choice"] = Value::Null;
@@ -996,20 +987,14 @@ async fn nested_call(
 
     // The hook-free sender is the recursion boundary: extensions never see this
     // request, so a nested call cannot recurse.
-    let response = match crate::proxy::send_openai_request_via(
-        client,
-        config,
-        &typed,
-        Some(&provider),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("nested call: request failed, continuing: {e}");
-            return Ok(NestedOutcome::Failed(payload));
-        }
-    };
+    let response =
+        match crate::proxy::send_openai_request_via(client, config, &typed, Some(&entry)).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("nested call: request failed, continuing: {e}");
+                return Ok(NestedOutcome::Failed(payload));
+            }
+        };
 
     if !response.status().is_success() {
         tracing::warn!("nested call: returned {}, continuing", response.status());
@@ -1065,12 +1050,16 @@ async fn nested_call(
     }
 }
 
-/// Look up a provider by name, or the active one when `name` is `None`.
-fn resolve_provider(config: &Config, name: Option<&str>) -> Option<crate::providers::Config> {
-    match name {
-        Some(n) => config.get_provider_config(n).cloned(),
-        None => config.get_active_provider_config().cloned(),
-    }
+/// Resolve the connection a nested call runs on.
+///
+/// The nested call names a model (its `model` field); a `[[models]]` entry by
+/// that name wins. An unknown or empty name falls back to the configured
+/// completion model.
+fn resolve_model(config: &Config, req: &NestedCallRequest) -> Option<crate::providers::Model> {
+    config
+        .resolve_model(&req.model)
+        .cloned()
+        .or_else(|| config.default_completion().cloned())
 }
 
 fn prepend_system(payload: &mut Value, system: &str) {
@@ -1419,7 +1408,7 @@ mod tests {
 
     /// An extension that always asks for a nested call must not get one
     /// without an approved decide while the host policy requires it. The
-    /// refusal happens before any provider is resolved, so this test never
+    /// refusal happens before any model is resolved, so this test never
     /// touches the network.
     #[cfg(unix)]
     #[tokio::test]

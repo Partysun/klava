@@ -6,10 +6,12 @@
 //! search settings, runs the search, and feeds the result back upstream until
 //! the model answers normally.
 //!
-//! The search itself runs through the active provider's chat-completions
-//! endpoint with a search plugin attached (see [`wire`] and [`settings`]), so
-//! it is billed the same way as any other request and no gateway identity
-//! leaks into names or messages.
+//! The search itself runs through the **search model's** chat-completions
+//! endpoint (`search_model`, defaulting to the completion model) with a search
+//! plugin attached (see [`wire`] and [`settings`]), so it is billed the same
+//! way as any other request and no gateway identity leaks into names or
+//! messages. The backend is only reachable through a `type = "klava"` model,
+//! which is what gates the feature.
 
 pub mod routing;
 pub mod settings;
@@ -312,15 +314,18 @@ pub async fn execute_outcome(
     query: &str,
     settings: &SearchSettings,
 ) -> Result<wire::SearchOutcome> {
-    let model = config
-        .resolve_search_model()
+    let entry = config
+        .search_entry()
+        .cloned()
         .ok_or_else(|| Error::Internal("No search model configured".to_string()))?;
+    let name = entry.name.clone();
 
-    let url = config.chat_completions_url();
-    tracing::debug!("Running web search via {} for model {}", url, model);
+    let url = entry.chat_completions_url().unwrap_or_default();
+    tracing::debug!("Running web search via {} for model {}", url, name);
 
-    let req = wire::build_request(query, &model, settings);
-    let response = crate::proxy::send_openai_request(client, config, &req).await?;
+    let req = wire::build_request(query, &entry.upstream_model(), settings);
+    let response =
+        crate::proxy::send_openai_request_via(client, config, &req, Some(&entry)).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -337,8 +342,9 @@ pub async fn execute_outcome(
                 engine: settings::Engine::Auto,
                 ..settings.clone()
             };
-            let req = wire::build_request(query, &model, &fallback);
-            let response = crate::proxy::send_openai_request(client, config, &req).await?;
+            let req = wire::build_request(query, &entry.upstream_model(), &fallback);
+            let response =
+                crate::proxy::send_openai_request_via(client, config, &req, Some(&entry)).await?;
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();

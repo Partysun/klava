@@ -38,7 +38,7 @@ operators = {
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Master switch. klava also injects `disable_pii` when the legacy `enable_pii = false` flag is set. |
+| `enabled` | `true` | Master switch: this setting is the only way to turn the guardrail off. |
 | `entities` | `["Email", "CryptoAddress"]` | Which entity types to scan for. Empty = all 21 recognizers. |
 | `operators` | map on right | How each entity is rewritten: `replace:<text>`, `mask:<keep-from-end>`, `hash:<salt>`, or nothing (plain `Redact`). |
 

@@ -41,17 +41,20 @@ async fn main() -> anyhow::Result<()> {
     let setup_context = match &cli.command {
         Command::Launch { agent, .. } => Some(match agent {
             Some(agent) => format!(
-                "klava launch {} needs an AI provider first. Let's configure one, then we'll launch {}.",
+                "klava launch {} needs an AI model first. Let's set one up, then we'll launch {}.",
                 agent.name(),
                 agent.name()
             ),
-            None => "klava launch needs an AI provider first. Let's configure one now.".to_string(),
+            None => "klava launch needs an AI model first. Let's set one up now.".to_string(),
         }),
         _ => None,
     };
 
-    let mut config =
-        cli_setup::build_config_interactive_with_context(setup_context.as_deref()).await?;
+    let mut config = cli_setup::build_config_interactive_with_context(
+        cli_setup::auto_setup_for(subcommand_name(&cli.command)),
+        setup_context.as_deref(),
+    )
+    .await?;
 
     let hook_chain = Arc::new(default_chain(&config));
 
@@ -83,45 +86,19 @@ async fn main() -> anyhow::Result<()> {
                 current_config.search_model = Some(model);
             }
 
-            // Handle provider switch if provided
-            if let Some(provider_name) = provider {
-                // Find matching provider
-                let selected_provider = current_config
-                    .providers
-                    .iter()
-                    .find(|p| p.name == provider_name)
-                    .ok_or_else(|| {
-                        Error::Internal(format!(
-                            "Invalid provider: '{}'. Available providers: {}",
-                            provider_name,
-                            current_config
-                                .providers
-                                .iter()
-                                .map(|p| p.name.clone())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
-                    })?;
-
-                // Update the config with the new active provider
-                current_config.active_provider = selected_provider.name.to_string();
-
-                println!("Switched to provider: {}", provider_name);
-
-                // Handle provider-specific authentication if needed
-                match selected_provider.provider_type {
-                    klava::providers::Type::QwenCode => {
-                        handle_qwen_authentication().await?;
-                    }
-                    #[cfg(feature = "klava")]
-                    klava::providers::Type::Klava => {
-                        ensure_klava_authenticated(false).await?;
-                    }
-                    klava::providers::Type::OpenAICompatible => {
-                        // Validate OpenAI-compatible provider config
-                        selected_provider.validate_config(&current_config)?;
-                    }
+            // `--provider <model>` switches the active model for this launch.
+            if let Some(model_name) = provider {
+                if current_config.pool(&model_name).is_empty() {
+                    return Err(Error::Internal(format!(
+                        "Invalid model: '{}'. Available models: {}",
+                        model_name,
+                        current_config.model_names().join(", ")
+                    ))
+                    .into());
                 }
+                current_config.completion_model = Some(model_name.clone());
+                current_config.reasoning_model = Some(model_name.clone());
+                println!("Using model: {}", model_name);
             }
 
             ensure_provider_ready(&current_config).await?;
@@ -163,9 +140,11 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 println!(
-                    "Configuration generated for {} with {} provider",
+                    "Configuration generated for {} with model {}",
                     agent.name(),
-                    current_config.active_provider
+                    current_config
+                        .resolve_completion_model()
+                        .unwrap_or_else(|| "none".to_string())
                 );
                 return Ok(());
             }
@@ -378,19 +357,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Providers { args } => handle_providers_command(args).await,
         Command::Extensions { args } => klava::ext_cli::run(&mut config, args),
         Command::Check { provider, model } => {
-            if let Some(provider_name) = provider {
-                // Check specific provider
-                let target_config = config.clone();
-                klava::diagnostic::run_tests(
-                    &target_config,
-                    Some(&provider_name),
-                    model.as_deref(),
-                )
-                .await;
-            } else {
-                // Check active provider
-                klava::diagnostic::run_tests(&config, None, model.as_deref()).await;
-            }
+            // `--provider` filters by model-entry name (the old flag name is
+            // kept so existing scripts keep working).
+            klava::diagnostic::run_tests(&config, provider.as_deref(), model.as_deref()).await;
             Ok(())
         }
         Command::Login { force } => handle_klava_login(force).await,
@@ -428,6 +397,7 @@ async fn handle_daemon_mode() -> anyhow::Result<()> {
 }
 
 /// Handle Qwen authentication with user consent and risk warnings
+#[cfg(feature = "qwen-code")]
 async fn handle_qwen_authentication() -> anyhow::Result<()> {
     use klava::qwen_auth::QwenAuth;
     let mut qwen_auth = QwenAuth::new();
@@ -474,25 +444,38 @@ async fn handle_qwen_authentication() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Check if active provider is ready and authenticate if needed
+/// Check that the configured models are ready, authenticating when needed.
+///
+/// Every entry is validated; the login flows run once per credential kind
+/// (klava device flow, qwen OAuth) and never for a model that carries its own
+/// key.
 async fn ensure_provider_ready(config: &config::Config) -> anyhow::Result<()> {
-    let active_provider_config = config.get_active_provider_config().ok_or_else(|| {
-        Error::Internal(format!(
-            "Active provider '{}' not found",
-            config.active_provider
-        ))
-    })?;
+    config.validate_complete()?;
 
-    match active_provider_config.provider_type {
-        klava::providers::Type::QwenCode => {
-            handle_qwen_authentication().await?;
-        }
-        #[cfg(feature = "klava")]
-        klava::providers::Type::Klava => {
-            ensure_klava_authenticated(false).await?;
-        }
-        klava::providers::Type::OpenAICompatible => {
-            active_provider_config.validate_config(config)?;
+    #[cfg(feature = "qwen-code")]
+    let mut qwen_checked = false;
+    #[cfg(feature = "klava")]
+    let mut klava_checked = false;
+
+    for model in &config.models {
+        match model.provider_type {
+            #[cfg(feature = "qwen-code")]
+            klava::providers::Type::QwenCode => {
+                if !qwen_checked {
+                    handle_qwen_authentication().await?;
+                    qwen_checked = true;
+                }
+            }
+            #[cfg(feature = "klava")]
+            klava::providers::Type::Klava => {
+                if !klava_checked && !model.has_klava_auth() {
+                    ensure_klava_authenticated(false).await?;
+                    klava_checked = true;
+                }
+            }
+            klava::providers::Type::OpenAICompatible => {
+                model.validate_config(config)?;
+            }
         }
     }
 
@@ -577,231 +560,311 @@ async fn handle_config_command(setup: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Handle providers command
+/// Error used by the subcommands that only exist with a feature enabled.
+#[cfg(not(feature = "qwen-code"))]
+fn qwen_not_built() -> anyhow::Result<()> {
+    anyhow::bail!("qwen-code support is not enabled in this build")
+}
+
+/// The subcommand name, for decisions made before dispatch.
+fn subcommand_name(command: &cli::Command) -> &'static str {
+    match command {
+        cli::Command::Launch { .. } => "launch",
+        cli::Command::Up { .. } => "up",
+        cli::Command::Stop { .. } => "stop",
+        cli::Command::Restart { .. } => "restart",
+        cli::Command::Status { .. } => "status",
+        cli::Command::Logs { .. } => "logs",
+        cli::Command::Config { .. } => "config",
+        cli::Command::Providers { .. } => "providers",
+        cli::Command::Extensions { .. } => "extensions",
+        cli::Command::Check { .. } => "check",
+        cli::Command::Login { .. } => "login",
+        cli::Command::Logout { .. } => "logout",
+        cli::Command::Whoami { .. } => "whoami",
+        cli::Command::Balance { .. } => "balance",
+    }
+}
+
+/// Handle providers command.
+///
+/// `klava providers` is the onboarding surface: without a subcommand it lists
+/// the configured models and offers to add a provider. `klava providers add`
+/// runs the wizard; `check`, `remove` and `set` manage what it wrote.
 async fn handle_providers_command(args: Vec<String>) -> anyhow::Result<()> {
-    let (provider_name, subcommand, flags) = parse_provider_args(args)?;
+    let mut args = args.into_iter().peekable();
+    let first = args.peek().cloned();
 
-    match subcommand.as_deref() {
-        Some("login") => {
-            let force = flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
-            if provider_name.as_deref() == Some("klava") {
-                return handle_klava_login(force).await;
-            }
-            #[cfg(feature = "qwen-code")]
-            {
-                handle_qwen_login(force).await?;
-            }
-            #[cfg(not(feature = "qwen-code"))]
-            {
-                anyhow::bail!("qwen-code feature is not enabled");
-            }
+    match first.as_deref() {
+        Some("add") => {
+            args.next();
+            let id = args.next();
+            add_provider(id.as_deref()).await?;
+            Ok(())
         }
-        Some("logout") => {
-            let force = flags.contains(&"--force".to_string()) || flags.contains(&"-f".to_string());
-            if provider_name.as_deref() == Some("klava") {
-                return handle_klava_logout(force).await;
-            }
-            #[cfg(feature = "qwen-code")]
-            {
-                handle_qwen_logout(force).await?;
-            }
-            #[cfg(not(feature = "qwen-code"))]
-            {
-                anyhow::bail!("qwen-code feature is not enabled");
-            }
+        Some("list") => {
+            list_models(&config::Config::load()?);
+            Ok(())
         }
-        Some("status") => {
-            if provider_name.as_deref() == Some("klava") {
-                return handle_klava_status().await;
+        Some("check") => {
+            args.next();
+            let name = args.next();
+            let config = config::Config::load()?;
+            let mut all_passed = true;
+            let targets: Vec<_> = match name.as_deref() {
+                Some(name) => config.models.iter().filter(|m| m.name == name).collect(),
+                None => config.models.iter().collect(),
+            };
+            if targets.is_empty() {
+                anyhow::bail!(
+                    "no models configured - run 'klava providers add'{}",
+                    name.map(|n| format!(" (no model named '{n}')"))
+                        .unwrap_or_default()
+                );
             }
-            #[cfg(feature = "qwen-code")]
-            {
-                handle_qwen_status().await?;
-            }
-            #[cfg(not(feature = "qwen-code"))]
-            {
-                anyhow::bail!("qwen-code feature is not enabled");
-            }
-        }
-        Some("set") | None => {
-            // Set provider or show current
-            if let Some(provider_name) = provider_name {
-                // Set the provider
-                let current_config = config::Config::load()?;
-                let providers = current_config.providers;
-
-                // Find matching provider
-                let selected_provider = providers
-                    .iter()
-                    .find(|p| {
-                        p.name == provider_name //|| p.aliases().contains(&provider_name.as_str())
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Invalid provider: '{}'. Available providers: {}",
-                            provider_name,
-                            providers
-                                .iter()
-                                .map(|p| p.name.clone())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    })?;
-
-                save_provider_config(selected_provider)?;
-                handle_provider_switch(&selected_provider.name).await?;
-            } else {
-                // Show current and prompt to choose
-                let current_config = config::Config::load()?;
-                let providers = current_config.providers;
-
-                println!("Current provider: {}", current_config.active_provider);
-                println!();
-                println!("Available providers:");
-                for provider in &providers {
-                    let marker = if provider.name == current_config.active_provider {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    println!(" {} {} - {}", marker, provider.name, provider.description());
+            let client = build_http_client()?;
+            for model in targets {
+                match klava::diagnostic::test_provider(&client, &config, model, None).await {
+                    Ok(result) => {
+                        result.print_summary();
+                        all_passed &= result.success;
+                    }
+                    Err(e) => {
+                        println!("  ✗ {}: {}", model.name, e);
+                        all_passed = false;
+                    }
                 }
-                println!();
-
-                use inquire::Select;
-                let options: Vec<String> = providers
-                    .iter()
-                    .map(|p| {
-                        let marker = if p.name == current_config.active_provider {
-                            "*"
-                        } else {
-                            " "
-                        };
-                        format!("{} {} - {}", marker, p.name, p.description())
-                    })
-                    .collect();
-
-                let selected = Select::new("Select provider:", options)
-                    .prompt()
-                    .map_err(|e| anyhow::anyhow!("Failed to select provider: {}", e))?;
-
-                // Parse back the selected provider (extract name from selection)
-                let selected_provider = providers
-                    .iter()
-                    .find(|p| selected.contains(&p.name))
-                    .ok_or_else(|| anyhow::anyhow!("Failed to determine selected provider"))?;
-
-                save_provider_config(selected_provider)?;
-                handle_provider_switch(&selected_provider.name).await?;
+            }
+            if !all_passed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Some("remove") | Some("rm") => {
+            args.next();
+            let name = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: klava providers remove <model>"))?;
+            let mut config = config::Config::load()?;
+            let removed = klava::providers::remove_provider(&mut config, &name)?;
+            config.save()?;
+            println!(
+                "✓ removed {removed} entr{} named '{name}'",
+                if removed == 1 { "y" } else { "ies" }
+            );
+            if config.models.is_empty() {
+                println!("  no models left - run 'klava providers add'");
+            }
+            Ok(())
+        }
+        Some("set") => {
+            args.next();
+            match args.next() {
+                Some(name) => set_default_model(&name),
+                None => pick_default_model(config::Config::load()?),
+            }
+        }
+        Some("login") | Some("logout") | Some("status") | Some("whoami") => {
+            let subcommand = args.next().unwrap_or_default();
+            let force = has_flag(&args, "force");
+            match subcommand.as_str() {
+                "login" => handle_klava_login(force).await,
+                "logout" => handle_klava_logout(force).await,
+                "status" => handle_klava_status().await,
+                _ => handle_klava_whoami().await,
+            }
+        }
+        Some(id) if klava::providers::providers().iter().any(|k| k.id == id) => {
+            // `klava providers klava [login|status|...]`
+            let id = args.next().unwrap();
+            match args.next().as_deref() {
+                Some("login") => match id.as_str() {
+                    "klava" => handle_klava_login(has_flag(&args, "force")).await,
+                    #[cfg(feature = "qwen-code")]
+                    "qwen-code" => handle_qwen_login(has_flag(&args, "force")).await,
+                    #[cfg(not(feature = "qwen-code"))]
+                    "qwen-code" => qwen_not_built(),
+                    _ => add_provider(Some(&id)).await,
+                },
+                Some("logout") => match id.as_str() {
+                    "klava" => handle_klava_logout(has_flag(&args, "force")).await,
+                    #[cfg(feature = "qwen-code")]
+                    "qwen-code" => handle_qwen_logout(has_flag(&args, "force")).await,
+                    #[cfg(not(feature = "qwen-code"))]
+                    "qwen-code" => qwen_not_built(),
+                    _ => anyhow::bail!("'{id}' has no login to clear"),
+                },
+                Some("status") => handle_provider_status(&id).await,
+                Some(other) => anyhow::bail!(
+                    "unknown subcommand '{other}' for '{id}'. Use: login, logout, status, or no subcommand to add it"
+                ),
+                None => add_provider(Some(&id)).await,
             }
         }
         Some(other) => anyhow::bail!(
-            "Unknown subcommand: '{}'. Use: login, logout, status, or omit to set provider",
-            other
+            "unknown subcommand '{other}'. Use: klava providers [add [provider] | list | check [model] | remove <model> | set [model]]"
         ),
+        None => {
+            let config = config::Config::load()?;
+            list_models(&config);
+            if config.models.is_empty() && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                use inquire::Confirm;
+                let add = Confirm::new("No models configured. Add a provider now?")
+                    .with_default(true)
+                    .prompt()
+                    .unwrap_or(false);
+                if add {
+                    add_provider(None).await?;
+                }
+            }
+            Ok(())
+        }
     }
+}
 
+/// Whether `--<name>` (or its short form) is among the remaining arguments.
+fn has_flag(args: &std::iter::Peekable<std::vec::IntoIter<String>>, name: &str) -> bool {
+    args.clone()
+        .any(|a| a == format!("--{name}") || (name == "force" && a == "-f"))
+}
+
+/// Run the onboarding wizard and report what was written.
+async fn add_provider(id: Option<&str>) -> anyhow::Result<()> {
+    let mut config = config::Config::load()?;
+    klava::providers::add_provider_interactive(&mut config, id).await?;
+    print_next_steps(&config);
     Ok(())
 }
 
-fn save_provider_config(provider: &klava::providers::Config) -> anyhow::Result<()> {
-    let current_config = config::Config::load()?;
-    let mut updated_config = current_config.clone();
-    updated_config.active_provider = provider.name.to_string();
+/// `klava providers list` — the configured model entries.
+fn list_models(config: &config::Config) {
+    let names = config.model_names();
+    if names.is_empty() {
+        println!("No models configured.");
+        println!();
+        println!(
+            "Run 'klava providers add' to set up Klava, OpenRouter, Cloudflare, Qwen or a custom endpoint."
+        );
+        return;
+    }
 
-    // Save the updated config
-    updated_config.save()?;
-    println!("✓ Provider changed to: {}", provider.name);
+    println!("Models (routing: {}):", config.routing);
+    for name in &names {
+        let mut marks = Vec::new();
+        if config.completion_model.as_deref() == Some(name.as_str()) {
+            marks.push("completion");
+        }
+        if config.reasoning_model.as_deref() == Some(name.as_str()) {
+            marks.push("reasoning");
+        }
+        if config.resolve_decide_model() == *name {
+            marks.push("decide");
+        }
+        let suffix = if marks.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", marks.join(", "))
+        };
+        println!();
+        println!("  {name}{suffix}");
+        for model in config.pool(name) {
+            let key = match (&model.api_key, &model.api_key_name) {
+                (Some(_), _) => "key: config".to_string(),
+                (_, Some(env)) => format!("key: ${env}"),
+                _ => "key: login".to_string(),
+            };
+            let jigor = model
+                .jigor_backend()
+                .map(|b| format!(", decide via {}", b.as_str()))
+                .unwrap_or_default();
+            println!(
+                "    {} · {}{}",
+                model
+                    .chat_completions_url()
+                    .unwrap_or_else(|| "no URL".to_string()),
+                key,
+                jigor
+            );
+        }
+    }
+
     println!();
+    println!(
+        "Web search: {}",
+        if config.websearch_available() {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!("Decide model: {}", config.resolve_decide_model());
+}
+
+/// Print the follow-up commands after setup.
+fn print_next_steps(config: &config::Config) {
+    println!();
+    println!("Next steps:");
+    println!("  klava providers check      — verify every model answers");
+    println!("  klava providers list       — see what is configured");
+    if let Some(completion) = &config.completion_model {
+        println!("  klava launch               — start an agent on '{completion}'");
+    }
+}
+
+/// `klava providers set <model>` — make a model the default.
+fn set_default_model(name: &str) -> anyhow::Result<()> {
+    let mut config = config::Config::load()?;
+    if config.pool(name).is_empty() {
+        anyhow::bail!(
+            "no model named '{name}'. Configured: {}",
+            config.model_names().join(", ")
+        );
+    }
+    klava::providers::set_defaults(&mut config, Some(name), Some(name));
+    config.save()?;
+    println!("✓ default model set to '{name}'");
     Ok(())
 }
 
-/// Handle qwen provider switch: check auth and prompt to login if needed
-async fn handle_qwen_provider_switch(provider_name: &str) -> anyhow::Result<()> {
-    if provider_name != "qwen" {
-        return Ok(());
+/// Interactive default picker (the `set` without arguments path).
+fn pick_default_model(mut config: config::Config) -> anyhow::Result<()> {
+    use inquire::Select;
+
+    let names = config.model_names();
+    if names.is_empty() {
+        anyhow::bail!("no models configured - run 'klava providers add'");
     }
-
-    #[cfg(feature = "qwen-code")]
-    {
-        use klava::providers::setup_qwen;
-
-        // Load config, call setup_qwen (it doesn't modify config but needs the param)
-        let mut config = config::Config::load()?;
-        setup_qwen(&mut config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Qwen authentication failed: {}", e))?;
-    }
-
+    let selected = Select::new("Default (completion) model:", names)
+        .prompt()
+        .map_err(|e| anyhow::anyhow!("failed to select model: {e}"))?;
+    klava::providers::set_defaults(&mut config, Some(&selected), Some(&selected));
+    config.save()?;
+    println!("✓ default model set to '{selected}'");
     Ok(())
 }
 
-/// Dispatch the "set provider" post-switch hook to the right provider.
-async fn handle_provider_switch(provider_name: &str) -> anyhow::Result<()> {
-    if provider_name == "klava" {
-        return handle_klava_login(false).await;
-    }
-    handle_qwen_provider_switch(provider_name).await
-}
-
-/// Handle qwen provider switch (no-op when feature not enabled)
-#[cfg(not(feature = "qwen-code"))]
-async fn handle_qwen_provider_switch(_provider_name: &str) -> anyhow::Result<()> {
-    Ok(())
-}
-
-/// Parse provider arguments
-fn parse_provider_args(
-    args: Vec<String>,
-) -> anyhow::Result<(Option<String>, Option<String>, Vec<String>)> {
-    let mut provider_name = None;
-    let mut subcommand = None;
-    let mut flags = Vec::new();
-
-    // Handle: klava providers
-    // Handle: klava providers qwen
-    // Handle: klava providers set qwen
-    // Handle: klava providers qwen login
-
-    if args.is_empty() {
-        return Ok((None, None, flags));
-    }
-
-    let mut iter = args.iter();
-    let first = iter.next().unwrap();
-
-    // Check if first arg is "set"
-    if first == "set" {
-        // klava providers set <provider>
-        if let Some(name) = iter.next() {
-            provider_name = Some(name.clone());
-        }
-        subcommand = Some("set".to_string());
-    } else {
-        // Could be: klava providers <provider> [subcommand] or klava providers qwen login
-        let potential_provider = first.clone();
-
-        provider_name = Some(potential_provider);
-
-        // Check for subcommand
-        if let Some(next) = iter.next() {
-            // Check if it's a subcommand or flag
-            if next.starts_with('-') {
-                flags.push(next.clone());
-            } else {
-                subcommand = Some(next.clone());
-            }
-        }
-
-        // Collect remaining flags
-        for arg in iter {
-            if arg.starts_with('-') {
-                flags.push(arg.clone());
-            }
+/// `klava providers <klava|qwen-code> status`.
+async fn handle_provider_status(id: &str) -> anyhow::Result<()> {
+    match id {
+        "klava" => handle_klava_status().await,
+        #[cfg(feature = "qwen-code")]
+        "qwen-code" => handle_qwen_status().await,
+        #[cfg(not(feature = "qwen-code"))]
+        "qwen-code" => qwen_not_built(),
+        _ => {
+            let config = config::Config::load()?;
+            let count = config
+                .models
+                .iter()
+                .filter(|m| m.provider_type.as_str() == id)
+                .count();
+            println!(
+                "{id}: {count} model entr{} configured",
+                if count == 1 { "y" } else { "ies" }
+            );
+            Ok(())
         }
     }
-
-    Ok((provider_name, subcommand, flags))
 }
 
 #[cfg(feature = "qwen-code")]
@@ -816,14 +879,15 @@ async fn handle_qwen_login(force: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Check if provider is set to qwen
+    // Warn when no Qwen model is configured: the login would not be used.
     let config = config::Config::load()?;
-    if config.active_provider != "qwen" {
-        println!(
-            "⚠️  Warning: Current provider is set to '{}', not 'qwen'",
-            config.active_provider
-        );
-        println!("You can switch providers with: klava providers qwen");
+    let has_qwen = config
+        .models
+        .iter()
+        .any(|m| m.provider_type == klava::providers::Type::QwenCode);
+    if !has_qwen {
+        println!("⚠️  No Qwen Code model is configured.");
+        println!("Add one with: klava providers add qwen-code");
         println!();
     }
 
@@ -861,7 +925,12 @@ async fn handle_qwen_status() -> anyhow::Result<()> {
     let config = config::Config::load()?;
 
     println!("Provider status:");
-    println!("  Current provider: {}", config.active_provider);
+    println!(
+        "  Default model: {}",
+        config
+            .resolve_completion_model()
+            .unwrap_or_else(|| "none".to_string())
+    );
     println!();
 
     println!("Qwen Code authentication:");
@@ -995,30 +1064,32 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
     };
     let mut config = config::Config::load()?;
 
-    let entry = config.providers.iter_mut().find(|p| p.name == "klava");
-    if let Some(provider) = entry {
-        provider.provider_type = Type::Klava;
-        provider.base_url = Some(format!("{}/api", auth.base_url()));
-        if let Some(m) = &model {
-            provider.reasoning_model = Some(m.clone());
-            provider.completion_model = Some(m.clone());
-        }
-    } else {
-        config.providers.push(klava::providers::Config {
-            name: "klava".to_string(),
+    // Write the chosen model as a self-contained entry. Re-running the login
+    // refreshes the entry in place; models from other providers are untouched.
+    let base_url = format!("{}/api", auth.base_url());
+    if let Some(model) = &model {
+        let entry = klava::providers::Model {
+            name: model.clone(),
             provider_type: Type::Klava,
-            base_url: Some(format!("{}/api", auth.base_url())),
-            chat_completions_path: None,
-            api_key: None,
-            api_key_name: None,
-            reasoning_model: model.clone(),
-            completion_model: model,
-        });
+            base_url: Some(base_url.clone()),
+            ..klava::providers::Model::default()
+        };
+        match config
+            .models
+            .iter_mut()
+            .find(|m| m.provider_type == Type::Klava && m.name == entry.name)
+        {
+            Some(existing) => existing.base_url = entry.base_url,
+            None => config.models.push(entry),
+        }
+        klava::providers::set_defaults(&mut config, Some(model), Some(model));
     }
-    config.active_provider = "klava".to_string();
     config.save()?;
 
-    println!("✓ Provider 'klava' configured and set as active.");
+    match &model {
+        Some(model) => println!("✓ Klava model '{model}' configured and set as the default."),
+        None => println!("✓ Klava signed in."),
+    }
     if !credentials.email.is_empty() {
         println!("  Account: {}", credentials.email);
     }
@@ -1033,8 +1104,9 @@ async fn handle_klava_login(force: bool) -> anyhow::Result<()> {
     }
     println!();
     println!("Next steps:");
-    println!("  klava whoami     — account + balance");
-    println!("  klava launch pi  — start an agent on the klava provider");
+    println!("  klava whoami        — account + balance");
+    println!("  klava providers list");
+    println!("  klava launch pi     — start an agent on the klava model");
     Ok(())
 }
 
@@ -1052,7 +1124,7 @@ async fn handle_klava_logout(force: bool) -> anyhow::Result<()> {
 
     if !force {
         let confirmed =
-            Confirm::new("Revoke the KLava API key on the server and sign out locally?")
+            Confirm::new("Revoke the Klava API key on the server and sign out locally?")
                 .with_default(false)
                 .prompt()
                 .map_err(|e| anyhow::anyhow!("Failed to get confirmation: {}", e))?;

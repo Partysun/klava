@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`[[models]]` replaces `[[providers]]` + `active_provider`.** Every model is one self-contained entry (`name`, `type`, `base_url`, `api_key`/`api_key_name`, optional `chat_completions_path` and `upstream_model`), so a model name — not a provider — is the unit of routing. `active_provider` is replaced by the top-level `completion_model` and `reasoning_model`, which name entries.
+- **Per-request routing.** A request whose body names a configured model goes to that model; an unknown or placeholder name (e.g. an agent still sending `klava`) falls back to the configured completion/reasoning model. `reasoning` requests are those with `reasoning_effort` above `none` (OpenAI), `thinking.type` enabled/adaptive (Anthropic) or `reasoning.effort` above `minimal` (Responses).
+- **Duplicate names form a pool**, picked per request by the new `routing` key: `shuffle` (default, random), `round_robin`, or `first` (declaration order = failover priority).
+- **Real model names in harnesses.** The proxy serves `GET /v1/models`, and the setup for opencode, pi and codex writes the configured model names instead of the synthetic `klava`, so the model picker and the model label show what actually answers.
+- **`klava providers` is the onboarding wizard.** `add [klava|openrouter|cloudflare|qwen-code|custom]` logs in, lists the provider catalog, checks the connection with a tiny completion, lets you pick models with a multi-select, then asks for the default completion/reasoning/decide model and writes the entries — storing keys in an env var by default. Also `list`, `check [model]`, `remove <model>`, `set [model]`, and the existing `klava login|logout|status` / `qwen-code login|logout|status`.
+- Cloudflare Workers AI is a first-class wizard option: it collects the account id, lists text-generation models through `/ai/models/search` and stores the account-scoped `…/accounts/<id>/ai/v1` base URL.
+- **jigor backend auto-detection.** The decide backend is derived from the `decide_model` entry's type and URL — `type = "klava"` → klava gateway, `openrouter.ai` → OpenRouter, `api.cloudflare.com` → Workers AI, anything else → klava wire — with credentials taken from the entry and falling back to the saved `klava login`. The optional `jigor` field exists only for self-hosted gateways.
+- An `openai-compatible` entry with neither `api_key` nor `api_key_name` is treated as an unauthenticated endpoint (local Ollama/llama.cpp) and sends no `Authorization` header; naming an `api_key_name` whose variable is empty is reported as an error.
+- `KLAVA_CONFIG_FILE=/path/config.toml` pins the config file, so a second profile or a hermetic test run never touches `~/.config/klava/config.toml`.
+
+### Changed
+
+- Config migration is automatic: a config with `[[providers]]` is rewritten as `[[models]]` on load, after copying the original to `config.toml.bak`. Every distinct model id a provider named becomes its own entry; the previously active provider supplies the top-level defaults.
+- The decide model must name exactly one entry: a duplicate name is a startup error, unlike regular models, because a classifier has to be deterministic. With no entry, the built-in klava gateway is used.
+- Web search is gated on the *search model's* type (`type = "klava"` plus a key or saved login), not on a global active provider; `search_model` defaults to the completion model. When the name is a mixed pool, search always uses the klava entry instead of the one `routing` picks for chat.
+- Extensions' `nested_call` resolves its connection from the model entry it names (falling back to the completion model); the old `provider` field is gone, since nothing shipped depending on it.
+- `klava check [--provider <model>]` iterates model entries; `klava launch --provider <model>` selects the active model for that launch.
+
+### Removed
+
+- `enable_pii` and `[extensions] disable_pii`. PII redaction has moved out of the core into the `klava-pii-guardrail` extension, which is configured by its own settings (`enabled`, `entities`, `operators`), so the host no longer needs a switch of its own. Both keys are now ignored (and dropped on the next save); to turn PII filtering off, disable the extension instead.
+
 ## [0.2.24] - 2026-10-19
 
 ### Added

@@ -33,14 +33,31 @@ The `launch` command starts the proxy server and launches an AI code agent with 
 ```bash
 klava launch
 klava launch claude
-klava launch claude --provider qwen
+klava launch claude --provider ~deepseek/deepseek-flash-latest
 klava launch opencode
 klava launch pi
 ```
 
-Notice: When launching opencode, you need to manually select the "klava" model using the model command in opencode after it starts.
+The first run has no models yet: `klava launch` (or `klava providers add`)
+opens the onboarding wizard, which logs in to a provider, lists its models,
+checks the connection and writes the ones you pick.
 
-When launching pi, the klava provider is used by default with the active provider's model, so no manual selection is needed.
+`--provider <model>` uses that configured model for this launch.
+
+Harnesses see the **real model names** (`~deepseek/deepseek-flash-latest`,
+`glm-5.1`, …) — the proxy advertises them on `GET /v1/models` and each agent's
+config lists them, so the model picker and the model label in the UI show what
+actually answers. A request picks the model named in its body; a name that is
+not configured falls back to the configured defaults.
+
+When several `[[models]]` entries share a name they form a pool. Pick how it is
+used with `routing`:
+
+| `routing`          | Behaviour                                                          |
+| ------------------ | ------------------------------------------------------------------ |
+| `"shuffle"` (default) | random entry per request — spreads load/cost across endpoints   |
+| `"round_robin"`    | cycles through the pool in declaration order                       |
+| `"first"`          | always the first entry (declaration order = failover priority)     |
 
 #### Managed background service (Linux/systemd, macOS/launchd)
 
@@ -95,41 +112,57 @@ Platform-specific config file locations:
 - **Linux and macOS**: `~/.config/klava/config.toml`
 - **Windows**: `%APPDATA%\klava\config\config.toml`
 
+Set `KLAVA_CONFIG_FILE=/path/to/config.toml` to use another file (a second
+profile, or a throwaway config for tests and CI).
+
 #### Config file
+
+```bash
+klava providers add       # onboarding wizard: Klava, OpenRouter, Cloudflare, Qwen, custom
+klava providers list      # what is configured, which model is the default
+klava providers check     # one tiny completion per model
+klava providers set       # choose the default model
+klava providers remove m  # drop a model (all entries with that name)
+```
+
+The wizard writes self-contained `[[models]]` entries — each carries its own
+connection (type, base URL, key), so the same name on two endpoints is a pool
+and no global "active provider" switch exists:
 
 ```toml
 port = 48017
 verbose = false
-active_provider = "qwen"
+completion_model = "~deepseek/deepseek-flash-latest"
+reasoning_model = "~deepseek/deepseek-flash-latest"
+routing = "shuffle"                      # shuffle | round_robin | first
+decide_model = "typesafe/jev-1.13"       # one entry; backend auto-detected
 
-[[providers]]
-name = "qwen"
-type = "qwen-code"
+[[models]]
+name = "~deepseek/deepseek-flash-latest"
+type = "klava"                           # klava login, no key in the file
 
-[[providers]]
-name = "cloudru"
+[[models]]
+name = "~deepseek/deepseek-flash-latest"  # same name = pool with the entry above
+type = "openai-compatible"
+base_url = "https://openrouter.ai/api"
+api_key_name = "OPENROUTER_API_KEY"
+
+[[models]]
+name = "glm-5.1"
 type = "openai-compatible"
 base_url = "https://foundation-models.api.cloud.ru"
 api_key_name = "CLOUD_RU_KEY"
-reasoning_model = "zai-org/GLM-4.7"
-completion_model = "zai-org/GLM-4.7"
 
-[[providers]]
-name = "immerse"
+[[models]]
+name = "deepseek-v4-flash"
 type = "openai-compatible"
 base_url = "https://chat.immers.cloud"
 api_key_name = "IMMERSE_TOKEN"
 chat_completions_path = "/v1/endpoints/generate/chat/completions"
-reasoning_model = "deepseek-v4-flash-0731"
-completion_model = "deepseek-v4-flash-0731"
 
-[[providers]]
-name = "openrouter"
-type = "openai-compatible"
-base_url = "https://openrouter.ai/api"
-api_key_name = "OPENROUTER_API_KEY"
-reasoning_model = "z-ai/glm-5.1"
-completion_model = "z-ai/glm-5.1"
+[[models]]
+name = "qwen3-coder-plus"
+type = "qwen-code"
 ```
 
 Notice: base_url should not include /v1 at the end!
@@ -141,9 +174,56 @@ path (e.g. `…/v1/endpoints/generate/chat/completions`), set
 
 Notice: You can use api_key_name if you have the api_key in your environment,
 if you want you can set api_key in the toml file with the api_key variable.
+For `type = "klava"` no key is needed: the wizard uses `klava login` and klava
+reads the saved session.
 
-Notice: The type can be openai-compatible or qwen-code.
+Notice: an entry with neither `api_key` nor `api_key_name` sends no
+`Authorization` header — that is how a local server (Ollama, llama.cpp) is
+configured. Naming an `api_key_name` whose variable is empty is an error.
+
+Notice: `upstream_model` overrides the id sent upstream when the public name
+differs (e.g. a friendly alias). `name` is what agents send and see.
+
+Notice: klava model names may start with `~`, which the shell expands. Quote
+them on the command line: `klava providers set '~deepseek/deepseek-flash-latest'`.
+
+Notice: The type can be `openai-compatible`, `klava` or `qwen-code`.
 qwen-code uses an authentication flow involving reverse engineering of the Qwen Code application. You can use 1000 free requests per day of the great large model, but with risks due to this being an unofficial implementation of qwen-code.
+
+#### Cloudflare Workers AI
+
+Cloudflare has no OpenAI-style `/v1/models` listing, so the wizard asks for the
+account id and stores the account-scoped endpoint:
+
+```toml
+[[models]]
+name = "@cf/meta/llama-4-scout-17b-16e-instruct"
+type = "openai-compatible"
+base_url = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1"
+api_key_name = "CLOUDFLARE_AUTH_TOKEN"
+```
+
+#### Decide model (System One / jigor)
+
+`decide_model` names exactly one `[[models]]` entry. Every classifier call
+klava makes — the web-search tuning and any extension that asks for a `decide` —
+uses it. The jigor backend is **detected from that entry**, so there is no
+backend switch to set:
+
+| Entry type / URL                                        | Backend                |
+| ------------------------------------------------------- | ---------------------- |
+| `type = "klava"` (the default)                          | klava gateway          |
+| host `openrouter.ai`                                    | OpenRouter             |
+| host `api.cloudflare.com` (`…/accounts/<id>/ai/…`)      | Cloudflare Workers AI  |
+| any other OpenAI-compatible gateway                     | klava wire (default)   |
+
+Credentials come from the entry (`api_key` / `api_key_name`), falling back to
+the saved `klava login`. Without a configured entry the built-in klava gateway
+is used, so `decide` works out of the box after `klava login`. Set `jigor =`
+on the entry only for a self-hosted gateway that cannot be recognised.
+
+Because a classifier must be deterministic, a `decide_model` name shared by
+several entries is rejected with an error — unlike regular models, which pool.
 
 ### Manual Claude Execution
 

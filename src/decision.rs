@@ -11,7 +11,10 @@
 //! path.
 
 use crate::config::Config;
-use crate::ext_api::{DecideQuestion, DecideRequest, DecideResult};
+#[cfg(feature = "decide")]
+use crate::ext_api::DecideQuestion;
+use crate::ext_api::{DecideRequest, DecideResult};
+#[cfg(feature = "decide")]
 use std::collections::HashMap;
 
 /// Model used when the config leaves `decide_model` empty.
@@ -24,14 +27,19 @@ pub const DECIDE_TIMEOUT_SECS: u32 = 8;
 /// into an unbounded classifier bill.
 pub const MAX_QUESTIONS: usize = 16;
 
-/// Klava API key for a decision call.
+/// Key for a decision call.
 ///
-/// The gateway key is the same one the `klava` provider uses: the env var
-/// named by the provider's `api_key_name` (e.g. `KLAVA_API_KEY`), the
-/// provider's `api_key` field, or the saved `klava login` credentials.
+/// Comes from the `decide_model` entry (its `api_key`, or the env var named by
+/// `api_key_name`), then `KLAVA_API_KEY`, then the saved `klava login`
+/// credentials. The backend itself is detected from the entry.
+#[cfg(feature = "decide")]
 pub(crate) fn api_key(config: &Config) -> Option<String> {
-    config
-        .resolve_api_key()
+    let from_entry = config
+        .decide_entry()
+        .ok()
+        .flatten()
+        .and_then(|entry| entry.api_key());
+    from_entry
         .or_else(|| std::env::var("KLAVA_API_KEY").ok())
         .or_else(|| {
             #[cfg(feature = "klava")]
@@ -45,6 +53,163 @@ pub(crate) fn api_key(config: &Config) -> Option<String> {
             }
         })
         .filter(|k| !k.is_empty())
+}
+
+/// The jigor gateway that answers `decide` calls for a model.
+#[cfg(feature = "decide")]
+#[derive(Debug)]
+enum Backend {
+    Klava(jigor::KlavaBackend),
+    OpenRouter(jigor::OpenRouterBackend),
+    Cloudflare(jigor::CloudflareBackend),
+}
+
+/// Turn a chat-completions base URL into the matching decisions endpoint.
+///
+/// jigor wants the full decisions URL; a `[[models]]` entry only names the
+/// base its chat requests go to, so the path is appended here. An explicit
+/// `…/decisions` URL is left untouched.
+#[cfg(feature = "decide")]
+fn decisions_url(base: &str, backend: crate::providers::JigorBackend) -> String {
+    use crate::providers::JigorBackend;
+
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/decisions") {
+        return base.to_string();
+    }
+    match backend {
+        JigorBackend::Openrouter => format!("{base}/alpha/decisions"),
+        // Klava and self-hosted klava-wire gateways.
+        JigorBackend::Klava | JigorBackend::Cloudflare => {
+            if base.contains("/client/v4/accounts/") {
+                // Cloudflare is handled by the caller (it needs the account id).
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{base}/alpha/decisions")
+            } else {
+                format!("{base}/v1/alpha/decisions")
+            }
+        }
+    }
+}
+
+/// Build the jigor backend for the configured decide model.
+///
+/// Without a `decide_model` entry the klava gateway is used with the saved
+/// login — the zero-config default. With one, its type and base URL select
+/// the backend automatically (klava / OpenRouter / Cloudflare Workers AI).
+#[cfg(feature = "decide")]
+fn build_backend(config: &Config, model: &str) -> Result<Backend, String> {
+    use crate::providers::JigorBackend;
+    #[cfg(feature = "qwen-code")]
+    use crate::providers::Type;
+
+    let entry = config
+        .decide_entry()
+        .map_err(|e| format!("decide model is ambiguous: {e}"))?;
+
+    let Some(entry) = entry else {
+        // No entry: the klava gateway with the saved login.
+        let key = api_key(config)
+            .ok_or_else(|| "no klava key available for the decide model".to_string())?;
+        let mut backend = jigor::KlavaBackend::for_model(model);
+        backend.api_key = key;
+        backend.timeout_secs = DECIDE_TIMEOUT_SECS;
+        return Ok(Backend::Klava(backend));
+    };
+
+    #[cfg(feature = "qwen-code")]
+    if entry.provider_type == Type::QwenCode {
+        return Err(format!(
+            "decide model '{}' is a qwen-code model, which cannot answer decisions; \
+             point decide_model at a klava, OpenRouter or Cloudflare model",
+            entry.name
+        ));
+    }
+
+    let upstream = entry.upstream_model();
+    let backend_kind = entry.jigor_backend().unwrap_or(JigorBackend::Klava);
+    let base = entry.base_url.clone();
+    let entry_key = entry.api_key();
+
+    match backend_kind {
+        JigorBackend::Klava => {
+            let mut backend = jigor::KlavaBackend::for_model(&upstream);
+            if let Some(base) = base {
+                backend.base_url = decisions_url(&base, backend_kind);
+            }
+            backend.api_key = entry_key
+                .or_else(|| api_key(config))
+                .ok_or_else(|| format!("no key available for decide model '{}'", entry.name))?;
+            backend.timeout_secs = DECIDE_TIMEOUT_SECS;
+            Ok(Backend::Klava(backend))
+        }
+        JigorBackend::Openrouter => {
+            let mut backend = jigor::OpenRouterBackend::for_model(&upstream);
+            if let Some(base) = base {
+                backend.base_url = decisions_url(&base, backend_kind);
+            }
+            if let Some(key) = entry_key {
+                backend.api_key = key;
+                backend.api_key_env = entry.api_key_name.clone().unwrap_or_default();
+            }
+            backend.timeout_secs = DECIDE_TIMEOUT_SECS;
+            if backend.api_key.is_empty() {
+                return Err(format!(
+                    "no OpenRouter key available for decide model '{}'",
+                    entry.name
+                ));
+            }
+            Ok(Backend::OpenRouter(backend))
+        }
+        JigorBackend::Cloudflare => {
+            let mut backend = jigor::CloudflareBackend::for_model(&upstream);
+            match entry.cloudflare_account_id() {
+                Some(account) => {
+                    backend.account_id = account.clone();
+                    backend.base_url =
+                        format!("https://api.cloudflare.com/client/v4/accounts/{account}/ai/run");
+                }
+                None => {
+                    return Err(format!(
+                        "decide model '{}' has a Cloudflare-type URL but no \"/accounts/<id>/ai/\" \
+                         segment; set base_url to the account's Workers AI endpoint",
+                        entry.name
+                    ));
+                }
+            }
+            if let Some(key) = entry_key {
+                backend.api_token = key;
+                backend.token_env = entry.api_key_name.clone().unwrap_or_default();
+            }
+            backend.timeout_secs = DECIDE_TIMEOUT_SECS;
+            if backend.api_token.is_empty() {
+                return Err("no Cloudflare API token available for the decide model".to_string());
+            }
+            Ok(Backend::Cloudflare(backend))
+        }
+    }
+}
+
+/// One blocking classification call over the configured decide model.
+///
+/// Shared by the extension `decide` capability and the web-search tuner so
+/// both always agree on the model, backend and credentials. Callers run this
+/// under [`tokio::task::spawn_blocking`] (jigor is blocking).
+#[cfg(feature = "decide")]
+pub(crate) fn ask_blocking(
+    config: &Config,
+    model: &str,
+    state: &serde_json::Value,
+    questions: &[jigor::Question],
+) -> Result<jigor::Asks, String> {
+    let backend = build_backend(config, model)?;
+    let result = match backend {
+        Backend::Klava(b) => b.ask(state, questions, None),
+        Backend::OpenRouter(b) => b.ask(state, questions, None),
+        Backend::Cloudflare(b) => b.ask(state, questions, None),
+    };
+    result.map_err(|e| e.to_string())
 }
 
 /// Validate an extension's decide request before spending on it.
@@ -106,6 +271,7 @@ pub fn validate(request: &DecideRequest) -> Result<(), String> {
 }
 
 /// Which question decides `approve`: the named one, else the first `noul`.
+#[cfg(feature = "decide")]
 fn decide_question_id(request: &DecideRequest) -> Option<&str> {
     match &request.approve_question {
         Some(id) => Some(id.as_str()),
@@ -117,6 +283,12 @@ fn decide_question_id(request: &DecideRequest) -> Option<&str> {
     }
 }
 
+/// Reject a decide model that cannot answer, before spending on it.
+#[cfg(feature = "decide")]
+fn validate_decide_model(config: &Config) -> Result<(), String> {
+    build_backend(config, &config.resolve_decide_model()).map(|_| ())
+}
+
 /// Run the host's decide model over an extension-supplied request.
 ///
 /// Errors are returned as `Err` (never a silent "yes"), so the host can leave
@@ -124,14 +296,12 @@ fn decide_question_id(request: &DecideRequest) -> Option<&str> {
 /// result when the call actually succeeded.
 #[cfg(feature = "decide")]
 pub async fn ask(config: &Config, request: &DecideRequest) -> Result<DecideResult, String> {
-    use jigor::{Answer, KlavaBackend, Question};
+    use jigor::{Answer, Question};
 
     validate(request)?;
 
     let model = config.resolve_decide_model();
-    let Some(key) = api_key(config) else {
-        return Err("no klava key available for the decide model".to_string());
-    };
+    validate_decide_model(config)?;
 
     let questions: Vec<Question> = request
         .questions
@@ -139,15 +309,13 @@ pub async fn ask(config: &Config, request: &DecideRequest) -> Result<DecideResul
         .map(question_to_jigor)
         .collect::<Result<_, _>>()?;
     let state = request.state.clone();
+    let config = config.clone();
     let model_for_call = model.clone();
     let threshold = request.threshold.clamp(0.0, 1.0);
     let approve_id = decide_question_id(request).map(str::to_string);
 
     let asks = tokio::task::spawn_blocking(move || {
-        let mut backend = KlavaBackend::for_model(&model_for_call);
-        backend.api_key = key;
-        backend.timeout_secs = DECIDE_TIMEOUT_SECS;
-        backend.ask(&state, &questions, None)
+        ask_blocking(&config, &model_for_call, &state, &questions)
     })
     .await
     .map_err(|e| format!("decide task failed: {e}"))?
@@ -236,6 +404,7 @@ fn string_options(question: &DecideQuestion) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ext_api::DecideQuestion;
     use serde_json::json;
 
     fn request() -> DecideRequest {
@@ -285,12 +454,122 @@ mod tests {
         assert!(validate(&req).is_err());
     }
 
+    #[cfg(feature = "decide")]
+    #[test]
+    fn decisions_url_appends_the_backend_path() {
+        use crate::providers::JigorBackend;
+
+        assert_eq!(
+            decisions_url("https://klava.zatsepin.dev/api", JigorBackend::Klava),
+            "https://klava.zatsepin.dev/api/v1/alpha/decisions"
+        );
+        assert_eq!(
+            decisions_url("https://klava.zatsepin.dev/api/v1/", JigorBackend::Klava),
+            "https://klava.zatsepin.dev/api/v1/alpha/decisions"
+        );
+        assert_eq!(
+            decisions_url("https://openrouter.ai/api", JigorBackend::Openrouter),
+            "https://openrouter.ai/api/alpha/decisions"
+        );
+        // An explicit endpoint is never rewritten.
+        assert_eq!(
+            decisions_url("https://gw.example/alpha/decisions", JigorBackend::Klava),
+            "https://gw.example/alpha/decisions"
+        );
+    }
+
+    #[cfg(feature = "decide")]
+    fn entry(name: &str, base: Option<&str>) -> crate::providers::Model {
+        crate::providers::Model {
+            name: name.to_string(),
+            base_url: base.map(str::to_string),
+            api_key: Some("k".to_string()),
+            ..crate::providers::Model::default()
+        }
+    }
+
+    #[cfg(feature = "decide")]
+    #[test]
+    fn a_decide_entry_selects_its_backend_from_the_url() {
+        use crate::providers::Model;
+
+        let config = Config {
+            decide_model: "m".to_string(),
+            models: vec![entry("m", Some("https://openrouter.ai/api"))],
+            ..Config::default()
+        };
+        let backend = build_backend(&config, "m").unwrap();
+        match backend {
+            Backend::OpenRouter(b) => assert_eq!(b.api_key, "k"),
+            _ => panic!("expected the OpenRouter backend"),
+        }
+
+        let config = Config {
+            decide_model: "m".to_string(),
+            models: vec![entry(
+                "m",
+                Some("https://api.cloudflare.com/client/v4/accounts/abc/ai/v1"),
+            )],
+            ..Config::default()
+        };
+        match build_backend(&config, "m").unwrap() {
+            Backend::Cloudflare(b) => {
+                assert_eq!(b.account_id, "abc");
+                assert_eq!(b.api_token, "k");
+            }
+            _ => panic!("expected the Cloudflare backend"),
+        }
+
+        // A generic OpenAI-compatible endpoint falls back to the klava wire.
+        let config = Config {
+            decide_model: "m".to_string(),
+            models: vec![entry("m", Some("https://gw.example"))],
+            ..Config::default()
+        };
+        match build_backend(&config, "m").unwrap() {
+            Backend::Klava(b) => {
+                assert_eq!(b.base_url, "https://gw.example/v1/alpha/decisions")
+            }
+            _ => panic!("expected the klava backend"),
+        }
+
+        // A Cloudflare-type entry without an account id is a config error.
+        let config = Config {
+            decide_model: "m".to_string(),
+            models: vec![Model {
+                base_url: Some("https://api.cloudflare.com/client/v4".to_string()),
+                jigor: Some("cloudflare".to_string()),
+                ..entry("m", None)
+            }],
+            ..Config::default()
+        };
+        let err = build_backend(&config, "m").unwrap_err();
+        assert!(err.contains("accounts"), "{err}");
+    }
+
+    #[cfg(feature = "decide")]
+    #[test]
+    fn an_ambiguous_decide_model_is_rejected() {
+        let config = Config {
+            decide_model: "m".to_string(),
+            models: vec![
+                entry("m", Some("https://a.example")),
+                entry("m", Some("https://b.example")),
+            ],
+            ..Config::default()
+        };
+        let err = build_backend(&config, "m").unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[cfg(feature = "decide")]
     #[test]
     fn approve_defaults_to_the_first_noul_question() {
         let req = request();
         assert_eq!(decide_question_id(&req), Some("intervene"));
     }
 
+    #[cfg(feature = "decide")]
     #[test]
     fn approve_is_none_without_a_noul_question() {
         let mut req = request();

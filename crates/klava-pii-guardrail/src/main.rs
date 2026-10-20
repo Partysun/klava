@@ -435,18 +435,6 @@ fn main() {
 
     let _ = PROTOCOL;
 
-    // The host injects `disable_pii` when the legacy `enable_pii = false` flag
-    // is set. Honour it here so old configs keep working.
-    if request
-        .config
-        .get("disable_pii")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        emit_continue();
-        return;
-    }
-
     let config: GuardrailConfig = match serde_json::from_value(request.config.clone()) {
         Ok(config) => config,
         Err(e) => {
@@ -632,20 +620,5 @@ mod tests {
         })
         .unwrap();
         assert!(!text.contains("payload"));
-    }
-
-    #[test]
-    fn disable_pii_flag_blocks_redaction() {
-        let req: HostRequest = serde_json::from_str(
-            r#"{"config":{"disable_pii":true,"enabled":true},"payload":{"messages":[{"role":"user","content":"a@b.com"}]}}"#,
-        )
-        .unwrap();
-        // With the flag set, main() would emit continue; simulate the check.
-        let disabled = req
-            .config
-            .get("disable_pii")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        assert!(disabled);
     }
 }

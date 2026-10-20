@@ -59,6 +59,31 @@ impl OpencodeRunner {
         models
     }
 
+    /// Distinct configured model names, completion model first.
+    fn configured_model_names() -> Vec<String> {
+        let Ok(config) = crate::config::Config::load() else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for name in [
+            config.resolve_completion_model(),
+            config.resolve_reasoning_model(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        for name in config.model_names() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
     pub fn is_klava_model(cfg: &serde_json::Map<String, serde_json::Value>) -> bool {
         if let Some(serde_json::Value::Bool(true)) = cfg.get("_klava") {
             return true;
@@ -181,24 +206,45 @@ impl AgentRunner for OpencodeRunner {
             .and_modify(|v| *v = serde_json::json!(base_url))
             .or_insert_with(|| serde_json::json!(base_url));
 
-        // Ensure klava model exists with _klava marker
-        let model_entry = if let Some(existing) = provider.models.get("klava") {
-            // Update existing entry only if needed
-            let mut entry = existing.clone();
-            if let serde_json::Value::Object(ref mut map) = entry {
-                map.entry("_klava".to_string())
-                    .or_insert_with(|| serde_json::json!(true));
-            }
-            entry
-        } else {
-            // Create new model entry
-            serde_json::json!({
-                "name": "klava",
-                "_klava": true
-            })
-        };
+        // Expose every configured model under its real name, so the picker and
+        // the model label show e.g. `~deepseek/deepseek-flash-latest` instead
+        // of a synthetic proxy name. klava routes by that name.
+        let model_names = Self::configured_model_names();
+        for name in &model_names {
+            let entry = if let Some(existing) = provider.models.get(name) {
+                let mut entry = existing.clone();
+                if let serde_json::Value::Object(ref mut map) = entry {
+                    map.entry("_klava".to_string())
+                        .or_insert_with(|| serde_json::json!(true));
+                }
+                entry
+            } else {
+                serde_json::json!({
+                    "name": name,
+                    "_klava": true
+                })
+            };
+            provider.models.insert(name.clone(), entry);
+        }
 
-        provider.models.insert("klava".to_string(), model_entry);
+        // Drop the old synthetic entry once real models are configured.
+        if !model_names.is_empty() {
+            let synthetic = provider.models.get("klava").is_some_and(|m| {
+                Self::is_klava_model(m.as_object().unwrap_or(&Default::default()))
+            });
+            if synthetic && !model_names.iter().any(|n| n == "klava") {
+                provider.models.remove("klava");
+            }
+        }
+
+        // Point the default and the small model at real names too.
+        if let Some(default) = model_names.first() {
+            let qualified = format!("klava/{default}");
+            config.model = Some(qualified.clone());
+            if config.small_model.is_none() {
+                config.small_model = Some(qualified);
+            }
+        }
 
         let new_config = serde_json::to_string_pretty(&config)?;
 

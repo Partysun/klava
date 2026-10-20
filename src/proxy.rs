@@ -24,37 +24,84 @@ use serde_json::json;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Apply model override based on config for OpenAI requests
-/// Detects reasoning requests by checking reasoning_effort parameter
-fn apply_openai_model_override(
-    req: openai::OpenAIRequest,
-    reasoning_model: Option<String>,
-    completion_model: Option<String>,
-) -> openai::OpenAIRequest {
-    // Check if this is a reasoning request based on reasoning_effort
-    let is_reasoning = req
-        .reasoning_effort
-        .as_ref()
-        .is_some_and(|effort| !matches!(effort, openai::ReasoningEffort::None));
-
-    apply_model_override(req, is_reasoning, reasoning_model, completion_model)
+/// Anchors a client's model name to the entry it routed to.
+///
+/// Hooks keep getting one payload; before the send we write the upstream id
+/// into `model`, and just before answering we put the client-facing name back
+/// so a harness only ever sees the model it asked for (or our default).
+#[derive(Clone)]
+struct ModelRoute {
+    entry: Arc<crate::providers::Model>,
+    client_model: String,
 }
 
-/// Pick the configured reasoning vs completion model for a request.
-fn apply_model_override(
-    mut req: openai::OpenAIRequest,
-    is_reasoning: bool,
-    reasoning_model: Option<String>,
-    completion_model: Option<String>,
-) -> openai::OpenAIRequest {
-    let model = if is_reasoning {
-        reasoning_model.unwrap_or_else(|| req.model.clone())
-    } else {
-        completion_model.unwrap_or_else(|| req.model.clone())
-    };
+impl ModelRoute {
+    fn new(config: &Config, requested: &str, is_reasoning: bool) -> Result<Self> {
+        let entry = config
+            .resolve_request_model(requested, is_reasoning)
+            .ok_or(Error::NoModelsConfigured)?;
+        Ok(Self {
+            entry: Arc::new(entry.clone()),
+            client_model: requested.trim().to_string(),
+        })
+    }
 
-    req.model = model;
-    req
+    fn upstream_model(&self) -> String {
+        self.entry.upstream_model()
+    }
+
+    /// Point a parsed request at this route's upstream model.
+    fn apply(&self, mut req: openai::OpenAIRequest) -> openai::OpenAIRequest {
+        req.model = self.upstream_model();
+        req
+    }
+
+    /// Put the client-facing model name back into an upstream response.
+    fn restore(&self, mut value: Value) -> Value {
+        if self.client_model.is_empty() {
+            return value;
+        }
+        if let Some(obj) = value.as_object_mut()
+            && obj.contains_key("model")
+        {
+            obj.insert("model".to_string(), json!(self.client_model));
+        }
+        value
+    }
+
+    /// Same as [`Self::restore`], for OpenAI SSE text (best effort: each
+    /// `data:` event that carries a `model` field is rewritten).
+    fn restore_sse(&self, bytes: Bytes) -> Bytes {
+        if self.client_model.is_empty() {
+            return bytes;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return bytes;
+        };
+        let mut out = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            if let Some(payload) = trimmed.strip_prefix("data: ")
+                && let Ok(mut chunk) = serde_json::from_str::<Value>(payload.trim())
+                && let Some(obj) = chunk.as_object_mut()
+                && obj.get("model").and_then(Value::as_str).is_some()
+            {
+                obj.insert("model".to_string(), json!(self.client_model));
+                out.push_str(&format!("data: {chunk}\n"));
+                continue;
+            }
+            out.push_str(line);
+        }
+        Bytes::from(out)
+    }
+}
+
+/// Whether an OpenAI request asks for reasoning. klava looks at
+/// `reasoning_effort`; anything above `none` selects the reasoning model.
+fn openai_request_is_reasoning(req: &openai::OpenAIRequest) -> bool {
+    req.reasoning_effort
+        .as_ref()
+        .is_some_and(|effort| !matches!(effort, openai::ReasoningEffort::None))
 }
 
 /// Whether a Responses request asks for reasoning. Codex sends
@@ -65,6 +112,15 @@ fn responses_request_is_reasoning(req: &crate::models::responses::ResponsesReque
         .as_ref()
         .and_then(|r| r.effort.as_deref())
         .is_some_and(|e| !matches!(e, "none" | "minimal"))
+}
+
+/// Whether an Anthropic request asks for thinking (`enabled` or `adaptive`).
+fn anthropic_request_is_reasoning(req: &anthropic::AnthropicRequest) -> bool {
+    req.extra
+        .get("thinking")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("type").and_then(|t| t.as_str()))
+        .is_some_and(|t| matches!(t, "enabled" | "adaptive"))
 }
 
 /// Handler for Anthropic-compatible requests (/v1/messages)
@@ -119,14 +175,16 @@ pub async fn proxy_anthropic(
         .await;
     }
 
-    let openai_req = anthropic_to_openai(
-        anthropic_req,
-        config.resolve_reasoning_model(),
-        config.resolve_completion_model(),
-    )?;
+    // Anthropic carries thinking in `thinking.type` (not `reasoning_effort`),
+    // so decide the reasoning/completion default before transforming.
+    let is_reasoning = anthropic_request_is_reasoning(&anthropic_req);
+    let openai_req = anthropic_to_openai(anthropic_req, None, None)?;
+    let route = ModelRoute::new(&config, &openai_req.model, is_reasoning)?;
+    let openai_req = route.apply(openai_req);
     tracing::debug!(
-        "Transformed to OpenAI request for model: {}",
-        openai_req.model
+        "Transformed to OpenAI request for model: {} (routed to {})",
+        openai_req.model,
+        route.entry.name
     );
 
     // Extension chain. Runs on the normalized OpenAI payload so one extension
@@ -151,6 +209,7 @@ pub async fn proxy_anthropic(
                 ClientFormat::Anthropic,
                 &hook_chain,
                 &config,
+                &route,
             );
         }
         openai_req = serde_json::from_value(outcome.payload)?;
@@ -170,6 +229,7 @@ pub async fn proxy_anthropic(
                 &config,
                 &hook_chain,
                 openai_req,
+                &route,
                 ClientFormat::Anthropic,
                 None,
             )
@@ -180,6 +240,7 @@ pub async fn proxy_anthropic(
             &config,
             &hook_chain,
             openai_req,
+            &route,
             ClientFormat::Anthropic,
             is_streaming,
             None,
@@ -187,7 +248,7 @@ pub async fn proxy_anthropic(
         .await;
     }
 
-    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
+    let response = send_request(&client, &config, &route, &openai_req, &hook_chain).await?;
 
     if config.verbose {
         tracing::trace!(
@@ -201,9 +262,9 @@ pub async fn proxy_anthropic(
     }
 
     let response = if is_streaming {
-        handle_streaming_anthropic(response, &config).await?
+        handle_streaming_anthropic(response, &config, &route).await?
     } else {
-        handle_non_streaming_anthropic(response, &hook_chain, &config).await?
+        handle_non_streaming_anthropic(response, &hook_chain, &config, &route).await?
     };
 
     Ok(response)
@@ -234,17 +295,25 @@ pub async fn proxy_openai(
     let data = hook_chain.execute(HookStage::RequestReceived, data, &config)?;
     let openai_req: openai::OpenAIRequest = serde_json::from_value(data)?;
 
-    // Override model based on config (reasoning vs completion model)
-    let mut openai_req = apply_openai_model_override(
-        openai_req,
-        config.resolve_reasoning_model(),
-        config.resolve_completion_model(),
+    // Route on the model the client sent; unknown names fall back to the
+    // configured defaults (see `Config::resolve_request_model`).
+    let route = ModelRoute::new(
+        &config,
+        &openai_req.model,
+        openai_request_is_reasoning(&openai_req),
+    )?;
+    let mut openai_req = route.apply(openai_req);
+    tracing::debug!(
+        "Requested model '{}' routed to entry '{}' (upstream {})",
+        route.client_model,
+        route.entry.name,
+        openai_req.model
     );
 
     // Extension chain: transforms and escalation.
     //
     // Escalation may fold reviewer remarks into the conversation, so it runs
-    // here — after model override, before any send — and works for streaming
+    // here — after model selection, before any send — and works for streaming
     // clients too, because the request body is complete at this point.
     if !extensions.is_empty() {
         let payload = serde_json::to_value(&openai_req)?;
@@ -267,6 +336,7 @@ pub async fn proxy_openai(
                 ClientFormat::OpenAi,
                 &hook_chain,
                 &config,
+                &route,
             );
         }
         openai_req = serde_json::from_value(outcome.payload)?;
@@ -286,6 +356,7 @@ pub async fn proxy_openai(
                 &config,
                 &hook_chain,
                 openai_req,
+                &route,
                 ClientFormat::OpenAi,
                 None,
             )
@@ -296,6 +367,7 @@ pub async fn proxy_openai(
             &config,
             &hook_chain,
             openai_req,
+            &route,
             ClientFormat::OpenAi,
             is_streaming,
             None,
@@ -303,16 +375,16 @@ pub async fn proxy_openai(
         .await;
     }
 
-    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
+    let response = send_request(&client, &config, &route, &openai_req, &hook_chain).await?;
 
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
     }
 
     let response = if is_streaming {
-        handle_streaming_openai(response, &config).await?
+        handle_streaming_openai(response, &config, &route).await?
     } else {
-        handle_non_streaming_openai(response, &hook_chain, &config).await?
+        handle_non_streaming_openai(response, &hook_chain, &config, &route).await?
     };
 
     Ok(response)
@@ -326,8 +398,16 @@ fn render_canned(
     format: ClientFormat,
     hook_chain: &HookChain,
     config: &Config,
+    route: &ModelRoute,
 ) -> Result<Response> {
-    render_final(value, format, client_streaming, None, hook_chain, config)
+    render_final(
+        route.restore(value),
+        format,
+        client_streaming,
+        None,
+        hook_chain,
+        config,
+    )
 }
 
 /// Max request body we accept from a client. Code-agent clients (opencode,
@@ -352,33 +432,29 @@ async fn read_body_bytes_limited(request: Request, limit: usize) -> Result<bytes
 async fn send_request(
     client: &Client,
     config: &Config,
+    route: &ModelRoute,
     openai_req: &openai::OpenAIRequest,
     hook_chain: &HookChain,
 ) -> Result<reqwest::Response> {
-    let request_payload = build_upstream_payload(config, openai_req);
+    let request_payload = build_upstream_payload(route, openai_req);
 
     // The hook result must be the payload we send: a `BeforeUpstream` hook is
     // a transform, and discarding its return value silently disabled every
     // request-side rewrite (guardrails, routing).
     let request_payload = hook_chain.execute(HookStage::BeforeUpstream, request_payload, config)?;
 
-    send_openai_payload(client, config, openai_req, request_payload).await
+    send_openai_payload_via(client, config, &route.entry, openai_req, request_payload).await
 }
 
 /// Serialize a typed request into the upstream JSON payload, applying the
 /// provider-specific tweaks (Qwen incremental output / default system message).
-fn build_upstream_payload(config: &Config, openai_req: &openai::OpenAIRequest) -> Value {
-    let url = config.chat_completions_url();
-    build_upstream_payload_for(config, openai_req, &url)
+fn build_upstream_payload(route: &ModelRoute, openai_req: &openai::OpenAIRequest) -> Value {
+    let url = route.entry.chat_completions_url().unwrap_or_default();
+    build_upstream_payload_for(openai_req, &url)
 }
 
-/// Same as [`build_upstream_payload`], for an explicit upstream URL (used when
-/// a nested call targets a different provider).
-fn build_upstream_payload_for(
-    _config: &Config,
-    openai_req: &openai::OpenAIRequest,
-    url: &str,
-) -> Value {
+/// Same as [`build_upstream_payload`], for an explicit upstream URL.
+fn build_upstream_payload_for(openai_req: &openai::OpenAIRequest, url: &str) -> Value {
     let mut request_payload = serde_json::to_value(openai_req).unwrap_or_else(|_| json!({}));
 
     // Special handling for Qwen models that require specific parameters.
@@ -413,36 +489,19 @@ fn build_upstream_payload_for(
     request_payload
 }
 
-/// POST an already-built JSON payload to the active provider. Used by the
-/// normal proxy path and by the web-search loop (both send chat-completions
-/// requests to the same endpoint with the same auth).
-pub(crate) async fn send_openai_payload(
+/// POST an already-built JSON payload to one model entry. Used by the normal
+/// proxy path and by the web-search loop (both send chat-completions requests
+/// to the same endpoint with the same auth).
+pub(crate) async fn send_openai_payload_via(
     client: &Client,
     config: &Config,
+    entry: &crate::providers::Model,
     openai_req: &openai::OpenAIRequest,
     request_payload: Value,
 ) -> Result<reqwest::Response> {
-    let provider = config.get_active_provider_config().cloned();
-    match provider {
-        Some(p) => send_openai_payload_via(client, config, &p, openai_req, request_payload).await,
-        None => Err(Error::Internal(format!(
-            "Active provider '{}' not found in configuration",
-            config.active_provider
-        ))),
-    }
-}
-
-/// POST a payload to an explicit provider.
-async fn send_openai_payload_via(
-    client: &Client,
-    config: &Config,
-    provider: &crate::providers::Config,
-    openai_req: &openai::OpenAIRequest,
-    request_payload: Value,
-) -> Result<reqwest::Response> {
-    let url = provider
+    let url = entry
         .chat_completions_url()
-        .ok_or_else(|| Error::Internal(format!("provider '{}' has no base URL", provider.name)))?;
+        .ok_or_else(|| Error::Internal(format!("model '{}' has no base URL", entry.name)))?;
     tracing::debug!("Sending request to {} for model: {}", url, openai_req.model);
 
     let mut req_builder = client.post(&url).json(&request_payload);
@@ -458,7 +517,7 @@ async fn send_openai_payload_via(
             .header("X-OpenRouter-Categories", "cli-agent-proxy");
     }
 
-    if let Some(headers) = provider.get_auth_headers(config).await? {
+    if let Some(headers) = entry.get_auth_headers(config).await? {
         req_builder = req_builder.headers(headers);
     }
 
@@ -468,33 +527,32 @@ async fn send_openai_payload_via(
         .map_err(|e| Error::Upstream(format!("Failed to send request to upstream ({url}): {e} — check provider connectivity with `klava check`")))
 }
 
-/// Send a typed OpenAI request to the active provider (no hooks). Shared entry
-/// point for the web-search loop.
-pub(crate) async fn send_openai_request(
-    client: &Client,
-    config: &Config,
-    openai_req: &openai::OpenAIRequest,
-) -> Result<reqwest::Response> {
-    send_openai_request_via(client, config, openai_req, None).await
-}
-
-/// Send a typed OpenAI request through an explicit provider (or the active one
-/// when `provider` is `None`). Runs no hooks — this is the recursion boundary
-/// used by nested calls such as web search and model escalation.
+/// Send a typed OpenAI request through an explicit model entry (or the
+/// configured default when `entry` is `None`). Runs no hooks — this is the
+/// recursion boundary used by nested calls such as web search and model
+/// escalation.
 pub(crate) async fn send_openai_request_via(
     client: &Client,
     config: &Config,
     openai_req: &openai::OpenAIRequest,
-    provider: Option<&crate::providers::Config>,
+    entry: Option<&crate::providers::Model>,
 ) -> Result<reqwest::Response> {
-    let url = provider
-        .and_then(|p| p.chat_completions_url())
-        .unwrap_or_else(|| config.chat_completions_url());
-    let payload = build_upstream_payload_for(config, openai_req, &url);
-    match provider {
-        Some(p) => send_openai_payload_via(client, config, p, openai_req, payload).await,
-        None => send_openai_payload(client, config, openai_req, payload).await,
-    }
+    let owned;
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            owned = config
+                .default_completion()
+                .ok_or(Error::NoModelsConfigured)?
+                .clone();
+            &owned
+        }
+    };
+    let url = entry
+        .chat_completions_url()
+        .ok_or_else(|| Error::Internal(format!("model '{}' has no base URL", entry.name)))?;
+    let payload = build_upstream_payload_for(openai_req, &url);
+    send_openai_payload_via(client, config, entry, openai_req, payload).await
 }
 
 // ===== Web search loop =====
@@ -523,18 +581,33 @@ async fn proxy_streaming_search(
     config: &Arc<Config>,
     hook_chain: &HookChain,
     mut openai_req: openai::OpenAIRequest,
+    route: &ModelRoute,
     format: ClientFormat,
     responses_req: Option<&crate::models::responses::ResponsesRequest>,
 ) -> Result<Response> {
     search::inject_tool(&mut openai_req);
-    let model = openai_req.model.clone();
+    let model = if route.client_model.is_empty() {
+        openai_req.model.clone()
+    } else {
+        route.client_model.clone()
+    };
 
-    let response = send_request(client, config, &openai_req, hook_chain).await?;
+    let response = send_request(client, config, route, &openai_req, hook_chain).await?;
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
     }
 
-    let stream = search::stream::drive(client.clone(), config.clone(), openai_req, response);
+    let stream = search::stream::drive(
+        client.clone(),
+        config.clone(),
+        openai_req,
+        route.entry.as_ref().clone(),
+        response,
+    );
+    // The loop forwards upstream SSE bytes; rewrite the model id on each event
+    // so the answer carries the name the client asked for.
+    let route = route.clone();
+    let stream = stream.map(move |chunk| chunk.map(|bytes| route.restore_sse(bytes)));
 
     let converted: Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>> = match format {
         ClientFormat::OpenAi => Box::pin(openai_passthrough(stream)),
@@ -623,11 +696,13 @@ async fn proxy_native_search(
 /// the final answer is rendered in the client's format (synthesizing an SSE
 /// stream for streaming clients). The client never sees the search tool
 /// definition or the intercepted tool calls.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_with_search(
     client: &Client,
     config: &Config,
     hook_chain: &HookChain,
     mut openai_req: openai::OpenAIRequest,
+    route: &ModelRoute,
     format: ClientFormat,
     client_streaming: bool,
     responses_req: Option<&crate::models::responses::ResponsesRequest>,
@@ -640,7 +715,7 @@ async fn proxy_with_search(
     // response. The client's stream preference is honored when rendering.
     openai_req.stream = Some(false);
 
-    let mut response = send_request(client, config, &openai_req, hook_chain).await?;
+    let mut response = send_request(client, config, route, &openai_req, hook_chain).await?;
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
     }
@@ -652,7 +727,7 @@ async fn proxy_with_search(
         let split = search::split_tool_calls(&value);
         if !split.needs_search() {
             return render_final(
-                value,
+                route.restore(value),
                 format,
                 client_streaming,
                 responses_req,
@@ -677,7 +752,7 @@ async fn proxy_with_search(
             // unresolved tool call so the client isn't left with a dangling
             // call it has no definition for.
             return render_final(
-                strip_search_call(value),
+                route.restore(strip_search_call(value)),
                 format,
                 client_streaming,
                 responses_req,
@@ -716,7 +791,7 @@ async fn proxy_with_search(
             // The client must answer its own tools; return the model's turn
             // with only the search calls removed.
             return render_final(
-                strip_search_call(value),
+                route.restore(strip_search_call(value)),
                 format,
                 client_streaming,
                 responses_req,
@@ -725,7 +800,7 @@ async fn proxy_with_search(
             );
         }
 
-        response = send_openai_request(client, config, &openai_req).await?;
+        response = send_openai_request_via(client, config, &openai_req, Some(&route.entry)).await?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
@@ -921,11 +996,12 @@ async fn handle_non_streaming_anthropic(
     response: reqwest::Response,
     hook_chain: &HookChain,
     config: &Config,
+    route: &ModelRoute,
 ) -> Result<Response> {
     let openai_resp: openai::OpenAIResponse = response.json().await?;
     let anthropic_resp = openai_to_anthropic(openai_resp)?;
 
-    let data: Value = serde_json::to_value(anthropic_resp)?;
+    let data: Value = route.restore(serde_json::to_value(anthropic_resp)?);
     let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
     Ok(Json(resp).into_response())
 }
@@ -933,6 +1009,7 @@ async fn handle_non_streaming_anthropic(
 async fn handle_streaming_anthropic(
     response: reqwest::Response,
     _config: &Config,
+    route: &ModelRoute,
 ) -> Result<Response> {
     let stream = response.bytes_stream().inspect(|chunk| {
         if let Ok(bytes) = chunk {
@@ -940,7 +1017,9 @@ async fn handle_streaming_anthropic(
         }
     });
 
-    let upstream = stream.map(|result| result.map_err(Error::Http));
+    let route = route.clone();
+    let upstream =
+        stream.map(move |result| result.map(|b| route.restore_sse(b)).map_err(Error::Http));
     let converter = AnthropicStreamConverter::new();
     let universal = UniversalConverter::new(converter);
 
@@ -953,10 +1032,11 @@ async fn handle_non_streaming_openai(
     response: reqwest::Response,
     hook_chain: &HookChain,
     config: &Config,
+    route: &ModelRoute,
 ) -> Result<Response> {
     let openai_resp: openai::OpenAIResponse = response.json().await?;
 
-    let data: Value = serde_json::to_value(openai_resp)?;
+    let data: Value = route.restore(serde_json::to_value(openai_resp)?);
     let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
     Ok(Json(resp).into_response())
 }
@@ -964,9 +1044,12 @@ async fn handle_non_streaming_openai(
 async fn handle_streaming_openai(
     response: reqwest::Response,
     _config: &Config,
+    route: &ModelRoute,
 ) -> Result<Response> {
     let stream = response.bytes_stream();
-    let upstream = stream.map(|result| result.map_err(Error::Http));
+    let route = route.clone();
+    let upstream =
+        stream.map(move |result| result.map(|b| route.restore_sse(b)).map_err(Error::Http));
     let stream = openai_passthrough(Box::pin(upstream));
 
     Ok(build_sse_response(stream))
@@ -978,12 +1061,13 @@ async fn handle_non_streaming_responses(
     response: reqwest::Response,
     hook_chain: &HookChain,
     config: &Config,
+    route: &ModelRoute,
     req: Option<crate::models::responses::ResponsesRequest>,
 ) -> Result<Response> {
     let openai_resp: openai::OpenAIResponse = response.json().await?;
     let responses_resp = openai_to_responses(openai_resp, req.as_ref())?;
 
-    let data: Value = serde_json::to_value(responses_resp)?;
+    let data: Value = route.restore(serde_json::to_value(responses_resp)?);
     let resp = hook_chain.execute(HookStage::BeforeResponse, data, config)?;
     Ok(Json(resp).into_response())
 }
@@ -1031,16 +1115,14 @@ pub async fn proxy_responses(
 
     let openai_req = responses_to_openai(responses_req.clone())?;
 
-    // Apply model overrides
-    let openai_req = apply_model_override(
-        openai_req,
-        is_reasoning,
-        config.resolve_reasoning_model(),
-        config.resolve_completion_model(),
-    );
+    // Route on the model the client sent (see `proxy_openai`).
+    let route = ModelRoute::new(&config, &openai_req.model, is_reasoning)?;
+    let openai_req = route.apply(openai_req);
 
     tracing::debug!(
-        "Transformed to OpenAI request for model: {}",
+        "Requested model '{}' routed to entry '{}' (upstream {})",
+        route.client_model,
+        route.entry.name,
         openai_req.model
     );
 
@@ -1065,6 +1147,7 @@ pub async fn proxy_responses(
                 ClientFormat::Responses,
                 &hook_chain,
                 &config,
+                &route,
             );
         }
         openai_req = serde_json::from_value(outcome.payload)?;
@@ -1077,6 +1160,7 @@ pub async fn proxy_responses(
                 &config,
                 &hook_chain,
                 openai_req,
+                &route,
                 ClientFormat::Responses,
                 Some(&responses_req),
             )
@@ -1087,6 +1171,7 @@ pub async fn proxy_responses(
             &config,
             &hook_chain,
             openai_req,
+            &route,
             ClientFormat::Responses,
             is_streaming,
             Some(&responses_req),
@@ -1094,16 +1179,22 @@ pub async fn proxy_responses(
         .await;
     }
 
-    let response = send_request(&client, &config, &openai_req, &hook_chain).await?;
+    let response = send_request(&client, &config, &route, &openai_req, &hook_chain).await?;
 
     if !response.status().is_success() {
         return Err(handle_upstream_error(response).await);
     }
 
     let response = if is_streaming {
-        handle_streaming_responses(response, openai_req.model).await?
+        let model = if route.client_model.is_empty() {
+            openai_req.model.clone()
+        } else {
+            route.client_model.clone()
+        };
+        handle_streaming_responses(response, model).await?
     } else {
-        handle_non_streaming_responses(response, &hook_chain, &config, Some(responses_req)).await?
+        handle_non_streaming_responses(response, &hook_chain, &config, &route, Some(responses_req))
+            .await?
     };
 
     Ok(response)
@@ -1177,10 +1268,63 @@ mod tests {
         )));
     }
 
+    fn route_config(completion: &str, reasoning: &str) -> Config {
+        use crate::providers::{Model, Type as ProviderType};
+        Config {
+            port: 0,
+            verbose: false,
+            enable_token_stats: false,
+            completion_model: Some(completion.to_string()),
+            reasoning_model: Some(reasoning.to_string()),
+            models: vec![
+                Model {
+                    name: completion.to_string(),
+                    provider_type: ProviderType::OpenAICompatible,
+                    base_url: Some("https://chat.example".to_string()),
+                    api_key: Some("k".to_string()),
+                    ..Model::default()
+                },
+                Model {
+                    name: reasoning.to_string(),
+                    provider_type: ProviderType::OpenAICompatible,
+                    base_url: Some("https://think.example".to_string()),
+                    api_key: Some("k".to_string()),
+                    ..Model::default()
+                },
+            ],
+            ..Config::default()
+        }
+    }
+
     #[test]
-    fn apply_model_override_selects_by_flag() {
+    fn route_selects_the_default_by_reasoning_flag() {
+        let config = route_config("chat-model", "thinking-model");
+        let reasoning = ModelRoute::new(&config, "klava", true).unwrap();
+        assert_eq!(reasoning.entry.name, "thinking-model");
+
+        let completion = ModelRoute::new(&config, "klava", false).unwrap();
+        assert_eq!(completion.entry.name, "chat-model");
+    }
+
+    #[test]
+    fn route_honours_a_model_name_the_client_sent() {
+        let config = route_config("chat-model", "thinking-model");
+        let route = ModelRoute::new(&config, "thinking-model", false).unwrap();
+        assert_eq!(route.entry.name, "thinking-model");
+        // The client keeps seeing the name it asked for.
+        assert_eq!(route.client_model, "thinking-model");
+    }
+
+    #[test]
+    fn route_writes_the_upstream_id_and_restores_the_client_name() {
+        let mut config = route_config("chat-model", "chat-model");
+        config.models[0].upstream_model = Some("vendor/real-id".to_string());
+        config
+            .models
+            .retain(|m| m.name != "chat-model" || m.upstream_model.is_some());
+        let route = ModelRoute::new(&config, "chat-model", false).unwrap();
         let req = openai::OpenAIRequest {
-            model: "default".to_string(),
+            model: "chat-model".to_string(),
             messages: vec![],
             max_tokens: None,
             temperature: None,
@@ -1192,29 +1336,26 @@ mod tests {
             reasoning_effort: None,
             extra: json!({}),
         };
+        assert_eq!(route.apply(req).model, "vendor/real-id");
 
-        let reasoning = apply_model_override(
-            req.clone(),
-            true,
-            Some("thinking-model".to_string()),
-            Some("chat-model".to_string()),
-        );
-        assert_eq!(reasoning.model, "thinking-model");
-
-        let completion = apply_model_override(
-            req,
-            false,
-            Some("thinking-model".to_string()),
-            Some("chat-model".to_string()),
-        );
-        assert_eq!(completion.model, "chat-model");
+        let restored = route.restore(json!({"model": "vendor/real-id", "choices": []}));
+        assert_eq!(restored["model"], json!("chat-model"));
     }
 
     #[test]
-    fn apply_openai_model_override_detects_reasoning_from_effort() {
+    fn route_requires_a_configured_model() {
+        let config = Config::default();
+        assert!(matches!(
+            ModelRoute::new(&config, "x", false),
+            Err(Error::NoModelsConfigured)
+        ));
+    }
+
+    #[test]
+    fn openai_reasoning_flag_follows_the_effort() {
         fn req(effort: Option<openai::ReasoningEffort>) -> openai::OpenAIRequest {
             openai::OpenAIRequest {
-                model: "default".to_string(),
+                model: "m".to_string(),
                 messages: vec![],
                 max_tokens: None,
                 temperature: None,
@@ -1228,29 +1369,16 @@ mod tests {
             }
         }
 
-        let thinking = Some("thinking-model".to_string());
-        let chat = Some("chat-model".to_string());
-
-        // Explicit reasoning effort -> reasoning model.
-        let reasoning = apply_openai_model_override(
-            req(Some(openai::ReasoningEffort::High)),
-            thinking.clone(),
-            chat.clone(),
-        );
-        assert_eq!(reasoning.model, "thinking-model");
-        let reasoning = apply_openai_model_override(
-            req(Some(openai::ReasoningEffort::Medium)),
-            thinking.clone(),
-            chat.clone(),
-        );
-        assert_eq!(reasoning.model, "thinking-model");
-
-        // Absent or explicit "none" effort -> completion model.
-        let completion = apply_openai_model_override(req(None), thinking.clone(), chat.clone());
-        assert_eq!(completion.model, "chat-model");
-        let completion =
-            apply_openai_model_override(req(Some(openai::ReasoningEffort::None)), thinking, chat);
-        assert_eq!(completion.model, "chat-model");
+        assert!(openai_request_is_reasoning(&req(Some(
+            openai::ReasoningEffort::High
+        ))));
+        assert!(openai_request_is_reasoning(&req(Some(
+            openai::ReasoningEffort::Medium
+        ))));
+        assert!(!openai_request_is_reasoning(&req(None)));
+        assert!(!openai_request_is_reasoning(&req(Some(
+            openai::ReasoningEffort::None
+        ))));
     }
 
     #[tokio::test]

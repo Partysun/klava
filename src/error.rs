@@ -20,11 +20,17 @@ pub enum Error {
     #[error("invalid base URL: {0}")]
     InvalidBaseUrl(String),
 
-    #[error("API key is required for provider '{0}'")]
+    #[error("API key is required for model '{0}'")]
     MissingApiKey(String),
 
-    #[error("no active provider configured - run 'klava config --setup'")]
-    ActiveProviderNotSetup,
+    #[error("no models configured - run 'klava providers add'")]
+    NoModelsConfigured,
+
+    #[error("model '{0}' is not configured in [[models]] - run 'klava providers list'")]
+    MissingModel(String),
+
+    #[error("model '{0}' is configured {1} times - the decide model must be unique")]
+    AmbiguousModel(String, usize),
 
     /// Provider authentication errors
     #[error("provider authentication error: {0}")]
@@ -69,11 +75,25 @@ impl IntoResponse for Error {
             ),
             Error::MissingApiKey(provider) => (
                 StatusCode::BAD_REQUEST,
-                format!("API key is required for provider '{}'", provider),
+                format!("API key is required for model '{}'", provider),
             ),
-            Error::ActiveProviderNotSetup => (
+            Error::NoModelsConfigured => (
                 StatusCode::BAD_REQUEST,
-                "No active provider configured - run 'klava config --setup'".to_string(),
+                "No models configured - run 'klava providers add'".to_string(),
+            ),
+            Error::MissingModel(name) => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Model '{}' is not configured in [[models]] - run 'klava providers list'",
+                    name
+                ),
+            ),
+            Error::AmbiguousModel(name, count) => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Model '{}' is configured {} times - the decide model must be unique",
+                    name, count
+                ),
             ),
             Error::Provider(msg) => (
                 StatusCode::UNAUTHORIZED,
@@ -127,7 +147,12 @@ mod tests {
             (Error::MissingBaseUrl, StatusCode::BAD_REQUEST),
             (Error::InvalidBaseUrl("x".into()), StatusCode::BAD_REQUEST),
             (Error::MissingApiKey("p".into()), StatusCode::BAD_REQUEST),
-            (Error::ActiveProviderNotSetup, StatusCode::BAD_REQUEST),
+            (Error::NoModelsConfigured, StatusCode::BAD_REQUEST),
+            (Error::MissingModel("m".into()), StatusCode::BAD_REQUEST),
+            (
+                Error::AmbiguousModel("m".into(), 2),
+                StatusCode::BAD_REQUEST,
+            ),
             (Error::Transform("m".into()), StatusCode::BAD_REQUEST),
             (Error::Serialization(serde_err()), StatusCode::BAD_REQUEST),
             (Error::Provider("m".into()), StatusCode::UNAUTHORIZED),

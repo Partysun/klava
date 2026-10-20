@@ -103,8 +103,8 @@ pub struct DecideResult {
 /// Parameters for one nested model call, as the host performs it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NestedCallRequest {
-    /// Provider name; `None` selects the active provider.
-    pub provider: Option<String>,
+    /// Name of the `[[models]]` entry to call (falls back to the completion
+    /// model when the name is not configured).
     pub model: String,
     pub mode: FoldMode,
     /// System prompt for the nested call.

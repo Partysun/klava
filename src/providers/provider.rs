@@ -1,16 +1,16 @@
-//! Provider enum for managing API providers
+//! Per-model connection behaviour: URL, auth headers, validation.
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::providers::{Config as ProvidersConfig, Type as ProviderType};
+use crate::providers::{Model, Type as ProviderType};
 use reqwest::header::{HeaderMap, HeaderValue};
 
-impl ProvidersConfig {
-    /// Description
+impl Model {
+    /// Description of the provider family this entry belongs to.
     pub fn description(&self) -> &str {
         match self.provider_type {
             ProviderType::OpenAICompatible => {
-                "OpenAI-compatible APIs (OpenRouter, OpenAI, local LLMs)"
+                "OpenAI-compatible APIs (OpenRouter, Cloudflare, local LLMs)"
             }
             #[cfg(feature = "qwen-code")]
             ProviderType::QwenCode => "Qwen Code (Free*) with OAuth authentication",
@@ -29,49 +29,50 @@ impl ProvidersConfig {
         matches!(self.provider_type, ProviderType::OpenAICompatible)
     }
 
-    /// Base URL
-    pub fn base_url(&self) -> Option<String> {
-        match self.provider_type {
-            #[cfg(feature = "qwen-code")]
-            ProviderType::QwenCode => Some("https://portal.qwen.ai".to_string()),
-            #[cfg(feature = "klava")]
-            ProviderType::Klava => Some("https://klava.zatsepin.dev/api".to_string()),
-            _ => None,
-        }
-    }
-
-    /// Reasoning model
+    /// Reasoning model for this entry (legacy `[[providers]]` field).
     pub fn reasoning_model(&self) -> Option<String> {
         match self.provider_type {
             #[cfg(feature = "qwen-code")]
-            ProviderType::QwenCode => Some("qwen3-coder-plus".to_string()),
-            _ => self.reasoning_model.clone(),
+            ProviderType::QwenCode => Some(self.upstream_model()),
+            _ => self.reasoning_model.clone().or(Some(self.upstream_model())),
         }
     }
 
-    /// Completion model
+    /// Completion model for this entry (legacy `[[providers]]` field).
     pub fn completion_model(&self) -> Option<String> {
         match self.provider_type {
             #[cfg(feature = "qwen-code")]
-            ProviderType::QwenCode => Some("qwen3-coder-plus".to_string()),
-            _ => self.completion_model.clone(),
+            ProviderType::QwenCode => Some(self.upstream_model()),
+            _ => self
+                .completion_model
+                .clone()
+                .or(Some(self.upstream_model())),
         }
     }
 
-    /// Auth headers for a specific provider config
+    /// Auth headers for this model entry.
     pub async fn get_auth_headers_for(&self, _config: &Config) -> Result<Option<HeaderMap>> {
         match self.provider_type {
             ProviderType::OpenAICompatible => {
-                let api_key = self
-                    .api_key
-                    .clone()
-                    .filter(|k| !k.is_empty())
-                    .or_else(|| {
-                        self.api_key_name
-                            .as_ref()
-                            .and_then(|name| std::env::var(name).ok())
-                    })
-                    .ok_or_else(|| Error::MissingApiKey(self.name.to_string()))?;
+                // Naming an `api_key_name` is a promise that the variable
+                // exists: a missing value is an error. With neither field set
+                // the endpoint is treated as unauthenticated (a local server
+                // such as Ollama), and no Authorization header is sent.
+                let api_key = match self.api_key.clone().filter(|k| !k.is_empty()) {
+                    Some(key) => Some(key),
+                    None => match &self.api_key_name {
+                        Some(name) => Some(
+                            std::env::var(name)
+                                .ok()
+                                .filter(|k| !k.is_empty())
+                                .ok_or_else(|| Error::MissingApiKey(self.name.to_string()))?,
+                        ),
+                        None => None,
+                    },
+                };
+                let Some(api_key) = api_key else {
+                    return Ok(None);
+                };
                 let mut headers = HeaderMap::new();
                 headers.insert(
                     reqwest::header::AUTHORIZATION,
@@ -122,7 +123,27 @@ impl ProvidersConfig {
         self.get_auth_headers_for(config).await
     }
 
-    /// Whether this provider is the klava gateway provider.
+    /// The API key this entry would use, when it can be resolved without
+    /// network access (explicit key, env var, or a saved klava login).
+    pub fn api_key(&self) -> Option<String> {
+        if let Some(key) = self.api_key.clone().filter(|k| !k.is_empty()) {
+            return Some(key);
+        }
+        if let Some(name) = &self.api_key_name
+            && let Ok(key) = std::env::var(name)
+            && !key.is_empty()
+        {
+            return Some(key);
+        }
+        #[cfg(feature = "klava")]
+        if self.provider_type == ProviderType::Klava {
+            let mut auth = crate::klava_auth::KlavaAuth::new();
+            return auth.get_api_key().ok().filter(|k| !k.is_empty());
+        }
+        None
+    }
+
+    /// Whether this entry is the klava gateway provider.
     pub fn is_klava(&self) -> bool {
         #[cfg(feature = "klava")]
         {
@@ -158,27 +179,25 @@ impl ProvidersConfig {
         }
     }
 
-    /// Validate config
-    pub fn validate_config(&self, config: &Config) -> Result<()> {
-        let active_provider_config = config.get_active_provider_config().ok_or_else(|| {
-            Error::Internal(format!(
-                "Active provider config '{}' not found",
-                config.active_provider
-            ))
-        })?;
-
+    /// Validate this entry's settings.
+    pub fn validate_config(&self, _config: &Config) -> Result<()> {
         match self.provider_type {
             ProviderType::OpenAICompatible => {
-                let base_url = config
-                    .resolve_base_url()
-                    .ok_or_else(|| Error::MissingBaseUrl)?;
+                let base_url = self.resolve_base_url().ok_or(Error::MissingBaseUrl)?;
 
                 if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
                     return Err(Error::InvalidBaseUrl(base_url));
                 }
 
-                if active_provider_config.api_key.is_none() && config.resolve_api_key().is_none() {
-                    return Err(Error::MissingApiKey(self.name.to_string()));
+                // No key field at all means "this endpoint needs no auth".
+                // A named env var that is empty is a mistake worth failing.
+                if let Some(name) = &self.api_key_name
+                    && self.api_key().is_none()
+                {
+                    return Err(Error::MissingApiKey(format!(
+                        "{} (${} is not set)",
+                        self.name, name
+                    )));
                 }
             }
             #[cfg(feature = "qwen-code")]
@@ -194,7 +213,7 @@ impl ProvidersConfig {
         Ok(())
     }
 
-    /// Resolve base URL for this provider
+    /// Resolve base URL for this entry
     pub fn resolve_base_url(&self) -> Option<String> {
         match self.provider_type {
             ProviderType::OpenAICompatible => self.base_url.clone(),
@@ -209,13 +228,13 @@ impl ProvidersConfig {
         }
     }
 
-    /// Upstream chat completions URL for THIS provider.
+    /// Upstream chat completions URL for THIS entry.
     ///
     /// Defaults to `{base_url}/v1/chat/completions`; providers that expose
     /// the endpoint at a nested path (e.g. Immerse's
     /// `/v1/endpoints/generate/chat/completions`) can override the path via
     /// the `chat_completions_path` config field. Returns `None` when the
-    /// provider has no base URL.
+    /// entry has no base URL.
     pub fn chat_completions_url(&self) -> Option<String> {
         let base_url = self.resolve_base_url()?;
         let path = self
@@ -236,23 +255,22 @@ mod tests {
     use super::*;
     use crate::providers::Type as ProviderType;
 
-    fn provider(base_url: &str, path: Option<&str>) -> ProvidersConfig {
-        ProvidersConfig {
+    fn entry(base_url: &str, path: Option<&str>) -> Model {
+        Model {
             name: "test".to_string(),
             provider_type: ProviderType::OpenAICompatible,
             base_url: Some(base_url.to_string()),
             chat_completions_path: path.map(String::from),
             api_key: None,
             api_key_name: None,
-            reasoning_model: None,
-            completion_model: None,
+            ..Model::default()
         }
     }
 
     #[test]
     fn url_defaults_to_v1_chat_completions() {
         assert_eq!(
-            provider("https://openrouter.ai/api", None).chat_completions_url(),
+            entry("https://openrouter.ai/api", None).chat_completions_url(),
             Some("https://openrouter.ai/api/v1/chat/completions".to_string())
         );
     }
@@ -260,7 +278,7 @@ mod tests {
     #[test]
     fn url_uses_custom_path() {
         assert_eq!(
-            provider(
+            entry(
                 "https://chat.immers.cloud",
                 Some("/v1/endpoints/generate/chat/completions")
             )
@@ -272,37 +290,42 @@ mod tests {
     #[test]
     fn url_handles_trailing_slash_and_missing_leading_slash() {
         assert_eq!(
-            provider("https://blocks.gonka.gg/", Some("v1/chat/completions"))
-                .chat_completions_url(),
+            entry("https://blocks.gonka.gg/", Some("v1/chat/completions")).chat_completions_url(),
             Some("https://blocks.gonka.gg/v1/chat/completions".to_string())
         );
     }
 
     #[test]
     fn url_is_none_without_base_url() {
-        let p = ProvidersConfig {
+        let p = Model {
             base_url: None,
-            ..provider("https://x.example", None)
+            ..entry("https://x.example", None)
         };
         assert_eq!(p.chat_completions_url(), None);
     }
 
-    fn minimal(name: &str) -> ProvidersConfig {
-        ProvidersConfig {
+    #[test]
+    fn upstream_model_defaults_to_the_name() {
+        assert_eq!(entry("https://x.example", None).upstream_model(), "test");
+        let aliased = Model {
+            upstream_model: Some("real-id".to_string()),
+            ..entry("https://x.example", None)
+        };
+        assert_eq!(aliased.upstream_model(), "real-id");
+    }
+
+    fn minimal(name: &str) -> Model {
+        Model {
             name: name.to_string(),
             provider_type: ProviderType::OpenAICompatible,
             base_url: Some("https://x.example".to_string()),
-            chat_completions_path: None,
-            api_key: None,
-            api_key_name: None,
-            reasoning_model: None,
-            completion_model: None,
+            ..Model::default()
         }
     }
 
     #[tokio::test]
     async fn auth_headers_use_configured_api_key() {
-        let p = ProvidersConfig {
+        let p = Model {
             api_key: Some("sk-test".to_string()),
             ..minimal("t")
         };
@@ -321,7 +344,7 @@ mod tests {
         unsafe {
             std::env::set_var("KLAVA_TEST_AUTH_KEY", "env-key");
         }
-        let p = ProvidersConfig {
+        let p = Model {
             api_key_name: Some("KLAVA_TEST_AUTH_KEY".to_string()),
             ..minimal("t")
         };
@@ -337,8 +360,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_headers_missing_key_is_error() {
-        let p = minimal("t");
+    async fn auth_headers_missing_env_var_is_error() {
+        let p = Model {
+            api_key_name: Some("KLAVA_TEST_AUTH_KEY_ABSENT".to_string()),
+            ..minimal("t")
+        };
         let err = p
             .get_auth_headers_for(&Config::default())
             .await
@@ -347,46 +373,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_headers_without_any_key_are_omitted() {
+        // A local endpoint with no auth: no key field, no header, no error.
+        let p = minimal("t");
+        assert!(
+            p.get_auth_headers_for(&Config::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn validate_config_rejects_missing_base_url() {
-        let p = ProvidersConfig {
+        let p = Model {
             base_url: None,
             api_key: Some("k".to_string()),
             ..minimal("t")
         };
-        let cfg = Config {
-            active_provider: "t".to_string(),
-            providers: vec![p],
-            ..Config::default()
-        };
-        let err = cfg.validate_complete().unwrap_err();
+        let err = p.validate_config(&Config::default()).unwrap_err();
         assert!(matches!(err, Error::MissingBaseUrl));
     }
 
     #[tokio::test]
     async fn validate_config_rejects_non_http_base_url() {
-        let p = ProvidersConfig {
+        let p = Model {
             base_url: Some("ftp://x.example".to_string()),
             api_key: Some("k".to_string()),
             ..minimal("t")
         };
-        let cfg = Config {
-            active_provider: "t".to_string(),
-            providers: vec![p],
-            ..Config::default()
-        };
-        let err = cfg.validate_complete().unwrap_err();
+        let err = p.validate_config(&Config::default()).unwrap_err();
         assert!(matches!(err, Error::InvalidBaseUrl(_)));
     }
 
     #[tokio::test]
-    async fn validate_config_requires_api_key_for_openai_compatible() {
-        let cfg = Config {
-            active_provider: "t".to_string(),
-            providers: vec![minimal("t")],
-            ..Config::default()
+    async fn validate_config_rejects_a_named_but_unset_key_env() {
+        let p = Model {
+            api_key_name: Some("KLAVA_TEST_AUTH_KEY_ABSENT".to_string()),
+            ..minimal("t")
         };
-        let err = cfg.validate_complete().unwrap_err();
+        let err = p.validate_config(&Config::default()).unwrap_err();
         assert!(matches!(err, Error::MissingApiKey(_)));
+    }
+
+    #[tokio::test]
+    async fn validate_config_allows_an_unauthenticated_endpoint() {
+        assert!(minimal("t").validate_config(&Config::default()).is_ok());
     }
 
     #[test]
@@ -405,5 +437,47 @@ mod tests {
         );
         assert_eq!(ProviderType::parse("nonsense"), None);
         assert_eq!(ProviderType::OpenAICompatible.as_str(), "openai-compatible");
+    }
+
+    #[test]
+    fn jigor_backend_is_detected_from_type_and_url() {
+        use crate::providers::JigorBackend;
+
+        // OpenRouter endpoint -> OpenRouter backend.
+        let or = entry("https://openrouter.ai/api", None);
+        assert_eq!(or.jigor_backend(), Some(JigorBackend::Openrouter));
+
+        // Cloudflare account endpoint -> Cloudflare backend + account id.
+        let cf = entry(
+            "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1",
+            None,
+        );
+        assert_eq!(cf.jigor_backend(), Some(JigorBackend::Cloudflare));
+        assert_eq!(cf.cloudflare_account_id().as_deref(), Some("abc123"));
+
+        // Unknown OpenAI-compatible endpoint -> klava (the default).
+        let custom = entry("https://chat.example.com", None);
+        assert_eq!(custom.jigor_backend(), Some(JigorBackend::Klava));
+    }
+
+    #[cfg(feature = "klava")]
+    #[test]
+    fn jigor_backend_defaults_to_klava_for_the_klava_type() {
+        use crate::providers::JigorBackend;
+        let k = Model {
+            provider_type: ProviderType::Klava,
+            ..Model::default()
+        };
+        assert_eq!(k.jigor_backend(), Some(JigorBackend::Klava));
+    }
+
+    #[test]
+    fn explicit_jigor_field_overrides_detection() {
+        use crate::providers::JigorBackend;
+        let custom = Model {
+            jigor: Some("openrouter".to_string()),
+            ..entry("https://gateway.internal", None)
+        };
+        assert_eq!(custom.jigor_backend(), Some(JigorBackend::Openrouter));
     }
 }

@@ -247,10 +247,9 @@ impl CodexRunner {
         let old_config = config.clone();
 
         self.configure_provider(&mut config, &base_url);
-        // Don't add profiles to the profile config itself - that's the legacy format
-        // The profile config explicitly sets the model and provider at root level
-        config.model = default_model_value();
-        config.model_provider_id = default_model_provider();
+        // Don't add profiles to the profile config itself - that's the legacy format.
+        // The profile config explicitly sets the model and provider at root level;
+        // `configure_provider` already pointed them at the active model name.
         config.analytics = AnalyticsConfig::default();
 
         let new_config = toml::to_string_pretty(&config)?;
@@ -318,12 +317,29 @@ impl CodexRunner {
         provider.base_url = Some(base_url.clone());
 
         config.model_provider_id = KLAVA_PROFILE_NAME.to_string();
-        if config.model.is_empty() || config.model == "klava" {
-            config.model = KLAVA_PROFILE_NAME.to_string();
-        }
+
+        // Show the real active model instead of the synthetic "klava" id.
+        // klava routes the request by the name it carries.
+        let active = crate::config::Config::load()
+            .ok()
+            .and_then(|c| c.resolve_completion_model());
+        apply_model(config, active.as_deref());
 
         // Add analytics configuration as requested
         config.analytics.enabled = false;
+    }
+}
+
+/// Point the profile at the active model name (the synthetic `klava` id is
+/// kept only when no model is configured, so a stale config still starts).
+fn apply_model(config: &mut CodexConfig, active: Option<&str>) {
+    match active {
+        Some(model) => config.model = model.to_string(),
+        None => {
+            if config.model.is_empty() || config.model == "klava" {
+                config.model = KLAVA_PROFILE_NAME.to_string();
+            }
+        }
     }
 }
 
@@ -528,7 +544,25 @@ mod tests {
         );
 
         assert_eq!(config.model_provider_id, "klava".to_string());
-        assert_eq!(config.model, "klava".to_string());
+        // No configured model on this machine is not assumed: the profile
+        // either names the real active model or keeps the synthetic id.
+        assert!(!config.model.is_empty());
         assert!(!config.analytics.enabled);
+    }
+
+    #[test]
+    fn apply_model_prefers_the_real_model_name() {
+        let mut config = CodexConfig::default();
+        apply_model(&mut config, Some("~deepseek/deepseek-flash-latest"));
+        assert_eq!(config.model, "~deepseek/deepseek-flash-latest");
+
+        // Without a configured model the synthetic id remains, and an
+        // explicitly chosen model is left alone.
+        let mut config = CodexConfig::default();
+        apply_model(&mut config, None);
+        assert_eq!(config.model, "klava");
+        config.model = "gpt-5".to_string();
+        apply_model(&mut config, None);
+        assert_eq!(config.model, "gpt-5");
     }
 }

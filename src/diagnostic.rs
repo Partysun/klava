@@ -1,10 +1,10 @@
-//! Diagnostic module for testing provider connectivity
+//! Diagnostic module for testing model connectivity
 //!
-//! Sends small, cheap test requests to verify that configurations
-//! and LLM APIs are working correctly.
+//! Sends small, cheap test requests to every configured `[[models]]` entry
+//! to verify that the connection settings and the API are working.
 
 use crate::config::Config;
-use crate::providers::Config as ProviderConfig;
+use crate::providers::Model;
 use crate::{error::Error, models::openai};
 use colored::*;
 use reqwest::Client;
@@ -16,6 +16,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct TestResult {
     pub success: bool,
+    /// Model-entry name that was tested.
     pub provider: String,
     pub model: String,
     pub url: String,
@@ -65,11 +66,11 @@ impl TestResult {
     }
 }
 
-/// Test a provider configuration by sending a minimal request
+/// Test one model entry by sending a minimal request
 pub async fn test_provider(
     client: &Client,
     config: &Config,
-    provider_config: &ProviderConfig,
+    provider_config: &Model,
     model: Option<&str>,
 ) -> Result<TestResult, Error> {
     let start = std::time::Instant::now();
@@ -77,7 +78,7 @@ pub async fn test_provider(
     let mut result = TestResult {
         success: false,
         provider: provider_config.name.clone(),
-        model: model.unwrap_or("unknown").to_string(),
+        model: provider_config.upstream_model(),
         url: "N/A".to_string(),
         latency_ms: 0,
         response_preview: String::new(),
@@ -130,9 +131,7 @@ pub async fn test_provider(
 
     let test_model = model
         .map(|m| m.to_string())
-        .or(provider_config.completion_model())
-        .or(provider_config.reasoning_model())
-        .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+        .unwrap_or_else(|| provider_config.upstream_model());
     result.model = test_model.clone();
 
     let test_req = openai::OpenAIRequest {
@@ -330,21 +329,21 @@ fn validate_api_response(body: &Value) -> Result<String, String> {
     Err("No message content in response".to_string())
 }
 
-/// Test all providers or a specific one
-pub async fn run_tests(config: &Config, provider_name: Option<&str>, model: Option<&str>) {
+/// Test every model entry, or only those named `model_name`.
+pub async fn run_tests(config: &Config, model_name: Option<&str>, model: Option<&str>) {
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to build HTTP client");
 
-    let providers_to_test: Vec<_> = if let Some(name) = provider_name {
-        config.providers.iter().filter(|p| p.name == name).collect()
+    let providers_to_test: Vec<_> = if let Some(name) = model_name {
+        config.models.iter().filter(|p| p.name == name).collect()
     } else {
-        config.providers.iter().collect()
+        config.models.iter().collect()
     };
 
     if providers_to_test.is_empty() {
-        eprintln!("No providers configured. Run 'klava providers' to set up.");
+        eprintln!("No models configured. Run 'klava providers add' to set up.");
         std::process::exit(1);
     }
 

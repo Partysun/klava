@@ -13,13 +13,9 @@
 //! [`tokio::task::spawn_blocking`] with a short timeout.
 
 use crate::config::Config;
-use crate::decision::api_key;
 use crate::search::settings::{Breadth, ContextSize, Engine, SearchSettings};
-use jigor::{Answer, KlavaBackend};
+use jigor::Answer;
 use std::collections::HashMap;
-
-/// How long the decision model may take before klava falls back to defaults.
-const DECIDE_TIMEOUT_SECS: u32 = 8;
 
 /// Question id: needs very recent information?
 const Q_FRESHNESS: &str = "freshness";
@@ -42,13 +38,10 @@ pub async fn tune(config: &Config, query: &str, base: SearchSettings) -> SearchS
     }
 
     let model = config.resolve_decide_model();
-    let Some(key) = api_key(config) else {
-        tracing::debug!("web search: no klava key available; skipping decision model");
-        return base;
-    };
     let state = decision_state(query);
+    let config = config.clone();
 
-    let answers = tokio::task::spawn_blocking(move || run_decision(&model, &key, &state)).await;
+    let answers = tokio::task::spawn_blocking(move || run_decision(&config, &model, &state)).await;
     match answers {
         Ok(Some(answers)) => apply(base, &answers),
         Ok(None) => base,
@@ -70,17 +63,12 @@ fn decision_state(query: &str) -> serde_json::Value {
 /// Run the blocking decision call. Returns typed answers, or `None` on any
 /// failure (fail-open).
 fn run_decision(
+    config: &Config,
     model: &str,
-    key: &str,
     state: &serde_json::Value,
 ) -> Option<HashMap<String, Answer>> {
-    let mut backend = KlavaBackend::for_model(model);
-    // Prefer the resolved key (env or config) over jigor's own env lookup.
-    backend.api_key = key.to_string();
-    backend.timeout_secs = DECIDE_TIMEOUT_SECS;
-
     let questions = questions();
-    match backend.ask(state, &questions, None) {
+    match crate::decision::ask_blocking(config, model, state, &questions) {
         Ok(asks) => {
             tracing::debug!(
                 "web search: decision model {} answered {} question(s)",
