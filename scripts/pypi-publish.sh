@@ -24,16 +24,21 @@ shopt -u nullglob
 [ "${#artifacts[@]}" -gt 0 ] || { echo "no artifacts in dist/" >&2; exit 1; }
 
 API="https://pypi.org/pypi/$PROJECT/$VERSION/json"
-attempts=5
+attempts=8
 body="$(mktemp)"
 trap 'rm -f "$body"' EXIT
 
 # Print the filenames already on PyPI for this version, one per line.
 # Exits non-zero when the registry cannot be reached (404 = nothing yet, which
 # is *not* an error: the first publisher of a version always sees it).
+#
+# Only flags that every curl build understands are used: --retry-connrefused
+# is 7.52+/TLS-only and the release images ship older curls (the maturin image
+# rejects it outright). The outer loop below is what actually rides out a
+# dead resolver on the macOS/Windows agents.
 fetch_published() {
   local http
-  http="$(curl -sS --retry 3 --retry-connrefused --retry-delay 5 \
+  http="$(curl -sS --retry 3 --retry-delay 5 \
     --max-time 45 -o "$body" -w '%{http_code}' "$API")" || return 1
   case "$http" in
     200) python3 -c '
@@ -56,8 +61,8 @@ for ((i = 1; i <= attempts; i++)); do
     echo "cannot query PyPI for $PROJECT $VERSION after $attempts attempts" >&2
     exit 1
   fi
-  echo "PyPI query failed (attempt $i/$attempts), retrying in 10s" >&2
-  sleep 10
+  echo "PyPI query failed (attempt $i/$attempts), retrying in 15s" >&2
+  sleep 15
 done
 
 missing=()
