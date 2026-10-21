@@ -48,8 +48,11 @@ switch ($Phase) {
             }
         }
 
-        cargo install --quiet uv
-        if (-not $?) { throw "cargo install uv failed" }
+        if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+            cargo install --quiet uv
+            if (-not $?) { throw "cargo install uv failed" }
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+        }
         uv tool install --quiet maturin
         if (-not $?) { throw "uv tool install maturin failed" }
 
@@ -79,8 +82,14 @@ switch ($Phase) {
     }
 
     "pypi" {
-        cargo install --quiet uv
-        if (-not $?) { throw "cargo install uv failed" }
+        # uv is usually already there from the build phase; only install it
+        # when missing. Re-running `cargo install uv` here compiles uv from
+        # source again (several minutes, and it looks hung in the log).
+        if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+            cargo install --quiet uv
+            if (-not $?) { throw "cargo install uv failed" }
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+        }
 
         # PyPI rejects re-uploads ("File already exists"): skip files already
         # on the registry so re-runs of the same version are a no-op (mirrors
