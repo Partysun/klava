@@ -77,10 +77,6 @@ dirs = "7.0.0"
 similar = "3.0.0"
 colored = "3.1.1"
 
-# Daemonize (Unix only)
-[target.'cfg(unix)'.dependencies]
-daemonize = "0.5"
-
 # Server utilities
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["trace", "cors"] }
@@ -108,6 +104,13 @@ jigor = { version = "0.1.14", default-features = false, optional = true }
 sha2 = { version = "0.11", optional = true }
 base64 = { version = "0.23.1", optional = true }
 rand = { version = "0.10", optional = true }
+
+# Daemonize (Unix only; daemon.rs has a #[cfg(not(unix))] fallback).
+# Keep every target-specific table BELOW the shared [dependencies] one:
+# a table runs to the next header, so putting it mid-file silently makes
+# everything after it platform-specific (that is what broke the Windows build).
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
 
 # Optional feature flags
 [features]

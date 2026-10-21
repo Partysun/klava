@@ -18,14 +18,45 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 phase="${1:?usage: release-macos.sh <build|pypi|npm>}"
 
+# The Woodpecker step does not inherit the login shell's environment: HOME can
+# point somewhere else, so rustup finds no settings.toml and fails with "no
+# default is configured" even though `rustup show` in a terminal lists stable.
+# Point both homes at the real user's (~$(id -un)), like jigor does.
+if [ "$(uname -s)" = Darwin ]; then
+  user_home="$(eval echo "~$(id -un)")"
+  export RUSTUP_HOME="$user_home/.rustup"
+  export CARGO_HOME="$user_home/.cargo"
+  # the app targets macOS 11+
+  export MACOSX_DEPLOYMENT_TARGET=11.0
+fi
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$HOME/.local/bin:$PATH"
+
+# uv and maturin are not preinstalled on the agent: prefer what is there and
+# fall back to pip/cargo, which works without root.
+have_uv() { command -v uv >/dev/null 2>&1; }
+ensure_uv() {
+  have_uv && return 0
+  python3 -m pip install --quiet --user uv >/dev/null 2>&1 ||
+    python3 -m pip install --quiet --user --break-system-packages uv >/dev/null 2>&1 ||
+    cargo install --quiet uv
+}
+ensure_maturin() {
+  command -v maturin >/dev/null 2>&1 && return 0
+  ensure_uv
+  uv tool install --quiet maturin || true
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v maturin >/dev/null 2>&1 || cargo install --quiet maturin
+}
 
 case "$phase" in
   build)
     bash scripts/check-version.sh
 
-    cargo install --quiet uv || true
-    uv tool install --quiet maturin || true
+    # the toolchain must be resolvable from the agent's environment
+    rustup default stable
+    rustup show active-toolchain
+    ensure_uv
+    ensure_maturin
     # both slices of the universal2 build
     rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
@@ -33,7 +64,7 @@ case "$phase" in
     # `--universal2` is not a maturin flag (the old pipeline used it and
     # therefore never produced a macOS wheel since 0.2.0): universal2 is a
     # target, built as two per-arch slices and lipo-merged by maturin.
-    uv tool run maturin build --release --locked \
+    maturin build --release --locked \
       --target universal2-apple-darwin --out dist
 
     # the npm binary is the exact fat binary the wheel carries
@@ -54,7 +85,7 @@ case "$phase" in
     ;;
 
   pypi)
-    cargo install --quiet uv || true
+    ensure_uv
     bash scripts/pypi-publish.sh
     ;;
 
