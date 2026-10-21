@@ -139,6 +139,11 @@ switch ($Phase) {
     }
 
     "extensions-build" {
+        # This step runs on its own (it does not depend on `build`), so the
+        # toolchain must be selected here too.
+        rustup default stable
+        if (-not $?) { throw "rustup default stable failed" }
+
         # `ort-sys` probes pkg-config for libonnxruntime *before* falling back
         # to its static download and accepts any version >= 1.22, so an agent
         # with ONNX Runtime installed would link it dynamically — which a

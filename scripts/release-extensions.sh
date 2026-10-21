@@ -38,9 +38,13 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$HOME/.local/bin:$PATH"
 
 # macOS release steps run with the agent's HOME, which may differ from the
 # login shell's: point rustup at the real user's homes (same as
-# release-macos.sh) or the toolchain is invisible.
+# release-macos.sh) or the toolchain is invisible. HOME itself matters too:
+# `ort-sys` caches the ONNX Runtime archives it downloads under
+# $HOME/Library/Caches, and the npm phase writes ~/.npmrc, so a step HOME that
+# is not the user's home makes both land in the wrong place.
 if [ "$(uname -s)" = Darwin ]; then
   user_home="$(eval echo "~$(id -un)")"
+  export HOME="$user_home"
   export RUSTUP_HOME="$user_home/.rustup"
   export CARGO_HOME="$user_home/.cargo"
   export MACOSX_DEPLOYMENT_TARGET=11.0
