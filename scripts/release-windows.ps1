@@ -13,7 +13,7 @@
 # script files reach the shell untouched.
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("build", "pypi", "npm")]
+    [ValidateSet("build", "pypi", "npm", "extensions-build", "extensions")]
     [string]$Phase
 )
 
@@ -136,5 +136,69 @@ switch ($Phase) {
         if (-not $?) { throw "npm-version.js failed" }
         node scripts\npm-publish.js npm\platforms\win32-x64-msvc
         exit $LASTEXITCODE
+    }
+
+    "extensions-build" {
+        # `ort-sys` probes pkg-config for libonnxruntime *before* falling back
+        # to its static download and accepts any version >= 1.22, so an agent
+        # with ONNX Runtime installed would link it dynamically — which a
+        # single-file npm package cannot carry. Shadow it with a stale .pc so
+        # ort-sys ignores it and statically links its own prebuilt binaries.
+        $pcDir = "target\ext-build\win32-x64-msvc\pkgconfig"
+        New-Item -ItemType Directory -Path $pcDir -Force | Out-Null
+        Set-Content -Path (Join-Path $pcDir "libonnxruntime.pc") `
+            -Value "Name: onnxruntime`nDescription: shadowed, see scripts/release-windows.ps1`nVersion: 1.0.0`nLibs:`nCflags:`n"
+        $env:PKG_CONFIG_PATH = $pcDir + $(if ($env:PKG_CONFIG_PATH) { ";$env:PKG_CONFIG_PATH" } else { "" })
+        Remove-Item Env:ORT_LIB_LOCATION -ErrorAction SilentlyContinue
+
+        # The three extension crates are independent binaries; `cargo build`
+        # with several -p flags shares the dependency build.
+        $packages = @("klava-compress", "klava-pii-guardrail", "klava-model-escalation")
+        $cargoArgs = @("build", "--release", "--locked")
+        foreach ($p in $packages) { $cargoArgs += @("-p", $p) }
+        & cargo @cargoArgs
+        if (-not $?) { throw "cargo build of the extensions failed" }
+
+        # scripts/ext-npm.js stages the npm packages from a directory of
+        # unconditionally named binaries; the msvc artifacts carry .exe.
+        $dest = "target\ext-npm\win32-x64-msvc"
+        if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        foreach ($p in $packages) {
+            $src = "target\release\$p.exe"
+            if (-not (Test-Path $src)) { throw "missing $src" }
+            # the same dependency guard the unix phases run with ldd/otool
+            $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($src))
+            if ($text -match 'onnxruntime\.dll') {
+                throw "$p.exe imports a shared ONNX runtime: a single-file npm package cannot work"
+            }
+            Copy-Item $src (Join-Path $dest "$p.exe") -Force
+            # same smoke test klava runs after installing one
+            & (Join-Path $dest "$p.exe") --print-manifest | Out-Null
+            if (-not $?) { throw "$p.exe --print-manifest failed" }
+        }
+        Get-ChildItem $dest
+    }
+
+    "extensions" {
+        # The binaries come from the extensions-build step; this image has node
+        # but the publish step cannot recompile them (and must not).
+        if (-not $env:NPM_TOKEN) { throw "NPM_TOKEN is required" }
+        npm config set "//registry.npmjs.org/:_authToken" $env:NPM_TOKEN
+        if (-not $?) { throw "npm config set failed" }
+
+        $dest = "target\ext-npm\win32-x64-msvc"
+        if (-not (Test-Path $dest)) {
+            throw "no $dest : run the extensions-build phase first"
+        }
+        node scripts\ext-npm.js prepare win32-x64-msvc $dest
+        if (-not $?) { throw "ext-npm.js prepare failed" }
+        $dirs = node scripts\ext-npm.js dirs win32-x64-msvc
+        if (-not $?) { throw "ext-npm.js dirs failed" }
+        foreach ($dir in $dirs) {
+            node scripts\npm-publish.js $dir
+            if ($LASTEXITCODE -ne 0) { throw "npm publish of $dir failed" }
+        }
+        exit 0
     }
 }

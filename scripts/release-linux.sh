@@ -5,6 +5,8 @@
 #   bash scripts/release-linux.sh build   # wheels (x86_64 + aarch64) + sdist + npm binaries
 #   bash scripts/release-linux.sh pypi    # uv publish, skipping files already there
 #   bash scripts/release-linux.sh npm     # npm platform packages + meta package
+#   bash scripts/release-linux.sh extensions-build # extension npm binaries (x64 + arm64)
+#   bash scripts/release-linux.sh extensions       # publish the extension npm packages
 #
 # Called by the linux steps of .woodpecker/release-linux.yml. All logic lives
 # here rather than in the YAML: Woodpecker rewrites inline step commands with
@@ -18,7 +20,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-phase="${1:?usage: release-linux.sh <build|pypi|npm>}"
+phase="${1:?usage: release-linux.sh <build|pypi|npm|extensions-build|extensions>}"
 
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 
@@ -88,6 +90,22 @@ case "$phase" in
     # npm auth is already in ~/.npmrc from publish-npm-platform.sh.
     node scripts/npm-version.js npm
     node scripts/npm-publish.js npm --wait-deps=600
+    ;;
+
+  extensions-build)
+    # The extension crates need a different build image than the CLI: they
+    # link a glibc floor of 2.34 (ONNX runtime's prebuilt arm64 objects), while
+    # the maturin image is CentOS 7 / glibc 2.17. This phase only produces the
+    # binaries; `extensions` publishes them from node:22.
+    bash scripts/release-extensions.sh build linux-x64-gnu
+    bash scripts/release-extensions.sh build linux-arm64-gnu
+    ;;
+
+  extensions)
+    # Binaries come from the `extensions-build` phase above: this image has
+    # node but no cargo.
+    export NPM_TOKEN="${NPM_TOKEN:?NPM_TOKEN is required}"
+    bash scripts/release-extensions.sh npm linux-x64-gnu linux-arm64-gnu
     ;;
 
   *)

@@ -10,3 +10,8 @@ dist
 # the JS shim and postinstall.js are committed
 npm/platforms/*/klava
 npm/platforms/*/klava.exe
+
+# npm: the extension packages are generated from the built binaries by
+# scripts/ext-npm.js at publish time (target/ext-npm/<platform>/), never
+# committed
+npm/extensions/stage

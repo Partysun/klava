@@ -28,6 +28,16 @@ cargo install klava-model-escalation
 klava extensions install ~/.cargo/bin/klava-model-escalation --trust
 ```
 
+No Rust toolchain? Install the prebuilt binary from npm instead — the package
+name carries your platform:
+
+```sh
+klava extensions install npm:@zatsepin/klava-model-escalation-linux-x64-gnu --trust
+klava extensions install npm:@zatsepin/klava-model-escalation-linux-arm64-gnu --trust
+klava extensions install npm:@zatsepin/klava-model-escalation-darwin --trust
+klava extensions install npm:@zatsepin/klava-model-escalation-win32-x64-msvc --trust
+```
+
 ## Configuration
 
 All keys live under `[extensions.settings.klava-model-escalation]` in the klava

@@ -3,6 +3,8 @@
 # Publishes:
 #   - the PyPI win_amd64 wheel
 #   - the npm package `@zatsepin/klava-win32-x64-msvc`
+#   - the extension crates as prebuilt npm packages:
+#     `@zatsepin/klava-<ext>-win32-x64-msvc`
 #
 # Step environments DO reach powershell steps, but not the bash (WSL) steps,
 # so everything runs in powershell via a script file — which also keeps
@@ -43,3 +45,20 @@ steps:
         from_secret: npm_token
     commands:
       - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release-windows.ps1 npm
+
+  # Extensions are versioned and published independently of the CLI: these
+  # steps never gate (or are gated by) the CLI's build/publish above.
+  - name: build-extensions
+    image: powershell
+    commands:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release-windows.ps1 extensions-build
+
+  - name: publish-npm-extensions
+    image: powershell
+    depends_on:
+      - build-extensions
+    environment:
+      NPM_TOKEN:
+        from_secret: npm_token
+    commands:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release-windows.ps1 extensions

@@ -4,6 +4,8 @@
 #   - one universal2 wheel (Intel x64 + Apple Silicon arm64 slices lipo-merged
 #     by maturin, so an Intel agent covers both)
 #   - the npm package `@zatsepin/klava-darwin` with the same fat binary
+#   - the extension crates as prebuilt universal2 npm packages:
+#     `@zatsepin/klava-<ext>-darwin`
 #
 # All logic lives in scripts/ so Woodpecker's envsubst never touches a dollar
 # sign; klava has no ONNX runtime in the CLI, so unlike jigor both slices are
@@ -42,3 +44,20 @@ steps:
         from_secret: npm_token
     commands:
       - bash scripts/release-macos.sh npm
+
+  # Extensions are versioned and published independently of the CLI: these
+  # steps never gate (or are gated by) the CLI's build/publish above.
+  - name: build-extensions
+    image: bash
+    commands:
+      - bash scripts/release-macos.sh extensions-build
+
+  - name: publish-npm-extensions
+    image: bash
+    depends_on:
+      - build-extensions
+    environment:
+      NPM_TOKEN:
+        from_secret: npm_token
+    commands:
+      - bash scripts/release-macos.sh extensions

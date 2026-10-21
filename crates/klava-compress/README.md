@@ -19,6 +19,16 @@ cargo install klava-compress
 klava extensions install ~/.cargo/bin/klava-compress --trust
 ```
 
+No Rust toolchain? Install the prebuilt binary from npm instead — the package
+name carries your platform:
+
+```sh
+klava extensions install npm:@zatsepin/klava-compress-linux-x64-gnu --trust
+klava extensions install npm:@zatsepin/klava-compress-linux-arm64-gnu --trust
+klava extensions install npm:@zatsepin/klava-compress-darwin --trust
+klava extensions install npm:@zatsepin/klava-compress-win32-x64-msvc --trust
+```
+
 The `--trust` above also consents to the model download, which runs right after
 the extension is enabled (see [Model](#model)). To install and enable without
 downloading anything, or to fetch later:

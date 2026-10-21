@@ -4,10 +4,16 @@
 #   - the PyPI x86_64 wheel, aarch64 wheel (cross-compiled with zig) and sdist
 #   - the npm platform packages `@zatsepin/klava-linux-{x64,arm64}-gnu`
 #     plus the meta `@zatsepin/klava` package
+#   - the extension crates as prebuilt npm packages, one per crate and
+#     platform: `@zatsepin/klava-<ext>-linux-{x64,arm64}-gnu`
 #
-# Steps are split by phase and cut across two images (the maturin image has
+# Steps are split by phase and cut across images (the maturin image has
 # the manylinux toolchain but no node; node:22 has npm), and all logic lives
 # in scripts/ so Woodpecker's envsubst never touches a dollar sign.
+#
+# The extensions build in rust:bookworm, not the maturin image: ONNX runtime's
+# prebuilt aarch64 objects give klava-compress a glibc 2.34 floor, so it needs a
+# real GNU aarch64 cross toolchain (zig cannot link them) and a matching libc.
 when:
   - event: deployment
     evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "linux", "npm", "pypi", "publish"]'
@@ -45,3 +51,20 @@ steps:
         from_secret: npm_token
     commands:
       - bash scripts/release-linux.sh npm
+
+  # Extensions are versioned and published independently of the CLI: these
+  # steps never gate (or are gated by) the CLI's build/publish above.
+  - name: build-extensions
+    image: rust:bookworm
+    commands:
+      - bash scripts/release-linux.sh extensions-build
+
+  - name: publish-npm-extensions
+    image: node:22
+    depends_on:
+      - build-extensions
+    environment:
+      NPM_TOKEN:
+        from_secret: npm_token
+    commands:
+      - bash scripts/release-linux.sh extensions

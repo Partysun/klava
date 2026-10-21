@@ -18,6 +18,16 @@ cargo install klava-pii-guardrail
 klava extensions install ~/.cargo/bin/klava-pii-guardrail --trust
 ```
 
+No Rust toolchain? Install the prebuilt binary from npm instead — the package
+name carries your platform:
+
+```sh
+klava extensions install npm:@zatsepin/klava-pii-guardrail-linux-x64-gnu --trust
+klava extensions install npm:@zatsepin/klava-pii-guardrail-linux-arm64-gnu --trust
+klava extensions install npm:@zatsepin/klava-pii-guardrail-darwin --trust
+klava extensions install npm:@zatsepin/klava-pii-guardrail-win32-x64-msvc --trust
+```
+
 ## Configuration
 
 All keys live under `[extensions.settings.klava-pii-guardrail]` in the klava

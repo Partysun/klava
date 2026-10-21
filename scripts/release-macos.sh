@@ -4,6 +4,8 @@
 #   bash scripts/release-macos.sh build   # universal2 wheel + npm fat binary
 #   bash scripts/release-macos.sh pypi    # uv publish, skipping files already there
 #   bash scripts/release-macos.sh npm     # npm darwin platform package
+#   bash scripts/release-macos.sh extensions-build # extension npm binaries (universal2)
+#   bash scripts/release-macos.sh extensions       # publish the extension npm packages
 #
 # Called by the darwin steps of .woodpecker/release-macos.yml. All logic lives
 # here rather than in the YAML: Woodpecker rewrites inline step commands with
@@ -16,7 +18,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-phase="${1:?usage: release-macos.sh <build|pypi|npm>}"
+phase="${1:?usage: release-macos.sh <build|pypi|npm|extensions-build|extensions>}"
 
 # The Woodpecker step does not inherit the login shell's environment: HOME can
 # point somewhere else, so rustup finds no settings.toml and fails with "no
@@ -92,6 +94,17 @@ case "$phase" in
   npm)
     export NPM_TOKEN="${NPM_TOKEN:?NPM_TOKEN is required}"
     bash scripts/publish-npm-platform.sh npm/platforms/darwin
+    ;;
+
+  extensions-build)
+    # Same agent, same toolchain: universal2 like the CLI's npm package. Both
+    # slices build natively here, so no cross toolchain is involved.
+    bash scripts/release-extensions.sh build darwin
+    ;;
+
+  extensions)
+    export NPM_TOKEN="${NPM_TOKEN:?NPM_TOKEN is required}"
+    bash scripts/release-extensions.sh npm darwin
     ;;
 
   *)

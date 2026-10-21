@@ -18,6 +18,7 @@ klava extensions install cargo-path:./my-crate --trust
 klava extensions install cargo-git:https://github.com/user/repo --trust
 klava extensions install npm:my-extension --trust
 klava extensions install npm:@scope/pkg@1.2.3 --trust
+klava extensions install npm:@zatsepin/klava-compress-linux-x64-gnu --trust
 ```
 
 | Source | What klava does |
@@ -26,7 +27,7 @@ klava extensions install npm:@scope/pkg@1.2.3 --trust
 | `cargo:<crate>[@ver]` | Runs `cargo install --root <staging>`. |
 | `cargo-path:<dir>` | Same, from a local crate directory. |
 | `cargo-git:<url>[#rev]` | Same, from git. |
-| `npm:<pkg>[@ver]` | Runs `npm pack`, extracts, and takes the `bin` from `package.json`. |
+| `npm:<pkg>[@ver]` | Runs `npm pack`, extracts, and takes the `bin` from `package.json`. Because `npm pack` installs no dependencies and runs no postinstall, the package must contain the executable itself — that is why the klava extensions publish one package per crate *and* platform, e.g. `npm:@zatsepin/klava-compress-linux-x64-gnu`. |
 
 Installing runs third-party code, so klava prints the source and target and
 requires `--trust` (or an interactive `y`). The exact command is printed before
@@ -57,6 +58,39 @@ Drop an executable into the data directory:
 mkdir -p ~/.local/share/klava/extensions
 install -m 755 my-extension ~/.local/share/klava/extensions/my-extension
 ```
+
+### The klava extensions on npm
+
+The three extensions klava publishes are also on npm as prebuilt binaries, one
+package per crate and platform. They install with no Rust toolchain and no
+build step:
+
+| Extension | Package (append the platform) |
+|---|---|
+| `klava-compress` | `@zatsepin/klava-compress-<platform>` |
+| `klava-pii-guardrail` | `@zatsepin/klava-pii-guardrail-<platform>` |
+| `klava-model-escalation` | `@zatsepin/klava-model-escalation-<platform>` |
+
+Platforms: `linux-x64-gnu`, `linux-arm64-gnu`, `darwin` (universal2),
+`win32-x64-msvc`. For example:
+
+```sh
+klava extensions install npm:@zatsepin/klava-pii-guardrail-linux-x64-gnu --trust
+```
+
+There is deliberately no per-extension meta package: `npm pack` (what the npm
+installer runs) installs no dependencies and runs no postinstall, so a meta
+package would hand klava a shim with no binary next to it. The platform is part
+of the name for the same reason the CLI ships `@zatsepin/klava-linux-x64-gnu`.
+
+`klava-compress` links ONNX Runtime statically, so the package stays one file.
+That is not automatic: `ort-sys` asks `pkg-config` for `libonnxruntime` before
+falling back to its own prebuilt download and accepts any version ≥ 1.22, so a
+build machine that happens to have ONNX Runtime installed (Homebrew on macOS,
+distro packages elsewhere) would produce a binary linked against a shared
+library — broken once copied out of the package. The release scripts shadow that
+`.pc` with a deliberately stale one and fail the build if a
+`ldd`/`otool`/import-table check still shows a shared ONNX Runtime.
 
 ## Where klava looks
 
