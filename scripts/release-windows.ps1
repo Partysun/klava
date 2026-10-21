@@ -139,10 +139,22 @@ switch ($Phase) {
     }
 
     "extensions-build" {
-        # This step runs on its own (it does not depend on `build`), so the
-        # toolchain must be selected here too.
+        # Woodpecker's local backend gives every step the same per-pipeline
+        # HOME, and the CLI's `build` runs at the same time as this step.
+        # Both need a rustup toolchain there, and two concurrent
+        # `rustup default stable` runs corrupt the shared downloads directory
+        # (a component fails to rename its .partial file, and the CLI's build
+        # dies). A dedicated RUSTUP_HOME keeps this step independent of that:
+        # it installs its toolchain once, into a stable path, and never
+        # touches the one `build` is writing. CARGO_HOME stays shared (cargo
+        # locks its registry itself).
+        $env:RUSTUP_HOME = Join-Path $env:USERPROFILE ".rustup-extensions"
         rustup default stable
         if (-not $?) { throw "rustup default stable failed" }
+
+        # An own target dir: sharing target\ with the CLI's build would make
+        # the two cargo invocations evict each other's artifacts.
+        $env:CARGO_TARGET_DIR = "target\ext-build\win32-x64-msvc"
 
         # `ort-sys` probes pkg-config for libonnxruntime *before* falling back
         # to its static download and accepts any version >= 1.22, so an agent
@@ -170,7 +182,7 @@ switch ($Phase) {
         if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
         New-Item -ItemType Directory -Path $dest -Force | Out-Null
         foreach ($p in $packages) {
-            $src = "target\release\$p.exe"
+            $src = Join-Path $env:CARGO_TARGET_DIR "release\$p.exe"
             if (-not (Test-Path $src)) { throw "missing $src" }
             # the same dependency guard the unix phases run with ldd/otool
             $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($src))
