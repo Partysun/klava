@@ -1,0 +1,47 @@
+{
+  "name": "@zatsepin/klava",
+  "version": "0.3.0",
+  "description": "Klava CLI — run code agents (Claude Code, OpenCode, Pi, Codex) against any OpenAI-compatible provider, with secrets filtered out of your filesystem first.",
+  "homepage": "https://github.com/Partysun/klava",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Partysun/klava.git"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "codex",
+    "opencode",
+    "anthropic",
+    "openai",
+    "proxy",
+    "cli"
+  ],
+  "engines": {
+    "node": ">= 18.0.0"
+  },
+  "files": [
+    "klava",
+    "postinstall.js"
+  ],
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "optionalDependencies": {
+    "@zatsepin/klava-darwin": "0.3.0",
+    "@zatsepin/klava-linux-arm64-gnu": "0.3.0",
+    "@zatsepin/klava-linux-x64-gnu": "0.3.0",
+    "@zatsepin/klava-win32-x64-msvc": "0.3.0"
+  },
+  "bin": {
+    "klava": "klava"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/Partysun/klava/issues"
+  }
+}

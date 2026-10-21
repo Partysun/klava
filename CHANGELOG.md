@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.
+- **PyPI wheels for every supported platform.** Alongside the sdist, releases now ship `manylinux_2_17` wheels for x86_64 and aarch64 (aarch64 cross-compiled on the amd64 agent with zig), a macOS universal2 wheel and a Windows wheel, so `pip install klava` / `uvx klava` no longer compile from source. The macOS wheel had been missing since 0.2.0 because the release step passed a flag maturin does not have.
+
 ## [0.3.0] - 2026-10-20
 
 ### Added

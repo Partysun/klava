@@ -5,3 +5,8 @@ dist
 .claude
 .cargo
 .venv
+
+# npm: platform binaries are injected by CI; only the package.json templates,
+# the JS shim and postinstall.js are committed
+npm/platforms/*/klava
+npm/platforms/*/klava.exe

@@ -1,0 +1,29 @@
+{
+  "name": "@zatsepin/klava-linux-x64-gnu",
+  "version": "0.3.0",
+  "description": "klava binary for linux x64 (glibc)",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "klava"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Partysun/klava.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/Partysun/klava/issues"
+  }
+}

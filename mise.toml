@@ -15,6 +15,18 @@ run = "hurl --variable host=http://localhost:8085 --test tests.hurl"
 description = "Build for current platform"
 run = "cargo build --release"
 
-[tasks.build-pypi-artifacts]
-description = "Build artifacts for PyPI (manylinux via Docker + native via uv)"
-run = "docker run --rm -v $(pwd):/io ghcr.io/pyo3/maturin build --release --manylinux 2_17 --out dist && uv run maturin build --release --out dist && uv run maturin build --release --target aarch64-apple-darwin --out dist && uv run maturin build --release --target x86_64-pc-windows-gnu --out dist"
+[tasks.check-version]
+description = "Verify Cargo.toml / pyproject.toml / npm/package.json versions agree"
+run = "bash scripts/check-version.sh"
+
+[tasks.check-published]
+description = "Check that the current version is live on crates.io, PyPI and npm"
+run = "bash scripts/check-published.sh"
+
+[tasks.build-wheel-linux]
+description = "Build the manylinux x86_64 wheel + sdist locally (CI also builds an arm64 wheel with zig)"
+run = "docker run --rm -v $(pwd):/io ghcr.io/pyo3/maturin maturin build --release --locked --manylinux 2_17 --sdist --out dist"
+
+[tasks.pack-npm]
+description = "Dry-run the npm tarballs (platform binaries must already be in npm/platforms/*/)"
+run = "node scripts/npm-version.js npm npm/platforms/*/ && npm pack --dry-run --json ./npm"

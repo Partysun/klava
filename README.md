@@ -12,19 +12,45 @@ Klava is a CLI tool for using code agents with any provider. Use Claude Code wit
 
 ## Installation
 
-You can install klava from [pip](https://pypi.org/), [cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html), [mise](https://github.com/jdx/mise)!
+You can install klava from [pip](https://pypi.org/project/klava/),
+[npm](https://www.npmjs.com/package/@zatsepin/klava),
+[cargo](https://doc.rust-lang.org/cargo/getting-started/installation.html) or
+[mise](https://github.com/jdx/mise)!
 
 ```bash
+# Python (uvx and uv tool run it without a permanent install)
 pip install klava
+uv tool install klava
+uvx klava --help
+
+# Node (npx runs it without a permanent install)
+npm install --global @zatsepin/klava
+npx @zatsepin/klava --help
+
+# Rust
 cargo install klava --locked
 mise use -g cargo:klava
 ```
+
+Prebuilt binaries ship for linux x86_64/arm64 (glibc ≥ 2.17), macOS
+(universal2: Intel + Apple Silicon) and Windows x86_64, so neither pip nor npm
+needs a Rust toolchain. Alpine/musl and other platforms fall back to
+`cargo install klava`.
 
 Or you can build klava from source. You need to install rustup, clone the repository and then
 
 ```bash
 cargo install --path . --locked
 ```
+
+### Releasing (maintainers)
+
+Version and tag come from `Cargo.toml` `[package]` — bump it, plus
+`pyproject.toml` and `npm/package.json` (the test pipeline runs
+`scripts/check-version.sh` and fails on drift), then tag `v<version>`. The
+Woodpecker pipelines build and publish PyPI wheels/sdist and the npm platform
+packages per agent OS; both registries skip files that already exist, so a
+re-run of the same tag is safe.
 
 ### Launch AI Code Agent
 

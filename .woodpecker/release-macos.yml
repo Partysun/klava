@@ -1,6 +1,16 @@
+# PyPI + npm release for macOS (single darwin/amd64 agent).
+#
+# Publishes:
+#   - one universal2 wheel (Intel x64 + Apple Silicon arm64 slices lipo-merged
+#     by maturin, so an Intel agent covers both)
+#   - the npm package `@zatsepin/klava-darwin` with the same fat binary
+#
+# All logic lives in scripts/ so Woodpecker's envsubst never touches a dollar
+# sign; klava has no ONNX runtime in the CLI, so unlike jigor both slices are
+# plain cargo builds.
 when:
   - event: deployment
-    evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "macos", "publish"]'
+    evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "macos", "npm", "pypi", "publish"]'
   - event: tag
     ref: refs/tags/v*
 
@@ -8,16 +18,27 @@ labels:
   platform: darwin/amd64
 
 steps:
-  # Local macOS agent:
-  # receive from_secret environments.
-  - name: macos-publish
+  - name: build
     image: bash
+    commands:
+      - bash scripts/release-macos.sh build
+
+  - name: publish-pypi
+    image: bash
+    depends_on:
+      - build
     environment:
       UV_PUBLISH_TOKEN:
         from_secret: uv_token
     commands:
-      - cargo install --quiet uv || true
-      - uv tool install --quiet maturin || true
-      - uv tool run maturin build --release --universal2 --out dist
-      - uv publish dist/*
+      - bash scripts/release-macos.sh pypi
 
+  - name: publish-npm
+    image: bash
+    depends_on:
+      - build
+    environment:
+      NPM_TOKEN:
+        from_secret: npm_token
+    commands:
+      - bash scripts/release-macos.sh npm

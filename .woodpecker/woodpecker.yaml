@@ -12,10 +12,13 @@ steps:
     image: rust:latest
     commands:
       - cargo test
+      # fails when Cargo.toml / pyproject.toml / npm/package.json drift apart:
+      # each registry is published from its own manifest
+      - bash scripts/check-version.sh
 
   - name: build
     image: ghcr.io/pyo3/maturin
     commands:
-      - maturin build --release --manylinux 2_17 --sdist --out dist
+      - maturin build --release --locked --manylinux 2_17 --sdist --out dist
     depends_on:
       - test

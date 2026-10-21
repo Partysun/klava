@@ -1,6 +1,16 @@
+# PyPI + npm release for linux/amd64.
+#
+# Publishes, from the one amd64 docker agent:
+#   - the PyPI x86_64 wheel, aarch64 wheel (cross-compiled with zig) and sdist
+#   - the npm platform packages `@zatsepin/klava-linux-{x64,arm64}-gnu`
+#     plus the meta `@zatsepin/klava` package
+#
+# Steps are split by phase and cut across two images (the maturin image has
+# the manylinux toolchain but no node; node:22 has npm), and all logic lives
+# in scripts/ so Woodpecker's envsubst never touches a dollar sign.
 when:
   - event: deployment
-    evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "linux", "publish"]'
+    evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "linux", "npm", "pypi", "publish"]'
   - event: tag
     ref: refs/tags/v*
 
@@ -9,12 +19,29 @@ labels:
   platform: linux/amd64
 
 steps:
-  - name: publish
+  - name: build
     image: ghcr.io/pyo3/maturin
     commands:
-      - pip install uv
-      - maturin build --release --manylinux 2_17 --sdist --out dist
-      - uv publish dist/*
+      - bash scripts/release-linux.sh build
+
+  # publishing is idempotent per registry: a failed npm push never blocks
+  # PyPI and a re-run of the same tag is a no-op on both
+  - name: publish-pypi
+    image: ghcr.io/pyo3/maturin
+    depends_on:
+      - build
     environment:
       UV_PUBLISH_TOKEN:
         from_secret: uv_token
+    commands:
+      - bash scripts/release-linux.sh pypi
+
+  - name: publish-npm
+    image: node:22
+    depends_on:
+      - build
+    environment:
+      NPM_TOKEN:
+        from_secret: npm_token
+    commands:
+      - bash scripts/release-linux.sh npm

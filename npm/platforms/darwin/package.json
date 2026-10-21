@@ -1,0 +1,27 @@
+{
+  "name": "@zatsepin/klava-darwin",
+  "version": "0.3.0",
+  "description": "klava binary for macOS — universal2 fat binary (Intel x64 and Apple Silicon arm64)",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "files": [
+    "klava"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Partysun/klava.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/Partysun/klava/issues"
+  }
+}

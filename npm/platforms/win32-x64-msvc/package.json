@@ -1,0 +1,26 @@
+{
+  "name": "@zatsepin/klava-win32-x64-msvc",
+  "version": "0.3.0",
+  "description": "klava binary for windows x64",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "klava.exe"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Partysun/klava.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/Partysun/klava/issues"
+  }
+}
