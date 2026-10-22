@@ -2,9 +2,33 @@ debug
 target
 dist
 .env
+.env.*
 .claude
-.cargo
 .venv
+
+# .cargo/ holds local cargo state, but .cargo/config.toml carries the
+# cross-compilation linkers used by the release builds, so it stays tracked.
+.cargo/*
+!.cargo/config.toml
+
+# Credentials. Nothing here is ever read from the repo: the release pipelines
+# get their tokens from Woodpecker (`from_secret: npm_token` / `uv_token`) and
+# write them to the agent's home (~/.npmrc, npm config set), never to a file
+# under version control. These entries only catch a token pasted here by hand
+# or copied in by tooling.
+.npmrc
+.pypirc
+.netrc
+credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+known_hosts
 
 # npm: platform binaries are injected by CI; only the package.json templates,
 # the JS shim and postinstall.js are committed
