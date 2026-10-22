@@ -170,11 +170,41 @@ switch ($Phase) {
 
         # The three extension crates are independent binaries; `cargo build`
         # with several -p flags shares the dependency build.
+        #
+        # Retried because ort-sys's build script can abort with "could not
+        # determine cache directory": it locates the cache through
+        # SHGetKnownFolderPath, which intermittently fails in a freshly
+        # spawned step process (the same commit has both passed and failed
+        # here). That is a transient shell-API failure, not a build error, and
+        # a retry reuses every dependency already compiled.
         $packages = @("klava-compress", "klava-pii-guardrail", "klava-model-escalation")
         $cargoArgs = @("build", "--release", "--locked")
         foreach ($p in $packages) { $cargoArgs += @("-p", $p) }
-        & cargo @cargoArgs
-        if (-not $?) { throw "cargo build of the extensions failed" }
+        $log = Join-Path $env:TEMP "klava-extensions-build.log"
+        $attempts = 3
+        # Redirecting a native command's stderr turns every line into an error
+        # record, which the script-wide "Stop" preference would escalate into
+        # a terminating error. The exit code is the verdict here.
+        $previousPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $code = 1
+        try {
+            for ($i = 1; $i -le $attempts; $i++) {
+                # Pre-created so the pattern check below never reads a stale
+                # or missing file. `2>&1` turns each stderr line into an
+                # ErrorRecord; ToString() keeps the log plain text.
+                [IO.File]::WriteAllText($log, "")
+                & cargo @cargoArgs 2>&1 | ForEach-Object { $_.ToString() } | Tee-Object -FilePath $log
+                $code = $LASTEXITCODE
+                if ($code -eq 0) { break }
+                $text = Get-Content $log -Raw
+                if ($i -eq $attempts -or $text -notmatch "could not determine cache directory") { break }
+                Write-Host "ort-sys could not locate its cache directory (attempt $i/$attempts), retrying"
+            }
+        } finally {
+            $ErrorActionPreference = $previousPreference
+        }
+        if ($code -ne 0) { throw "cargo build of the extensions failed" }
 
         # scripts/ext-npm.js stages the npm packages from a directory of
         # unconditionally named binaries; the msvc artifacts carry .exe.
