@@ -4,8 +4,14 @@
 
 ### Added
 
+- **`klava-compress` plans a request instead of using a fixed token window.** `min_tokens = 200` / `max_tokens = 1500` matched *none* of the real tool output it was configured for (p50 188, p90 2,716, max 5,090 tokens), and memory is quadratic in the token count — 14k tokens measured 26.7 GB, ~41k asked ONNX Runtime for a single 80 GB buffer, and 24 OOM kills later the kernel always shot the extension. The extension now derives its window from two budgets (`budget_mb`, `budget_ms`), detects the first from what the machine actually has — cgroup v2 headroom then `MemAvailable` on Linux, Mach VM statistics on macOS, `GlobalMemoryStatusEx` on Windows — keeps a quarter back for the rest of the machine, and plans each request cheapest-message-first so a request that runs out of time returns partial work rather than nothing. A 14k-token message went from 26.7 GB / 54 s to 60 MB / 0.1 s, and a production-shaped 20-message request from 26 GB to 1.8 GB.
 - **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.
 - **PyPI wheels for every supported platform.** Alongside the sdist, releases now ship `manylinux_2_17` wheels for x86_64 and aarch64 (aarch64 cross-compiled on the amd64 agent with zig), a macOS universal2 wheel and a Windows wheel, so `pip install klava` / `uvx klava` no longer compile from source. The macOS wheel had been missing since 0.2.0 because the release step passed a flag maturin does not have.
+
+### Fixed
+
+- **`klava-compress` ran inference on messages it had already decided to discard.** The size guard ran *after* the forward pass, so a request the extension was certain to leave untouched still mapped the 600 MB graph and paid full inference — measured, 93% of all messages. Rejection now happens on the tokenizer's output, before the graph is loaded.
+- `klava-compress` no longer rewrites a message to remove less than 200 bytes. A percentage-only floor let a 40-token message "save 50%" and contribute nothing while the inference that produced it could have removed far more elsewhere.
 
 ## [0.3.0] - 2026-10-20
 

@@ -64,9 +64,11 @@ directories after it); `klava extensions path` lists them.
 
 One process per request that has an enabled extension. For this extension that
 is about **1.0 s of startup**, almost all of it loading the 573 MB ONNX model.
-The `max_tokens` window matters more here than in a linked design: a message
-outside `min_tokens..=max_tokens` costs the startup and is then skipped, so set
-the window to where compression actually pays.
+That fixed cost is why the extension rejects a message on its token count
+*before* mapping the graph: a message outside the window must not pay for the
+model. Below that, inference itself is quadratic in the token count, so the
+extension plans each request against a memory and time budget rather than a
+fixed window — see `crates/klava-compress/README.md`.
 
 ## klava-compress
 
@@ -115,9 +117,11 @@ klava extensions show klava-compress
 | `enabled` | `false` | Off by default: the model is a large download. |
 | `model_dir` | cache dir | Where `kompress-fp32.onnx` and `tokenizer.json` live. |
 | `threshold` | `0.7` | Keep a token when its score is ≥ this. Lower keeps more. |
-| `min_tokens` | `200` | Skip shorter messages; fixed cost dominates. |
-| `max_tokens` | `1500` | Skip longer messages; inference is superlinear. |
-| `min_savings` | `0.10` | Discard a result below this saving fraction. |
+| `min_tokens` | `0` = derived | Skip shorter messages. Derived from the 200-byte savings floor, near 100 tokens. |
+| `max_tokens` | `0` = derived | Only lowers the budget's own ceiling; a larger value is clamped to it. |
+| `min_savings` | `0.10` | Discard a result below this saving fraction or below 200 bytes. |
+| `budget_mb` | `0` = detected | Megabytes one request may spend on inference. `0` measures the machine: cgroup v2 headroom then `MemAvailable` on Linux, Mach VM statistics on macOS, `ullAvailPhys` on Windows. |
+| `budget_ms` | `0` = 8000 | Milliseconds one request may spend on inference; klava kills the extension at 20 s. |
 | `roles` | `["tool"]` | Which message roles may be rewritten. |
 | `skip_structured` | `true` | Skip content that is mostly code, SQL, JSON, or diffs. |
 
@@ -173,10 +177,15 @@ honest trade: no silent corruption.
 
 ### Cost
 
-Inference is CPU-bound and superlinear: ~0.43 ms/token at 175 tokens,
-0.70 ms/token at 1.7k, 1.9 ms/token at 3.4k. A 3.4k-token message costs ~6.5 s,
-which is why `max_tokens` defaults to 1500 and messages outside
-`min_tokens..=max_tokens` are skipped before inference.
+Inference is CPU-bound and quadratic: measured peak RSS and wall time are
+2k → 1.2 GB / 2.6 s, 4k → 2.9 GB / 6.5 s, 8k → 8.6 GB / 20 s, 14k → 26.7 GB /
+54 s, and ~41k asks ONNX Runtime for a single 80 GB buffer. Thread count does not
+change this (28, 20 and 4 threads all measured 8.6 GB at 8k tokens).
+
+So the token ceiling is **derived**, not configured: it is the largest message
+that fits the memory budget this process detects, capped at 4,000 tokens as a
+backstop. `budget_mb` and `budget_ms` override the detection; `min_tokens` and
+`max_tokens` can only narrow the result.
 
 ### Known limits
 

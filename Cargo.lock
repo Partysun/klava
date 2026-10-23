@@ -1404,19 +1404,21 @@ dependencies = [
 
 [[package]]
 name = "klava-compress"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
+ "libc",
  "ort",
  "serde",
  "serde_json",
  "tokenizers",
  "toml 1.1.6+spec-1.1.0",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "klava-model-escalation"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1425,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "klava-pii-guardrail"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "pii",
  "serde",

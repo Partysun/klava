@@ -13,6 +13,27 @@
 //! inference error, structured content, or a rewrite that would lose meaning all
 //! leave the request untouched. Compression is an optimization, never a gate.
 //!
+//! # Cost, and why there is a planner
+//!
+//! Inference memory and time are **quadratic** in the token count (attention),
+//! and the fixed model load dominates small inputs:
+//!
+//! | tokens | peak RSS | wall |
+//! |--------|----------|------|
+//! | 2,000  | 1.2 GB   | 2.6 s |
+//! | 4,000  | 2.9 GB   | 6.5 s |
+//! | 8,000  | 8.6 GB   | 20 s |
+//! | 11,000 | 15.7 GB  | 34 s |
+//! | 14,000 | 26.7 GB  | 54 s |
+//!
+//! So "compress the big tool results" and "do not exhaust the machine" are the
+//! same requirement, and a fixed `max_tokens` cannot express it: the right
+//! ceiling depends on the machine, on what klava will wait for, and on how many
+//! messages the request carries. [`Compressor::plan`] spends a per-request budget
+//! of megabytes and seconds, cheapest message first, and never starts an
+//! inference it has not paid for. Every check that can reject a message without
+//! the graph runs before the graph is mapped.
+//!
 //! [model]: https://huggingface.co/chopratejas/kompress-v2-base
 
 use ort::session::Session;
@@ -22,6 +43,7 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
 /// The protocol version klava sends. We answer whatever we understand.
@@ -48,9 +70,11 @@ timeout_secs = 3600
 enabled = false
 model_dir = ""
 threshold = 0.7
-min_tokens = 200
-max_tokens = 1500
+min_tokens = 0
+max_tokens = 0
 min_savings = 0.1
+budget_mb = 0
+budget_ms = 0
 roles = ["tool"]
 skip_structured = true
 "#;
@@ -104,10 +128,20 @@ pub struct CompressConfig {
     /// repeated JSON 0% / 4%.
     #[serde(default = "default_threshold")]
     pub threshold: f32,
-    /// Skip messages shorter than this many tokens (fixed cost dominates).
+    /// Hard floor on tokens, or `0` to derive one from [`MIN_SAVED_BYTES`].
+    ///
+    /// A message smaller than the floor is not worth a forward pass. Deriving it
+    /// is better than guessing: at the observed ~50% savings rate, the smallest
+    /// message that still removes a useful amount of text is about
+    /// `2 * MIN_SAVED_BYTES` bytes, which lands far below the old fixed 200 and
+    /// is what makes ordinary tool output eligible.
     #[serde(default = "default_min_tokens")]
     pub min_tokens: usize,
-    /// Skip messages longer than this many tokens (inference gets expensive).
+    /// Hard ceiling on tokens for one message, or `0` to let the budget decide.
+    ///
+    /// Only lower this. The effective ceiling is always the smaller of this and
+    /// what [`Self::budget_mb`] allows, because memory is quadratic in the token
+    /// count and no configuration may override that.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
     /// Discard a result unless it removes at least this fraction of tokens.
@@ -115,6 +149,20 @@ pub struct CompressConfig {
     /// Prevents paying inference cost to shave off a token or two.
     #[serde(default = "default_min_savings")]
     pub min_savings: f32,
+    /// Megabytes this process may spend on inference, or `0` to detect a budget.
+    ///
+    /// Detection reads the cgroup v2 limit, then `MemAvailable`, and leaves head-
+    /// room so a large message cannot take the desktop down with it. This is the
+    /// one number that actually bounds memory; `max_tokens` is derived from it.
+    #[serde(default = "default_budget_mb")]
+    pub budget_mb: usize,
+    /// Milliseconds a whole request may spend on inference, or `0` to derive one.
+    ///
+    /// The host kills the process at `timeout_secs` (20 by default), so spending
+    /// the whole budget risks returning nothing at all. The derived value leaves
+    /// room for the model load, the analysis and a reply.
+    #[serde(default = "default_budget_ms")]
+    pub budget_ms: usize,
     /// Message roles whose content may be rewritten.
     #[serde(default = "default_roles")]
     pub roles: Vec<String>,
@@ -131,13 +179,19 @@ fn default_threshold() -> f32 {
     0.7
 }
 fn default_min_tokens() -> usize {
-    200
+    0
 }
 fn default_max_tokens() -> usize {
-    1500
+    0
 }
 fn default_min_savings() -> f32 {
     0.10
+}
+fn default_budget_mb() -> usize {
+    0
+}
+fn default_budget_ms() -> usize {
+    0
 }
 fn default_roles() -> Vec<String> {
     vec!["tool".to_string()]
@@ -155,6 +209,8 @@ impl Default for CompressConfig {
             min_tokens: default_min_tokens(),
             max_tokens: default_max_tokens(),
             min_savings: default_min_savings(),
+            budget_mb: default_budget_mb(),
+            budget_ms: default_budget_ms(),
             roles: default_roles(),
             skip_structured: default_skip_structured(),
         }
@@ -203,48 +259,432 @@ fn shellexpand(path: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// What inference costs
+// ---------------------------------------------------------------------------
+
+/// Resident megabytes of the ONNX graph itself, measured: the same whether the
+/// message is 0 or 400 tokens.
+const MODEL_RESIDENT_MB: f64 = 1100.0;
+
+/// Extra peak megabytes per token **squared**.
+///
+/// Attention makes this quadratic. Fitted to the measured peaks (fp32 model,
+/// default ONNX Runtime pool): 8k → 8.6 GB, 11k → 15.7 GB, 14k → 26.7 GB. The
+/// coefficient is deliberately the largest of those three fits, so the estimate
+/// errs high: underestimating is what OOM-kills the desktop.
+const PEAK_MB_PER_TOKEN2: f64 = 1.35e-4;
+
+/// Seconds per token squared, fitted the same way: 8k → 20 s, 11k → 34 s,
+/// 14k → 54 s.
+const SECS_PER_TOKEN2: f64 = 3.0e-7;
+
+/// Fixed cost of mapping the graph and warming it up.
+const MODEL_LOAD_SECS: f64 = 1.1;
+
+/// The largest message this extension will *ever* run inference on.
+///
+/// This is a backstop, not a setting. [`MAX_BUDGET_MB`] already limits the
+/// derived ceiling to ~3,300 tokens, so this only binds if the cost model or the
+/// budget detection regresses. It exists so that no configuration, detection bug
+/// or unusual cgroup layout can reproduce the incident this rewrite is for: a
+/// 14k-token message asked ONNX Runtime for 26.7 GB, and ~41k asked for a single
+/// 80 GB buffer.
+const HARD_MAX_TOKENS: usize = 4000;
+
+/// Ceiling on a detected budget.
+///
+/// 2560 MB puts the token ceiling near 3,300, which clears the 90th percentile of
+/// real tool output (2,716 tokens) instead of landing just under it. Beyond that
+/// the message is genuinely too large to run without containment: the observed
+/// maximum, ~5,090 tokens, predicts 4.6 GB for a single message.
+const MAX_BUDGET_MB: usize = 2560;
+
+/// Floor on a detected budget, used only when detection itself fails.
+///
+/// Below the graph's own ~1.1 GB resident cost nothing fits at all, so this is
+/// that plus room for a small message. A cgroup that really is tighter than this
+/// is *not* overridden: detection returns what is actually available, and the
+/// planner then declines to run anything, which is the correct fail-open answer.
+const MIN_BUDGET_MB: usize = 1_300;
+
+/// Memory held back from the detected budget no matter how little is free.
+///
+/// Whatever the extension predicts, the machine still has to run a proxy, an
+/// editor and a desktop. Without a floor, a momentarily busy machine would detect
+/// a tiny budget and the extension would go silent for the rest of the request.
+const MIN_RESERVE_MB: usize = 1_024;
+
+/// Milliseconds one request may spend on inference when not configured.
+///
+/// klava kills an extension at `timeout_secs` (20 by default). Spending all of
+/// it means returning nothing at all, which is worse than a partial rewrite, so
+/// a third of it is reserved for the model load, the analysis and the reply.
+const DEFAULT_BUDGET_MS: usize = 8_000;
+
+/// How much text a rewrite must remove before it is worth having done.
+///
+/// A percentage floor alone is a trap: 50% of a 40-token message is 20 tokens of
+/// noise, while the same inference could have saved 900 tokens somewhere else.
+/// Bytes are the unit the user actually pays for in context.
+const MIN_SAVED_BYTES: usize = 200;
+
+/// Assumed bytes per token when turning [`MIN_SAVED_BYTES`] into a token floor.
+const BYTES_PER_TOKEN: usize = 4;
+
+/// Peak megabytes for one inference of `tokens` tokens.
+///
+/// Saturates rather than overflowing: `usize::MAX²` as `f64` is merely huge, and
+/// the result is only ever compared against a budget.
+fn predicted_peak_mb(tokens: usize) -> f64 {
+    MODEL_RESIDENT_MB + PEAK_MB_PER_TOKEN2 * (tokens as f64) * (tokens as f64)
+}
+
+/// Wall-clock seconds for one inference of `tokens` tokens.
+fn predicted_secs(tokens: usize) -> f64 {
+    MODEL_LOAD_SECS + SECS_PER_TOKEN2 * (tokens as f64) * (tokens as f64)
+}
+
+/// The largest message that fits `budget_mb` on its own.
+///
+/// The inverse of [`predicted_peak_mb`]. A budget below the graph's resident cost
+/// yields `0`, which the planner reads as "nothing fits" — the honest answer,
+/// and never an overflow.
+fn tokens_that_fit(budget_mb: usize) -> usize {
+    let varying = budget_mb as f64 - MODEL_RESIDENT_MB;
+    if varying <= 0.0 {
+        return 0;
+    }
+    let tokens = (varying / PEAK_MB_PER_TOKEN2).sqrt();
+    if !tokens.is_finite() || tokens < 1.0 {
+        return 0;
+    }
+    (tokens as usize).clamp(1, HARD_MAX_TOKENS)
+}
+
+/// How many megabytes of inference this process may spend.
+///
+/// One budget covers a whole request: the planner charges every message it runs
+/// against it. The number comes from what is actually available here, so the
+/// extension shrinks inside a tight cgroup instead of ignoring it.
+///
+/// A quarter of the free memory is held back for everything else on the machine
+/// (the proxy, the editor, the desktop), with a floor so a machine that is merely
+/// busy still gets a sane reserve. Note that the reserve is subtracted from
+/// *available*, not further divided: the graph's own resident cost is part of the
+/// budget, so dividing twice would reject a machine that could comfortably run a
+/// small message.
+///
+/// The budget is only as good as [`available_mb`]: on a target where memory
+/// cannot be measured, this falls back to [`MIN_BUDGET_MB`], a modest fixed
+/// budget. That is the safe direction — an unknown machine gets a conservative
+/// ceiling instead of an unbounded one — and `budget_mb` is there to raise it
+/// deliberately.
+fn detect_budget_mb() -> usize {
+    budget_from_available_mb(available_mb())
+}
+
+/// Turn a measurement into a budget.
+///
+/// Split out so the reserve and the two clamps can be exercised without a
+/// machine in a particular state: `None` (unmeasurable target or failed syscall)
+/// must still produce a usable budget rather than zero.
+fn budget_from_available_mb(available: Option<usize>) -> usize {
+    match available {
+        Some(available) => {
+            let reserve = (available / 4).max(MIN_RESERVE_MB);
+            available.saturating_sub(reserve).min(MAX_BUDGET_MB)
+        }
+        None => MIN_BUDGET_MB,
+    }
+}
+
+/// Megabytes this process could plausibly take on *this* machine.
+///
+/// Each platform measures a different thing, but all three answer the same
+/// question: how much memory could be handed to a new process without swapping?
+/// The answer has to be real, not a constant — a 16 GB Mac handed the fallback
+/// budget would cap out near 1,200 tokens and silently stop compressing the
+/// 90th percentile of tool output (2,716 tokens), which is exactly the traffic
+/// this extension exists for.
+#[cfg(target_os = "linux")]
+fn available_mb() -> Option<usize> {
+    // Inside a container or a systemd unit the cgroup limit is what actually
+    // binds, not the host's free memory.
+    if let Some(mb) = cgroup_available_mb() {
+        return Some(mb);
+    }
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo_available_mb(&meminfo)
+}
+
+/// Free + inactive + speculative Mach pages, in megabytes.
+///
+/// macOS has no `/proc`: it exposes VM statistics through Mach. Those three page
+/// classes are the ones the kernel may reclaim for a new process without paging
+/// out anything live, which is the closest analogue to Linux's `MemAvailable`.
+#[cfg(target_os = "macos")]
+fn available_mb() -> Option<usize> {
+    // `mach_host_self` is deprecated in `libc` in favour of the `mach2` crate,
+    // but this is the single Mach call we need and pulling in `mach2` for it
+    // would be a second dependency for one page count. The function itself is
+    // not going anywhere: it is the documented way to get the host port.
+    #[allow(deprecated)]
+    // SAFETY: `vm_statistics64` is a plain C struct that is all zeros being a
+    // valid value for, `host_statistics64` writes exactly `HOST_VM_INFO64_COUNT`
+    // integers into the buffer we hand it, and `count` is a local whose address
+    // we pass. Both calls are thread-safe and leak nothing.
+    unsafe {
+        let mut stats: libc::vm_statistics64 = std::mem::zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        let result = libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            std::ptr::from_mut(&mut stats).cast::<libc::integer_t>(),
+            &mut count,
+        );
+        if result != libc::KERN_SUCCESS {
+            return None;
+        }
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        if page_size <= 0 {
+            return None;
+        }
+        // The struct is `repr(packed)`, so the fields are copied out rather than
+        // borrowed: taking a reference into a packed struct is undefined.
+        pages_available_mb(
+            stats.free_count as usize,
+            stats.inactive_count as usize,
+            stats.speculative_count as usize,
+            page_size as usize,
+        )
+    }
+}
+
+/// `ullAvailPhys` from `GlobalMemoryStatusEx`, in megabytes.
+///
+/// Windows reports physical memory that is immediately available, including the
+/// standby list, which is the same notion as the other two platforms.
+#[cfg(windows)]
+fn available_mb() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `MEMORYSTATUSEX` is a plain C struct with `dwLength` set to its own
+    // size as the API requires, and the buffer outlives the call. The API writes
+    // nothing else and returns zero on failure.
+    unsafe {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if GlobalMemoryStatusEx(&mut status) == 0 {
+            return None;
+        }
+        Some(bytes_available_mb(status.ullAvailPhys))
+    }
+}
+
+/// Targets we cannot measure get no answer, and the caller falls back to
+/// [`MIN_BUDGET_MB`] rather than guessing.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn available_mb() -> Option<usize> {
+    None
+}
+
+/// Reclaimable pages times the page size, in megabytes.
+///
+/// Split out from [`available_mb`] so the arithmetic is testable on every target:
+/// an overflow or a unit slip here would set the whole budget.
+#[cfg(any(target_os = "macos", test))]
+fn pages_available_mb(
+    free: usize,
+    inactive: usize,
+    speculative: usize,
+    page_size: usize,
+) -> Option<usize> {
+    let pages = free.checked_add(inactive)?.checked_add(speculative)?;
+    Some(pages.checked_mul(page_size)? / (1024 * 1024))
+}
+
+/// Bytes to megabytes, rounded down and saturating.
+///
+/// Saturating keeps a 32-bit build from wrapping a large machine's free memory
+/// into a small budget.
+#[cfg(any(windows, test))]
+fn bytes_available_mb(bytes: u64) -> usize {
+    usize::try_from(bytes / (1024 * 1024)).unwrap_or(usize::MAX)
+}
+
+/// `memory.max - memory.current` for the cgroup this process lives in.
+///
+/// Walks up from `/proc/self/cgroup` because the effective limit is the tightest
+/// one on the path, and a unit's own directory does not carry a limit when the
+/// parent slice is the one that has it.
+#[cfg(target_os = "linux")]
+fn cgroup_available_mb() -> Option<usize> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .to_string();
+    cgroup_headroom_mb(Path::new("/sys/fs/cgroup"), &path)
+}
+
+/// The tightest headroom between `path` and `root`, in megabytes.
+///
+/// Split out from [`cgroup_available_mb`] so the walk can be tested against a
+/// synthetic cgroup tree: getting this wrong under-detects a limit, which is the
+/// one failure mode that would let the incident repeat.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_headroom_mb(root: &Path, path: &str) -> Option<usize> {
+    // A limit is only meaningful together with the usage it applies to, and a
+    // cgroup with `max` is unlimited, so the tightest *headroom* wins rather
+    // than the tightest limit.
+    let mut tightest: Option<usize> = None;
+    let mut dir = root.to_path_buf();
+    // `/proc/self/cgroup` records an *absolute* path inside the hierarchy. Its
+    // leading `/` must not be pushed onto the root, or the walk resets to the
+    // filesystem root and every read misses.
+    for component in Path::new(path).components().filter_map(|c| match c {
+        std::path::Component::Normal(name) => Some(name),
+        _ => None,
+    }) {
+        let name = component.to_string_lossy();
+        if !name.is_empty() {
+            dir.push(name.as_ref());
+        }
+        if let Ok(text) = std::fs::read_to_string(dir.join("memory.max"))
+            && let Some(limit) = parse_cgroup_bytes(&text)
+        {
+            let used = std::fs::read_to_string(dir.join("memory.current"))
+                .ok()
+                .and_then(|text| parse_cgroup_bytes(&text))
+                .unwrap_or(0);
+            let headroom = limit.saturating_sub(used);
+            tightest = Some(tightest.map_or(headroom, |best: usize| best.min(headroom)));
+        }
+    }
+
+    // Bytes in the v2 files, megabytes in the return value: everything above
+    // this point budgets in MB, and a silent 1024× here is a silent 1024×
+    // overshoot of the cgroup limit.
+    tightest.map(|bytes| bytes / (1024 * 1024))
+}
+
+/// Parse a cgroup v2 byte counter, or `None` for the literal `max`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_bytes(text: &str) -> Option<usize> {
+    let trimmed = text.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in megabytes.
+#[cfg(any(target_os = "linux", test))]
+fn meminfo_available_mb(meminfo: &str) -> Option<usize> {
+    for line in meminfo.lines() {
+        let Some(rest) = line.strip_prefix("MemAvailable:") else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let value: usize = fields.next()?.parse().ok()?;
+        let unit = fields.next().unwrap_or("kB");
+        return Some(match unit {
+            "kB" => value / 1024,
+            "MB" => value,
+            _ => value / 1024,
+        });
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
-/// A loaded model. The tokenizer is immutable; the session needs `&mut` to run.
-struct Model {
+/// The cheap half: the tokenizer alone.
+///
+/// Kept separate from [`Scorer`] because the two have wildly different costs —
+/// tens of milliseconds versus a 1.1 GB graph. A message outside the window is
+/// discarded either way, so it has to be rejected here, before the graph is
+/// mapped. Loading the model only to decide "this is too long for the model" was
+/// the single largest source of wasted work: measured, 93% of requests were
+/// skipped *after* paying for a full forward pass.
+struct Loaded {
     tokenizer: Tokenizer,
+    /// Mapped on first real use, so a request that is entirely rejected never
+    /// touches the graph.
+    scorer: OnceLock<Option<Scorer>>,
+    dir: PathBuf,
+}
+
+/// The expensive half: the ONNX graph.
+struct Scorer {
     session: Mutex<Session>,
 }
 
-impl std::fmt::Debug for Model {
+impl std::fmt::Debug for Loaded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Model").finish_non_exhaustive()
+        f.debug_struct("Loaded").finish_non_exhaustive()
     }
 }
 
-impl Model {
-    fn load(dir: &Path) -> Result<Self, String> {
+impl Loaded {
+    fn new(dir: PathBuf) -> Result<Self, String> {
         let tokenizer_path = dir.join(TOKENIZER_FILE);
-        let model_path = dir.join(MODEL_FILE);
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| format!("cannot load {}: {e}", tokenizer_path.display()))?;
-        let session = Session::builder()
-            .map_err(|e| format!("cannot create ONNX session: {e}"))?
-            .commit_from_file(&model_path)
-            .map_err(|e| format!("cannot load {}: {e}", model_path.display()))?;
         Ok(Self {
             tokenizer,
-            session: Mutex::new(session),
+            scorer: OnceLock::new(),
+            dir,
         })
     }
 
-    /// Per-token keep probability for `text`.
-    fn score(&self, text: &str) -> Result<(Vec<usize>, Vec<f32>), String> {
-        let encoding = self
-            .tokenizer
+    fn encode(&self, text: &str) -> Result<tokenizers::Encoding, String> {
+        self.tokenizer
             .encode(text, false)
-            .map_err(|e| format!("tokenizer failed: {e}"))?;
+            .map_err(|e| format!("tokenizer failed: {e}"))
+    }
 
+    /// Load once on first use. A failure is cached too, so a broken install logs
+    /// once instead of on every message.
+    fn scorer(&self) -> Option<&Scorer> {
+        self.scorer
+            .get_or_init(|| {
+                let model_path = self.dir.join(MODEL_FILE);
+                match Session::builder()
+                    .and_then(|builder| builder.commit_from_file(&model_path))
+                {
+                    Ok(session) => Some(Scorer {
+                        session: Mutex::new(session),
+                    }),
+                    Err(e) => {
+                        eprintln!(
+                            "kompress: model unavailable, requests pass through: cannot load {}: {e}",
+                            model_path.display()
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+}
+
+impl Scorer {
+    /// Per-token keep probability for an already-tokenized message.
+    ///
+    /// Memory here is quadratic in the token count (see [`predicted_peak_mb`]).
+    /// Callers must have checked the size guard first; this function is the one
+    /// that can exhaust the machine.
+    fn score(&self, encoding: &tokenizers::Encoding) -> Result<Vec<f32>, String> {
         let ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
         let n = ids.len();
         if n == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
 
         let inputs = ort::inputs![
@@ -264,15 +704,47 @@ impl Model {
             .try_extract_tensor::<f32>()
             .map_err(|e| format!("unexpected model output: {e}"))?;
 
-        // Byte offsets let us rebuild the text without guessing at whitespace.
-        let offsets: Vec<usize> = encoding
-            .get_offsets()
-            .iter()
-            .flat_map(|&(start, end)| [start, end])
-            .collect();
-
-        Ok((offsets, scores.to_vec()))
+        Ok(scores.to_vec())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Planning: what to run, in what order, within budget
+// ---------------------------------------------------------------------------
+
+/// One rewrite opportunity: a string message, or one text part of a multimodal
+/// message.
+///
+/// Collected and measured *before* anything is inferred, because the decision to
+/// run inference has to be made on the token count, not on what came back from
+/// running it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Candidate {
+    /// Index into `payload["messages"]`.
+    message: usize,
+    /// Index into the message's content array, when the content is a part list.
+    part: Option<usize>,
+    tokens: usize,
+}
+
+/// What the planner decided to run, and what it expects it to cost.
+#[derive(Debug, Default, PartialEq)]
+struct Selection {
+    chosen: Vec<Candidate>,
+    /// Predicted *marginal* megabytes on top of the resident graph.
+    mb: f64,
+    /// Predicted *marginal* seconds, excluding the one-time model load.
+    secs: f64,
+}
+
+/// Sort key: smallest first.
+///
+/// Cost per saved token falls as the message shrinks — `n` removed tokens cost
+/// `n²` — so under a budget the small messages are always the better buy. It
+/// also means a request that runs out of time still returned its best work
+/// instead of dying mid-way through the largest item.
+fn by_cost(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.tokens.cmp(&b.tokens).then(a.message.cmp(&b.message))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,30 +753,78 @@ impl Model {
 
 pub struct Compressor {
     config: CompressConfig,
-    model: OnceLock<Option<Model>>,
+    /// Ceiling and floor, resolved once: they depend on this machine, not on the
+    /// request.
+    max_tokens: usize,
+    min_tokens: usize,
+    budget_mb: usize,
+    budget_ms: usize,
+    model: OnceLock<Option<Loaded>>,
 }
 
 impl std::fmt::Debug for Compressor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Compressor")
             .field("config", &self.config)
+            .field("min_tokens", &self.min_tokens)
+            .field("max_tokens", &self.max_tokens)
+            .field("budget_mb", &self.budget_mb)
+            .field("budget_ms", &self.budget_ms)
             .finish_non_exhaustive()
     }
 }
 
 impl Compressor {
     pub fn new(config: CompressConfig) -> Self {
+        let budget_mb = if config.budget_mb > 0 {
+            config.budget_mb.min(MAX_BUDGET_MB)
+        } else {
+            detect_budget_mb()
+        };
+
+        // The ceiling is whatever the budget allows, optionally lowered by the
+        // user, and never above the backstop. A too-large `max_tokens` is
+        // therefore not a preference to honour: it is a way to exhaust the
+        // machine, so it is clamped rather than rejected, keeping the extension
+        // fail-open. A budget too small to hold the graph yields a zero ceiling,
+        // and the resulting empty window means "run nothing".
+        let derived_max = tokens_that_fit(budget_mb);
+        let max_tokens = if config.max_tokens == 0 {
+            derived_max
+        } else {
+            config.max_tokens.min(derived_max)
+        };
+
+        let min_tokens = if config.min_tokens > 0 {
+            config.min_tokens
+        } else {
+            // At the observed ~50% savings rate, a message has to be this long
+            // before it removes MIN_SAVED_BYTES. Deriving it beats the old fixed
+            // 200, which rejected the median tool message outright.
+            2 * MIN_SAVED_BYTES / BYTES_PER_TOKEN
+        };
+
+        let budget_ms = if config.budget_ms > 0 {
+            config.budget_ms
+        } else {
+            DEFAULT_BUDGET_MS
+        };
+
         Self {
             config,
+            max_tokens,
+            min_tokens,
+            budget_mb,
+            budget_ms,
             model: OnceLock::new(),
         }
     }
 
     /// Load once on first use. A failure is cached too, so a broken install logs
     /// once instead of on every request.
-    fn model(&self) -> Option<&Model> {
+    fn model(&self) -> Option<&Loaded> {
         self.model
-            .get_or_init(|| match Model::load(&self.config.resolved_model_dir()) {
+            .get_or_init(|| match Loaded::new(self.config.resolved_model_dir()) {
                 Ok(model) => Some(model),
                 Err(e) => {
                     eprintln!("kompress: model unavailable, requests pass through: {e}");
@@ -317,33 +837,35 @@ impl Compressor {
     /// Rewrite `text`, or return `None` when it is not worth it.
     ///
     /// Returns the compressed text and the token counts (before, after).
-    fn compress_text(&self, model: &Model, text: &str) -> Option<(String, usize, usize)> {
-        if self.config.skip_structured && looks_structured(text) {
-            eprintln!("kompress: skipping structured content");
-            return None;
-        }
+    fn compress_text(
+        &self,
+        model: &Loaded,
+        encoding: &tokenizers::Encoding,
+        text: &str,
+    ) -> Option<(String, usize, usize)> {
+        let tokens = encoding.get_ids().len();
 
-        let (offsets, scores) = match model.score(text) {
-            Ok(scored) => scored,
+        let scorer = model.scorer()?;
+        let scores = match scorer.score(encoding) {
+            Ok(scores) => scores,
             Err(e) => {
                 eprintln!("kompress: {e}");
                 return None;
             }
         };
 
-        let tokens = scores.len();
-        if offsets.len() != tokens * 2 {
+        // Byte offsets let us rebuild the text without guessing at whitespace.
+        let offsets: Vec<usize> = encoding
+            .get_offsets()
+            .iter()
+            .flat_map(|&(start, end)| [start, end])
+            .collect();
+
+        if offsets.len() != scores.len() * 2 || scores.len() != tokens {
             eprintln!(
                 "kompress: {} score(s) but {} offset pair(s); skipping",
-                tokens,
+                scores.len(),
                 offsets.len() / 2
-            );
-            return None;
-        }
-        if tokens < self.config.min_tokens || tokens > self.config.max_tokens {
-            eprintln!(
-                "kompress: skipping {} token message (window {}..={})",
-                tokens, self.config.min_tokens, self.config.max_tokens
             );
             return None;
         }
@@ -376,36 +898,164 @@ impl Compressor {
             return None;
         }
 
+        // Cheap rewrites are not worth having made. A percentage floor alone lets
+        // a 40-token message "save 50%" and contribute nothing, while the same
+        // inference could have removed far more elsewhere.
+        if text.len().saturating_sub(rebuilt.len()) < MIN_SAVED_BYTES {
+            eprintln!(
+                "kompress: only {} bytes saved, below the {} byte floor",
+                text.len() - rebuilt.len(),
+                MIN_SAVED_BYTES
+            );
+            return None;
+        }
+
         Some((rebuilt, tokens, kept))
     }
 
-    /// Compress one `content` value in place. Returns (tokens before, after).
-    fn compress_content(&self, model: &Model, content: &mut Value) -> (usize, usize) {
-        match content {
-            Value::String(text) => match self.compress_text(model, text) {
-                Some((next, before, after)) => {
-                    *text = next;
-                    (before, after)
-                }
-                None => (0, 0),
-            },
-            Value::Array(parts) => {
-                let mut before = 0;
-                let mut after = 0;
-                for part in parts {
-                    // Multimodal parts (images, files) carry no `text`.
-                    if let Some(Value::String(text)) = part.get_mut("text")
-                        && let Some((next, b, a)) = self.compress_text(model, text)
-                    {
-                        *text = next;
-                        before += b;
-                        after += a;
+    /// Every text this request is allowed to rewrite, measured but not run.
+    ///
+    /// Everything that can reject a message cheaply happens here: role, content
+    /// shape, structured content, and the token window. The graph is not mapped
+    /// until [`Self::plan`] has picked what to run.
+    fn candidates(&self, payload: &Value, model: &Loaded) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+            return out;
+        };
+
+        for (message, entry) in messages.iter().enumerate() {
+            let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+            if !self.config.roles.iter().any(|r| r == role) {
+                continue;
+            }
+            match entry.get("content") {
+                Some(Value::String(text)) => {
+                    if let Some(candidate) = self.measure(message, None, text, model) {
+                        out.push(candidate);
                     }
                 }
-                (before, after)
+                Some(Value::Array(parts)) => {
+                    for (index, part) in parts.iter().enumerate() {
+                        // Multimodal parts (images, files) carry no `text`.
+                        let Some(Value::String(text)) = part.get("text") else {
+                            continue;
+                        };
+                        if let Some(candidate) = self.measure(message, Some(index), text, model) {
+                            out.push(candidate);
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => (0, 0),
         }
+
+        out
+    }
+
+    /// Whether one text is worth an inference, and what it would cost.
+    fn measure(
+        &self,
+        message: usize,
+        part: Option<usize>,
+        text: &str,
+        model: &Loaded,
+    ) -> Option<Candidate> {
+        if self.config.skip_structured && looks_structured(text) {
+            eprintln!("kompress: skipping structured content");
+            return None;
+        }
+
+        // A message that cannot possibly clear the byte floor is not worth a
+        // forward pass, and this is cheaper than tokenizing it: it is rejected on
+        // raw length. `MIN_SAVED_BYTES` is a lower bound on what a rewrite must
+        // remove, so anything shorter than it can never qualify.
+        if text.len() < MIN_SAVED_BYTES {
+            eprintln!(
+                "kompress: skipping {} byte message, below the {} byte floor",
+                text.len(),
+                MIN_SAVED_BYTES
+            );
+            return None;
+        }
+
+        let encoding = match model.encode(text) {
+            Ok(encoding) => encoding,
+            Err(e) => {
+                eprintln!("kompress: {e}");
+                return None;
+            }
+        };
+        let tokens = encoding.get_ids().len();
+
+        // The window is checked on the tokenizer's output, before the graph is
+        // mapped. Checking it after inference was the original bug: a message
+        // destined to be discarded still loaded 1.1 GB and ran a full forward
+        // pass, and 93% of messages were discarded.
+        if tokens < self.min_tokens || tokens > self.max_tokens {
+            eprintln!(
+                "kompress: skipping {} token message (window {}..={})",
+                tokens, self.min_tokens, self.max_tokens
+            );
+            return None;
+        }
+
+        Some(Candidate {
+            message,
+            part,
+            tokens,
+        })
+    }
+
+    /// Choose which candidates to run under the memory and time budgets.
+    ///
+    /// The accounting is deliberately pessimistic about memory. ONNX Runtime's
+    /// arena never returns what it took, and it fragments when input shapes
+    /// differ: five *identically* sized 2.7k-token messages reused one arena
+    /// (2.1 GB total), while a real request with ~20 different sizes reached
+    /// 26 GB. Summing the per-message attention cost reproduces the worst case
+    /// instead of the best one.
+    fn plan(&self, mut candidates: Vec<Candidate>) -> Selection {
+        candidates.sort_by(by_cost);
+
+        let mut selection = Selection::default();
+        let time_budget = self.budget_ms as f64 / 1000.0;
+        // The graph is mapped once and stays; only the attention buffers are
+        // marginal. Everything below is charged against those.
+        let mut spent_mb = 0.0;
+        let mut spent_secs = MODEL_LOAD_SECS;
+
+        for candidate in candidates {
+            // Candidates are sorted smallest first and both costs grow with
+            // `n`, so once one does not fit, nothing later can either.
+            let marginal_mb = predicted_peak_mb(candidate.tokens) - MODEL_RESIDENT_MB;
+            let next_mb = MODEL_RESIDENT_MB + spent_mb + marginal_mb;
+            if next_mb > self.budget_mb as f64 {
+                eprintln!(
+                    "kompress: stopping at {} tokens: {:.0} MB predicted, {} MB budget",
+                    candidate.tokens, next_mb, self.budget_mb
+                );
+                break;
+            }
+
+            let marginal_secs = predicted_secs(candidate.tokens) - MODEL_LOAD_SECS;
+            let next_secs = spent_secs + marginal_secs;
+            if next_secs > time_budget {
+                eprintln!(
+                    "kompress: stopping at {} tokens: {:.1}s predicted, {:.1}s budget",
+                    candidate.tokens, next_secs, time_budget
+                );
+                break;
+            }
+
+            spent_mb += marginal_mb;
+            spent_secs = next_secs;
+            selection.mb += marginal_mb;
+            selection.secs += marginal_secs;
+            selection.chosen.push(candidate);
+        }
+
+        selection
     }
 }
 
@@ -761,31 +1411,80 @@ fn serve() {
 impl Compressor {
     fn on_request(&self, payload: Value) -> Option<Value> {
         let model = self.model()?;
+        let started = Instant::now();
 
-        let messages = payload.get("messages").and_then(Value::as_array)?;
-        let originals = messages.clone();
+        // Measure everything first: an inference is only started once the
+        // planner has decided it fits the budget. Collecting candidates also
+        // applies every cheap rejection (role, shape, structured content, token
+        // window) before the graph is ever mapped.
+        let candidates = self.candidates(&payload, model);
+        if candidates.is_empty() {
+            return None;
+        }
+        let selection = self.plan(candidates);
+        if selection.chosen.is_empty() {
+            return None;
+        }
 
         let mut payload = payload;
         let mut before_total = 0usize;
         let mut after_total = 0usize;
         let mut touched = 0usize;
 
-        if let Some(list) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-            for (message, original) in list.iter_mut().zip(originals.iter()) {
-                let role = original.get("role").and_then(Value::as_str).unwrap_or("");
-                if !self.config.roles.iter().any(|r| r == role) {
-                    continue;
-                }
-                let Some(content) = message.get_mut("content") else {
-                    continue;
-                };
-                let (before, after) = self.compress_content(model, content);
-                if before > 0 && after < before {
-                    before_total += before;
-                    after_total += after;
-                    touched += 1;
-                }
+        for candidate in &selection.chosen {
+            // The planner predicts from measured costs, but the wall clock is
+            // the thing klava actually kills us on. A loaded machine can run
+            // slower than the fit, so check reality before spending more.
+            if started.elapsed().as_millis() as usize >= self.budget_ms {
+                eprintln!(
+                    "kompress: out of time after {} of {} planned message(s)",
+                    touched,
+                    selection.chosen.len()
+                );
+                break;
             }
+
+            // Indices came from this same payload, so a miss means the shape
+            // changed under us. Skip it rather than abandoning rewrites already
+            // applied — an `?` here would throw away completed work.
+            let Some(list) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let Some(entry) = list.get_mut(candidate.message) else {
+                continue;
+            };
+            let Some(content) = entry.get_mut("content") else {
+                continue;
+            };
+            let text = match candidate.part {
+                None => match content {
+                    Value::String(text) => text,
+                    _ => continue,
+                },
+                Some(index) => match content.get_mut(index).and_then(|part| part.get_mut("text")) {
+                    Some(Value::String(text)) => text,
+                    _ => continue,
+                },
+            };
+
+            // Re-encode rather than keeping every candidate's tokens alive: the
+            // text can be large and the bundle is only held for one request.
+            let encoding = match model.encode(text) {
+                Ok(encoding) => encoding,
+                Err(e) => {
+                    eprintln!("kompress: {e}");
+                    continue;
+                }
+            };
+
+            let Some((rewritten, before, after)) = self.compress_text(model, &encoding, text)
+            else {
+                continue;
+            };
+            *text = rewritten;
+            before_total += before;
+            after_total += after;
+            touched += 1;
         }
 
         if touched == 0 || after_total >= before_total {
@@ -793,8 +1492,11 @@ impl Compressor {
         }
 
         eprintln!(
-            "kompress: {touched} message(s), {before_total} -> {after_total} tokens ({:.0}% saved)",
-            100.0 * (1.0 - after_total as f32 / before_total as f32)
+            "kompress: {touched} message(s), {before_total} -> {after_total} tokens ({:.0}% saved; {:.0} MB and {:.1}s predicted for {} candidate(s))",
+            100.0 * (1.0 - after_total as f32 / before_total as f32),
+            MODEL_RESIDENT_MB + selection.mb,
+            selection.secs,
+            selection.chosen.len()
         );
         Some(payload)
     }
@@ -1398,7 +2100,13 @@ mod tests {
         assert!(!cfg.enabled, "expensive model must be opt-in");
         assert_eq!(cfg.roles, vec!["tool"]);
         assert_eq!(cfg.threshold, 0.7);
-        assert!(cfg.min_tokens < cfg.max_tokens);
+        // Zero means "derive from this machine". A fixed window cannot be right
+        // for both a laptop and a 64 GB workstation, and the old 200..=1500
+        // default matched none of the real traffic it was meant for.
+        assert_eq!(cfg.min_tokens, 0);
+        assert_eq!(cfg.max_tokens, 0);
+        assert_eq!(cfg.budget_mb, 0);
+        assert_eq!(cfg.budget_ms, 0);
     }
 
     #[test]
@@ -1409,7 +2117,8 @@ mod tests {
         assert_eq!(cfg.threshold, 0.5);
         assert_eq!(cfg.roles, vec!["tool", "user"]);
         // Unspecified keys fall back to the documented defaults.
-        assert_eq!(cfg.max_tokens, 1500);
+        assert_eq!(cfg.max_tokens, 0);
+        assert_eq!(cfg.budget_mb, 0);
     }
 
     #[test]
@@ -1567,6 +2276,8 @@ mod tests {
         assert_eq!(declared.min_tokens, real.min_tokens);
         assert_eq!(declared.max_tokens, real.max_tokens);
         assert_eq!(declared.min_savings, real.min_savings);
+        assert_eq!(declared.budget_mb, real.budget_mb);
+        assert_eq!(declared.budget_ms, real.budget_ms);
         assert_eq!(declared.roles, real.roles);
         assert_eq!(declared.skip_structured, real.skip_structured);
         assert_eq!(declared.model_dir, real.model_dir);
@@ -1621,5 +2332,535 @@ mod tests {
         let names: Vec<&str> = MODEL_FILES.iter().map(|(_, local)| *local).collect();
         assert!(names.contains(&TOKENIZER_FILE));
         assert!(names.contains(&MODEL_FILE));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cost model
+    // -----------------------------------------------------------------------
+
+    /// Measured peaks on this machine, in megabytes (see the module docs).
+    const MEASURED: [(usize, f64); 5] = [
+        (2_000, 1_200.0),
+        (4_000, 2_900.0),
+        (8_000, 8_600.0),
+        (11_000, 15_700.0),
+        (14_000, 26_700.0),
+    ];
+
+    #[test]
+    fn the_cost_model_reproduces_the_measured_table() {
+        // These numbers are the whole reason for the planner: memory is
+        // quadratic, so a fixed token ceiling cannot be right for every machine.
+        // If the fit drifts the budget stops bounding anything, so pin it.
+        for (tokens, measured) in MEASURED {
+            let predicted = predicted_peak_mb(tokens);
+            assert!(
+                predicted >= measured,
+                "{tokens} tokens: predicted {predicted:.0} MB is below the measured {measured:.0} MB; \
+                 underestimating is what gets the process OOM-killed"
+            );
+            assert!(
+                predicted <= measured * 1.5,
+                "{tokens} tokens: predicted {predicted:.0} MB is far above the measured {measured:.0} MB; \
+                 the ceiling would be uselessly low"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cost_model_is_quadratic_not_linear() {
+        // Doubling the tokens must more than double the cost, or the planner's
+        // measurement pass means nothing.
+        let small = predicted_peak_mb(2_000) - MODEL_RESIDENT_MB;
+        let large = predicted_peak_mb(4_000) - MODEL_RESIDENT_MB;
+        assert!((large / small - 4.0).abs() < 0.01, "got {}", large / small);
+    }
+
+    #[test]
+    fn wall_time_tracks_the_measurements() {
+        // 14k tokens measured 54 s; the fit must not promise something the host
+        // will kill us for long before.
+        let predicted = predicted_secs(14_000);
+        assert!((40.0..=70.0).contains(&predicted), "got {predicted:.1}s");
+    }
+
+    #[test]
+    fn the_budget_ceiling_covers_the_90th_percentile_of_real_traffic() {
+        // Real tool output: p50 188, p90 2,716, max 5,090 tokens. A ceiling below
+        // p90 rejects a tenth of traffic for an arbitrary reason, which is how
+        // the old fixed 1,500 window ended up matching nothing.
+        let ceiling = tokens_that_fit(MAX_BUDGET_MB);
+        assert!(ceiling >= 2_716, "ceiling {ceiling} is below p90");
+        assert!(
+            ceiling < HARD_MAX_TOKENS,
+            "ceiling {ceiling} should be budget-derived"
+        );
+    }
+
+    #[test]
+    fn the_hard_ceiling_cannot_be_exceeded() {
+        // Whatever the budget says, one message never gets more than this. ~41k
+        // tokens once asked ONNX Runtime for a single 80 GB buffer.
+        assert_eq!(tokens_that_fit(usize::MAX), HARD_MAX_TOKENS);
+        const { assert!(HARD_MAX_TOKENS <= 4_000) };
+    }
+
+    #[test]
+    fn a_larger_budget_never_lowers_the_ceiling() {
+        let mut previous = 0;
+        for budget in [MIN_BUDGET_MB, 1_500, 2_000, 4_000, 8_000] {
+            let ceiling = tokens_that_fit(budget);
+            assert!(
+                ceiling >= previous,
+                "{budget} MB gave {ceiling}, below {previous}"
+            );
+            previous = ceiling;
+        }
+    }
+
+    #[test]
+    fn a_budget_too_small_for_the_graph_yields_no_ceiling() {
+        // Reporting a "usable" non-zero ceiling here would be a lie that turns
+        // into an overshoot: the graph alone exceeds the budget.
+        assert_eq!(tokens_that_fit(0), 0);
+        assert_eq!(tokens_that_fit(MODEL_RESIDENT_MB as usize), 0);
+    }
+
+    #[test]
+    fn detection_reserves_memory_for_everything_else() {
+        // The budget must leave the machine usable, not merely leave a number
+        // that happens to fit. On this 30 GB box the cgroup is unlimited, so the
+        // answer comes from `MemAvailable`: somewhere between the graph's floor
+        // and the cap.
+        let budget = detect_budget_mb();
+        assert!(budget >= MIN_BUDGET_MB, "detected {budget} MB");
+        assert!(budget <= MAX_BUDGET_MB, "detected {budget} MB");
+    }
+
+    #[test]
+    fn a_busy_machine_still_reserves_a_floor_of_memory() {
+        // With only 1 GB free, a quarter is 256 MB — not enough to leave the
+        // proxy alive. The reserve floor wins, so the budget goes to zero rather
+        // than eating the last gigabyte.
+        assert_eq!(budget_from_available_mb(Some(1_024)), 0);
+        // Just above the reserve floor there is still nothing left over.
+        assert_eq!(budget_from_available_mb(Some(MIN_RESERVE_MB)), 0);
+    }
+
+    #[test]
+    fn an_unmeasurable_machine_gets_a_usable_conservative_budget() {
+        // Windows and macOS used to land here because `available_mb` was Linux
+        // only. Even a target we truly cannot measure must not collapse to a
+        // zero budget: the extension would go silent, which is worse than a
+        // modest ceiling the user can raise with `budget_mb`.
+        assert_eq!(budget_from_available_mb(None), MIN_BUDGET_MB);
+        assert!(tokens_that_fit(MIN_BUDGET_MB) > 0);
+    }
+
+    #[test]
+    fn a_roomy_machine_gets_the_cap_and_never_more() {
+        // A 128 GB box must not hand out a 100 GB inference just because the
+        // memory is there: the cap is what keeps a single message bounded.
+        assert_eq!(budget_from_available_mb(Some(131_072)), MAX_BUDGET_MB);
+        // And a 16 GB Mac with half its memory reclaimable clears p90.
+        let mac = budget_from_available_mb(Some(8 * 1024));
+        assert!(mac > MIN_BUDGET_MB, "got {mac} MB");
+        assert!(tokens_that_fit(mac) > 2_716, "got {}", tokens_that_fit(mac));
+    }
+
+    #[test]
+    fn mac_page_counts_become_megabytes() {
+        // 4 KiB pages, as on the Intel agent: 1 GB of reclaimable pages is
+        // 262,144 pages and must not be reported as 262,144 MB.
+        assert_eq!(pages_available_mb(131_072, 131_072, 0, 4096), Some(1_024));
+        // On Apple Silicon pages are 16 KiB, and the answer is the same.
+        assert_eq!(pages_available_mb(32_768, 32_768, 0, 16_384), Some(1_024));
+        // Speculative pages count too: dropping them would under-report a Mac
+        // that caches aggressively and shrink its ceiling for no reason.
+        assert_eq!(pages_available_mb(0, 0, 262_144, 4096), Some(1_024));
+        // No pages at all is a measurement, not a failure.
+        assert_eq!(pages_available_mb(0, 0, 0, 4096), Some(0));
+    }
+
+    #[test]
+    fn mac_page_arithmetic_does_not_overflow() {
+        // A nonsense count must yield `None` (so the caller falls back) rather
+        // than a wrapped number that reads as an enormous budget.
+        assert_eq!(pages_available_mb(usize::MAX, usize::MAX, 0, 4096), None);
+        assert_eq!(pages_available_mb(1, 1, 0, usize::MAX), None);
+    }
+
+    #[test]
+    fn windows_available_bytes_become_megabytes() {
+        assert_eq!(bytes_available_mb(8 * 1024 * 1024 * 1024), 8 * 1024);
+        assert_eq!(bytes_available_mb(0), 0);
+    }
+
+    #[test]
+    fn the_planner_is_silent_when_detection_finds_nothing_to_spend() {
+        // The fail-open path for a machine with no memory to spare: no inference,
+        // no payload, the request passes through untouched.
+        let compressor = Compressor::new(CompressConfig {
+            budget_mb: 1,
+            ..CompressConfig::default()
+        });
+        assert_eq!(compressor.max_tokens, 0);
+        let model = loaded_without_a_model();
+        assert!(model.scorer.get().is_none());
+    }
+
+    #[test]
+    fn cgroup_max_means_unlimited() {
+        // `memory.max` is the literal `max` when a cgroup has no limit; treating
+        // that as bytes would be a bizarre number.
+        assert_eq!(parse_cgroup_bytes("max\n"), None);
+        assert_eq!(parse_cgroup_bytes("2147483648\n"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_bytes("not a number"), None);
+    }
+
+    #[test]
+    fn meminfo_reports_available_memory_in_megabytes() {
+        let meminfo = "MemTotal:       32000000 kB\nMemAvailable:    4194304 kB\nMemFree:  1 kB\n";
+        assert_eq!(meminfo_available_mb(meminfo), Some(4096));
+        assert_eq!(meminfo_available_mb("MemTotal: 1 kB\n"), None);
+    }
+
+    /// Build a throwaway cgroup tree: `(relative path, memory.max, memory.current)`.
+    fn fake_cgroup(name: &str, dirs: &[(&str, &str, &str)]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("kompress-cgroup-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (path, limit, current) in dirs {
+            let dir = root.join(path);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("memory.max"), limit).unwrap();
+            std::fs::write(dir.join("memory.current"), current).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn cgroup_headroom_is_limit_minus_usage() {
+        let root = fake_cgroup("basic", &[("unit.slice", "4294967296\n", "1073741824\n")]);
+        assert_eq!(
+            cgroup_headroom_mb(&root, "/unit.slice"),
+            Some(3 * 1024),
+            "4 GB limit with 1 GB used is 3 GB of headroom"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cgroup_walk_keeps_the_tightest_headroom_on_the_path() {
+        // The real trap: a unit has no limit of its own while the slice above it
+        // does. Reading only the leaf would report "unlimited" and let a 20 GB
+        // inference run.
+        let root = fake_cgroup(
+            "nested",
+            &[
+                ("user.slice", "4294967296\n", "1073741824\n"),
+                ("user.slice/unit.slice", "max\n", "0\n"),
+            ],
+        );
+        assert_eq!(
+            cgroup_headroom_mb(&root, "/user.slice/unit.slice"),
+            Some(3 * 1024),
+            "the parent's limit must still apply"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cgroup_headroom_uses_the_tighter_of_two_limits() {
+        let root = fake_cgroup(
+            "two",
+            &[
+                ("a.slice", "8589934592\n", "0\n"),
+                ("a.slice/b.slice", "4294967296\n", "2147483648\n"),
+            ],
+        );
+        // 8 GB free above, 2 GB free at the leaf: the leaf binds.
+        assert_eq!(
+            cgroup_headroom_mb(&root, "/a.slice/b.slice"),
+            Some(2 * 1024)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unlimited_cgroup_reports_nothing_so_meminfo_is_used() {
+        // `max` everywhere means "no cgroup limit"; returning a huge number
+        // would defeat the `MemAvailable` fallback entirely.
+        let root = fake_cgroup("unlimited", &[("x.slice", "max\n", "0\n")]);
+        assert_eq!(cgroup_headroom_mb(&root, "/x.slice"), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Configuration: the window is derived, not guessed
+    // -----------------------------------------------------------------------
+
+    /// A tokenizer with no model file behind it: one token per whitespace word.
+    ///
+    /// Every word is `[UNK]`, which is all the size guard needs — it counts
+    /// tokens, it does not care what they mean.
+    fn tiny_tokenizer() -> Tokenizer {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[UNK]": 0, "kept": 1},
+                "unk_token": "[UNK]"
+            }
+        }"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("test tokenizer")
+    }
+
+    fn loaded_without_a_model() -> Loaded {
+        Loaded {
+            tokenizer: tiny_tokenizer(),
+            scorer: OnceLock::new(),
+            dir: PathBuf::from("/nonexistent-kompress-test-model"),
+        }
+    }
+
+    fn compressor_with(budget_mb: usize, budget_ms: usize) -> Compressor {
+        Compressor::new(CompressConfig {
+            budget_mb,
+            budget_ms,
+            ..CompressConfig::default()
+        })
+    }
+
+    fn candidate(message: usize, tokens: usize) -> Candidate {
+        Candidate {
+            message,
+            part: None,
+            tokens,
+        }
+    }
+
+    #[test]
+    fn the_floor_admits_ordinary_tool_output() {
+        // The old fixed floor of 200 rejected the median real message (188
+        // tokens) outright, so the extension compressed nothing.
+        let compressor = compressor_with(1_024, DEFAULT_BUDGET_MS);
+        assert_eq!(compressor.min_tokens, 2 * MIN_SAVED_BYTES / BYTES_PER_TOKEN);
+        assert!(
+            compressor.min_tokens <= 188,
+            "floor {} is above the median",
+            compressor.min_tokens
+        );
+    }
+
+    #[test]
+    fn the_ceiling_comes_from_the_budget_not_from_the_config() {
+        let compressor = compressor_with(1_024, DEFAULT_BUDGET_MS);
+        assert_eq!(compressor.max_tokens, tokens_that_fit(1_024));
+    }
+
+    #[test]
+    fn a_configured_ceiling_can_only_lower_the_ceiling() {
+        // `max_tokens` is the user's preference, but it may not override physics:
+        // whatever it says, the budget wins.
+        let low = Compressor::new(CompressConfig {
+            max_tokens: 10,
+            budget_mb: 2_048,
+            ..CompressConfig::default()
+        });
+        assert_eq!(low.max_tokens, 10);
+
+        let absurd = Compressor::new(CompressConfig {
+            max_tokens: 100_000,
+            budget_mb: 1_024,
+            ..CompressConfig::default()
+        });
+        assert_eq!(absurd.max_tokens, tokens_that_fit(1_024));
+        assert!(absurd.max_tokens <= HARD_MAX_TOKENS);
+    }
+
+    #[test]
+    fn an_absurd_budget_is_clamped() {
+        let compressor = compressor_with(usize::MAX, DEFAULT_BUDGET_MS);
+        assert_eq!(compressor.budget_mb, MAX_BUDGET_MB);
+        assert_eq!(compressor.max_tokens, tokens_that_fit(MAX_BUDGET_MB));
+    }
+
+    // -----------------------------------------------------------------------
+    // The window is enforced before the graph exists
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_out_of_window_message_is_rejected_without_loading_the_graph() {
+        // This is the original bug: the window was checked *after* inference, so
+        // 93% of requests paid 1.1 GB and a full forward pass to be discarded.
+        let model = loaded_without_a_model();
+        let compressor = Compressor::new(CompressConfig {
+            budget_mb: 1_024,
+            budget_ms: DEFAULT_BUDGET_MS,
+            max_tokens: 20,
+            ..CompressConfig::default()
+        });
+
+        let text = "word ".repeat(200);
+        assert!(compressor.measure(0, None, &text, &model).is_none());
+        assert!(
+            model.scorer.get().is_none(),
+            "the graph must not be mapped for a message the window rejects"
+        );
+    }
+
+    #[test]
+    fn an_in_window_message_becomes_a_candidate_without_loading_the_graph() {
+        let model = loaded_without_a_model();
+        let compressor = compressor_with(2_048, DEFAULT_BUDGET_MS);
+        let text = "word ".repeat(400);
+        let measured = compressor
+            .measure(3, Some(1), &text, &model)
+            .expect("candidate");
+        assert_eq!(measured.message, 3);
+        assert_eq!(measured.part, Some(1));
+        assert_eq!(measured.tokens, 400);
+        assert!(model.scorer.get().is_none());
+    }
+
+    #[test]
+    fn a_message_too_short_to_clear_the_byte_floor_is_rejected_cheaply() {
+        // Rejected on raw length, before tokenizing: no rewrite can remove 200
+        // bytes from a message that is not 200 bytes long.
+        let model = loaded_without_a_model();
+        let compressor = compressor_with(2_048, DEFAULT_BUDGET_MS);
+        let text = "short log line";
+        assert!(compressor.measure(0, None, text, &model).is_none());
+        assert!(model.scorer.get().is_none());
+    }
+
+    #[test]
+    fn structured_content_is_rejected_before_the_graph() {
+        let model = loaded_without_a_model();
+        let compressor = compressor_with(2_048, DEFAULT_BUDGET_MS);
+        let sql = "SELECT * FROM users WHERE id = 1; ".repeat(20);
+        assert!(compressor.measure(0, None, &sql, &model).is_none());
+        assert!(model.scorer.get().is_none());
+    }
+
+    #[test]
+    fn candidates_respects_roles_and_part_shapes() {
+        let model = loaded_without_a_model();
+        let compressor = compressor_with(2_048, DEFAULT_BUDGET_MS);
+        let payload = json!({
+            "messages": [
+                {"role": "system", "content": "word ".repeat(300)},
+                {"role": "assistant", "content": "word ".repeat(300)},
+                {"role": "tool", "content": "word ".repeat(300)},
+                {"role": "tool", "content": [
+                    {"type": "text", "text": "word ".repeat(300)},
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                    {"type": "text", "text": "word ".repeat(300)}
+                ]},
+                {"role": "tool", "content": 42}
+            ]
+        });
+
+        let found = compressor.candidates(&payload, &model);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found[0].message, 2);
+        assert_eq!(found[0].part, None);
+        assert_eq!(found[1].message, 3);
+        assert_eq!(found[1].part, Some(0));
+        assert_eq!(found[2].part, Some(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // The planner
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_planner_runs_the_smallest_messages_first() {
+        // Cost per saved token falls as the message shrinks, so under a budget
+        // the small ones are always the better buy.
+        let compressor = compressor_with(MAX_BUDGET_MB, 60_000);
+        let selection = compressor.plan(vec![
+            candidate(0, 1_800),
+            candidate(1, 120),
+            candidate(2, 800),
+        ]);
+        let order: Vec<usize> = selection.chosen.iter().map(|c| c.tokens).collect();
+        assert_eq!(order, vec![120, 800, 1_800]);
+    }
+
+    #[test]
+    fn the_planner_never_exceeds_the_memory_budget() {
+        let budget = 1_300;
+        let compressor = compressor_with(budget, 600_000);
+        let selection = compressor.plan(vec![
+            candidate(0, 100),
+            candidate(1, 2_000),
+            candidate(2, 1_400),
+        ]);
+
+        let peak = MODEL_RESIDENT_MB + selection.mb;
+        assert!(
+            peak <= budget as f64,
+            "planned {peak:.0} MB against {budget} MB"
+        );
+        assert!(
+            !selection.chosen.is_empty(),
+            "something small should still fit"
+        );
+        assert!(
+            selection.chosen.iter().all(|c| c.tokens < 2_000),
+            "{:?}",
+            selection.chosen
+        );
+    }
+
+    #[test]
+    fn the_planner_never_exceeds_the_time_budget() {
+        // klava kills the process at 20 s by default, so the planner must return
+        // partial work instead of being killed with nothing to show.
+        let compressor = compressor_with(MAX_BUDGET_MB, 3_000);
+        let selection = compressor.plan(vec![candidate(0, 300), candidate(1, 3_500)]);
+        assert_eq!(selection.chosen.len(), 1, "{:?}", selection.chosen);
+        assert!(MODEL_LOAD_SECS + selection.secs <= 3.0);
+    }
+
+    #[test]
+    fn a_budget_below_the_model_selects_nothing() {
+        // Under the graph's own footprint every inference is over budget, and
+        // the honest answer is to run none rather than to be OOM-killed.
+        let compressor = compressor_with(500, 60_000);
+        let selection = compressor.plan(vec![candidate(0, 100), candidate(1, 200)]);
+        assert!(selection.chosen.is_empty());
+        assert_eq!(selection.mb, 0.0);
+    }
+
+    #[test]
+    fn the_planner_stops_instead_of_skipping_ahead() {
+        // Candidates are sorted ascending and both costs grow with `n`, so once
+        // one does not fit, nothing after it can. Skipping instead of stopping
+        // would only cost a longer walk with the same result.
+        let compressor = compressor_with(MAX_BUDGET_MB, 1_500);
+        let selection = compressor.plan(vec![candidate(0, 14_000), candidate(1, 15_000)]);
+        assert!(selection.chosen.is_empty());
+    }
+
+    #[test]
+    fn the_planner_reports_marginal_cost_not_the_model_load() {
+        // `mb`/`secs` describe what the plan adds on top of the resident graph.
+        // Adding the load back in must give the per-message prediction.
+        let compressor = compressor_with(MAX_BUDGET_MB, 60_000);
+        let selection = compressor.plan(vec![candidate(0, 2_000)]);
+        assert_eq!(selection.chosen.len(), 1);
+        assert!((MODEL_RESIDENT_MB + selection.mb - predicted_peak_mb(2_000)).abs() < 1e-6);
+        assert!((MODEL_LOAD_SECS + selection.secs - predicted_secs(2_000)).abs() < 1e-6);
     }
 }

@@ -28,6 +28,16 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = [
 # size check both need raw bytes, so compression must stay off.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
+# Memory detection outside Linux. Each is a handful of constants and one syscall
+# already exposed by the OS; a full `sysinfo`-style crate would pull in process
+# enumeration this extension has no use for. Both are target-gated so a Linux
+# build does not carry them.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
 [dev-dependencies]
 # The manifest test parses `--print-manifest` output the way klava will.
 toml = "1"
