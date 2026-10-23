@@ -34,6 +34,17 @@
 //! inference it has not paid for. Every check that can reject a message without
 //! the graph runs before the graph is mapped.
 //!
+//! Two things the planner has to get right beyond the raw fit:
+//!
+//! * **Memory is reused, time is spent.** ONNX Runtime keeps the largest arena it
+//!   has allocated and serves later messages from it, so eight 1,500-token
+//!   messages peak near 1.6 GB, not the 2.8 GB a per-message sum predicts. A
+//!   forward pass, by contrast, is paid in full every time.
+//! * **A forward pass cannot be interrupted.** Finishing under the budget is not
+//!   enough; the pass has to *start* early enough to finish, or klava's deadline
+//!   kills the process and the whole reply — including rewrites already applied —
+//!   is lost.
+//!
 //! [model]: https://huggingface.co/chopratejas/kompress-v2-base
 
 use ort::session::Session;
@@ -274,12 +285,52 @@ const MODEL_RESIDENT_MB: f64 = 1100.0;
 /// errs high: underestimating is what OOM-kills the desktop.
 const PEAK_MB_PER_TOKEN2: f64 = 1.35e-4;
 
-/// Seconds per token squared, fitted the same way: 8k → 20 s, 11k → 34 s,
-/// 14k → 54 s.
+/// Seconds per token squared, fitted to single messages.
+///
+/// Attention is quadratic and this is the dominant term for the largest message,
+/// which is the one that matters: a forward pass cannot be interrupted, so a
+/// message that overruns the host's deadline takes the whole reply with it.
+/// Measured: 1 × 720 → 1.25 s, 1 × 1,500 → 1.62 s, 1 × 3,276 → 4.5 s, 1 × 8,000 →
+/// 20 s, 1 × 11,000 → 34 s, 1 × 14,000 → 54 s.
 const SECS_PER_TOKEN2: f64 = 3.0e-7;
 
 /// Fixed cost of mapping the graph and warming it up.
+///
+/// Measured: a request rejected before inference takes 0.08 s, a single 720-token
+/// message 1.25 s, and a 3,276-token message 4.5 s. Solving those against the
+/// quadratic term leaves about a second of load.
 const MODEL_LOAD_SECS: f64 = 1.1;
+
+/// Fixed seconds per inference that the quadratic term does not capture.
+///
+/// A forward pass also pays for tensor setup, the session lock and the arena
+/// search, and those do not shrink with the input. Measured: 40 messages of ~200
+/// tokens take 4.0 s where the quadratic term alone predicts 1.6 s.
+const PER_MESSAGE_SECS: f64 = 0.07;
+
+/// Extra megabytes charged for the arena fragments of *other* shapes.
+///
+/// The planner must not sum the quadratic term over every message: the arena is
+/// reused, so measured peak was 1.6 GB for 8 × 1,500 tokens while the plain sum
+/// predicts 2.8 GB and admitted only 4 of the 8. It must not take the maximum
+/// either — shapes differ, and ONNX Runtime keeps the blocks it has already grown
+/// — so the largest shape is charged in full and the rest at this share, which
+/// reproduces the measurements without assuming the arena is free.
+const FRAGMENT_SHARE: f64 = 0.10;
+
+/// The host kills an extension at `timeout_secs`, 20 s by default
+/// (`DEFAULT_TIMEOUT` in klava's `src/extensions.rs`).
+///
+/// No setting may outlast it: an extension killed at the deadline prints nothing,
+/// so klava sees "produced no output" and passes the payload through unchanged.
+const HOST_TIMEOUT_MS: usize = 20_000;
+
+/// Time left for everything that is not inference.
+///
+/// The spawn, reading the request, writing the response and the host noticing the
+/// exit all happen inside the same 20 s. Spending to the last millisecond means
+/// returning nothing at all.
+const REPLY_MARGIN_MS: usize = 3_000;
 
 /// The largest message this extension will *ever* run inference on.
 ///
@@ -320,6 +371,12 @@ const MIN_RESERVE_MB: usize = 1_024;
 /// it means returning nothing at all, which is worse than a partial rewrite, so
 /// a third of it is reserved for the model load, the analysis and the reply.
 const DEFAULT_BUDGET_MS: usize = 8_000;
+
+/// The ceiling a configured `budget_ms` is clamped to.
+///
+/// Derived rather than written down so [`HOST_TIMEOUT_MS`] and [`REPLY_MARGIN_MS`]
+/// cannot drift apart from it.
+const MAX_BUDGET_MS: usize = HOST_TIMEOUT_MS - REPLY_MARGIN_MS;
 
 /// How much text a rewrite must remove before it is worth having done.
 ///
@@ -601,6 +658,130 @@ fn meminfo_available_mb(meminfo: &str) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Why a message was left alone
+// ---------------------------------------------------------------------------
+
+/// One reason a message was not compressed.
+///
+/// Collected and counted rather than printed per message: a request carries up
+/// to hundreds of messages, and klava forwards at most 20 stderr lines, so
+/// printing each rejection buried the one summary line that says what actually
+/// happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    /// Content looked like code, SQL, JSON or a diff.
+    Structured,
+    /// Shorter than the byte floor, so no rewrite could clear it.
+    TooShort,
+    /// Outside the derived token window.
+    OutsideWindow,
+    /// The rebuilt text would have been empty.
+    Empty,
+    /// The rebuilt text was not shorter than the original.
+    NotShorter,
+    /// The rebuild dropped something load-bearing.
+    MeaningLost,
+    /// The rebuilt text did not clear the savings floor.
+    BelowRebuiltSavings,
+    /// The rebuilt text did not clear the byte floor.
+    BelowBytes,
+    /// Tokenizer, model or inference failure.
+    Unavailable,
+}
+
+impl Skip {
+    /// Every variant, in report order.
+    const ALL: [Skip; 9] = [
+        Skip::OutsideWindow,
+        Skip::Structured,
+        Skip::TooShort,
+        Skip::BelowRebuiltSavings,
+        Skip::BelowBytes,
+        Skip::Empty,
+        Skip::NotShorter,
+        Skip::MeaningLost,
+        Skip::Unavailable,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Skip::Structured => "structured content",
+            Skip::TooShort => "shorter than the byte floor",
+            Skip::OutsideWindow => "outside the token window",
+            Skip::Empty => "would have emptied the message",
+            Skip::NotShorter => "not shorter after rebuild",
+            Skip::MeaningLost => "would have dropped protected content",
+            Skip::BelowRebuiltSavings => "below the savings floor after rebuild",
+            Skip::BelowBytes => "below the byte floor after rebuild",
+            Skip::Unavailable => "not compressible (model or tokenizer error)",
+        }
+    }
+}
+
+/// Counts of skipped messages, reported as a single line.
+#[derive(Debug, Default)]
+struct Rejections {
+    counts: Vec<(Skip, usize)>,
+}
+
+impl Rejections {
+    fn add(&mut self, skip: Skip) {
+        match self.counts.iter_mut().find(|(seen, _)| *seen == skip) {
+            Some((_, count)) => *count += 1,
+            None => self.counts.push((skip, 1)),
+        }
+    }
+
+    /// One line, in [`Skip::ALL`] order, or nothing when every message ran.
+    fn report(&self) {
+        if self.counts.is_empty() {
+            return;
+        }
+        let mut parts = Vec::with_capacity(self.counts.len());
+        for skip in Skip::ALL {
+            if let Some((_, count)) = self.counts.iter().find(|(seen, _)| *seen == skip) {
+                parts.push(format!("{count} {}", skip.label()));
+            }
+        }
+        eprintln!("kompress: skipped {}", parts.join(", "));
+    }
+}
+
+/// Whether a rebuilt message is fit to send, judged on the text itself.
+///
+/// Split out from [`Compressor::compress_text`] because this is the rule that
+/// matters: measuring the *rebuilt* text rather than the model's keep-flags is
+/// what stops a rewrite from emptying a message while still reporting a 100%
+/// saving. A pure function keeps it testable without a 580 MB model.
+///
+/// `after` is the token count of `rebuilt`, `tokens` that of the original.
+fn judge_rebuilt(
+    text: &str,
+    rebuilt: &str,
+    tokens: usize,
+    after: usize,
+    min_savings: f32,
+) -> Result<(), Skip> {
+    // A rewrite that leaves nothing is a deletion, not a compression. The
+    // meaning guard cannot catch it: with no words left, nothing load-bearing
+    // has visibly gone missing.
+    if rebuilt.trim().is_empty() || after == 0 {
+        return Err(Skip::Empty);
+    }
+    if rebuilt.len() >= text.len() || after >= tokens {
+        return Err(Skip::NotShorter);
+    }
+    if tokens.checked_sub(after).is_none_or(|removed| removed == 0) {
+        return Err(Skip::NotShorter);
+    }
+    let saved = (tokens - after) as f32 / tokens as f32;
+    if saved < min_savings {
+        return Err(Skip::BelowRebuiltSavings);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
@@ -804,8 +985,12 @@ impl Compressor {
             2 * MIN_SAVED_BYTES / BYTES_PER_TOKEN
         };
 
+        // No setting may outlast the host's own deadline. A `budget_ms` of 60 s
+        // against a 20 s `timeout_secs` is not a longer budget, it is a request
+        // that gets killed with no reply at all — measured: 20.05 s, no stdout,
+        // so klava fail-opens and the 20 s was spent for nothing.
         let budget_ms = if config.budget_ms > 0 {
-            config.budget_ms
+            config.budget_ms.min(MAX_BUDGET_MS)
         } else {
             DEFAULT_BUDGET_MS
         };
@@ -834,7 +1019,7 @@ impl Compressor {
             .as_ref()
     }
 
-    /// Rewrite `text`, or return `None` when it is not worth it.
+    /// Rewrite `text`, or say why it is not worth it.
     ///
     /// Returns the compressed text and the token counts (before, after).
     fn compress_text(
@@ -842,17 +1027,14 @@ impl Compressor {
         model: &Loaded,
         encoding: &tokenizers::Encoding,
         text: &str,
-    ) -> Option<(String, usize, usize)> {
+    ) -> Result<(String, usize, usize), Skip> {
         let tokens = encoding.get_ids().len();
 
-        let scorer = model.scorer()?;
-        let scores = match scorer.score(encoding) {
-            Ok(scores) => scores,
-            Err(e) => {
-                eprintln!("kompress: {e}");
-                return None;
-            }
-        };
+        let scorer = model.scorer().ok_or(Skip::Unavailable)?;
+        let scores = scorer.score(encoding).map_err(|e| {
+            eprintln!("kompress: {e}");
+            Skip::Unavailable
+        })?;
 
         // Byte offsets let us rebuild the text without guessing at whitespace.
         let offsets: Vec<usize> = encoding
@@ -867,50 +1049,51 @@ impl Compressor {
                 scores.len(),
                 offsets.len() / 2
             );
-            return None;
-        }
-
-        let keep: Vec<bool> = scores.iter().map(|s| *s >= self.config.threshold).collect();
-        let kept = keep.iter().filter(|k| **k).count();
-        let saved = (tokens - kept) as f32 / tokens as f32;
-        if saved < self.config.min_savings {
-            eprintln!(
-                "kompress: only {:.0}% saved ({} of {} tokens), below {:.0}% floor",
-                saved * 100.0,
-                tokens - kept,
-                tokens,
-                self.config.min_savings * 100.0
-            );
-            return None;
+            return Err(Skip::Unavailable);
         }
 
         let rebuilt = rebuild(text, &offsets, &scores, self.config.threshold);
 
-        // Removing words must not make the text longer; if it somehow did, the
-        // honest answer is "no change".
+        // Reject the two degenerate results before spending anything else: an
+        // empty rebuild (reachable at a high threshold on text whose words all
+        // score low) and one that somehow grew.
+        if rebuilt.trim().is_empty() {
+            return Err(Skip::Empty);
+        }
         if rebuilt.len() >= text.len() {
-            return None;
+            return Err(Skip::NotShorter);
+        }
+
+        // Cheap rewrites are not worth having made. A percentage floor alone lets
+        // a 40-token message "save 50%" and contribute nothing, while the same
+        // inference could have removed far more elsewhere. Checked on bytes,
+        // before re-encoding, because it is the cheaper of the two floors.
+        if text.len().saturating_sub(rebuilt.len()) < MIN_SAVED_BYTES {
+            return Err(Skip::BelowBytes);
         }
 
         // The score is a suggestion, not a guarantee. Refuse any rewrite that
         // loses something load-bearing.
         if !meaning_preserved(text, &rebuilt) {
-            return None;
+            return Err(Skip::MeaningLost);
         }
 
-        // Cheap rewrites are not worth having made. A percentage floor alone lets
-        // a 40-token message "save 50%" and contribute nothing, while the same
-        // inference could have removed far more elsewhere.
-        if text.len().saturating_sub(rebuilt.len()) < MIN_SAVED_BYTES {
-            eprintln!(
-                "kompress: only {} bytes saved, below the {} byte floor",
-                text.len() - rebuilt.len(),
-                MIN_SAVED_BYTES
-            );
-            return None;
-        }
+        // The model's per-token scores are a suggestion and are not what the user
+        // pays for: whole-word removal means the rebuilt text can keep far more
+        // than the raw scores suggest, and the two can disagree in either
+        // direction. Re-derive the after-count from the text we would actually
+        // send, so every floor measures the rewrite and not the model's opinion
+        // of it.
+        let after = match model.encode(&rebuilt) {
+            Ok(encoding) => encoding.get_ids().len(),
+            Err(e) => {
+                eprintln!("kompress: {e}");
+                return Err(Skip::Unavailable);
+            }
+        };
+        judge_rebuilt(text, &rebuilt, tokens, after, self.config.min_savings)?;
 
-        Some((rebuilt, tokens, kept))
+        Ok((rebuilt, tokens, after))
     }
 
     /// Every text this request is allowed to rewrite, measured but not run.
@@ -918,7 +1101,12 @@ impl Compressor {
     /// Everything that can reject a message cheaply happens here: role, content
     /// shape, structured content, and the token window. The graph is not mapped
     /// until [`Self::plan`] has picked what to run.
-    fn candidates(&self, payload: &Value, model: &Loaded) -> Vec<Candidate> {
+    fn candidates(
+        &self,
+        payload: &Value,
+        model: &Loaded,
+        rejected: &mut Rejections,
+    ) -> Vec<Candidate> {
         let mut out = Vec::new();
         let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
             return out;
@@ -930,19 +1118,19 @@ impl Compressor {
                 continue;
             }
             match entry.get("content") {
-                Some(Value::String(text)) => {
-                    if let Some(candidate) = self.measure(message, None, text, model) {
-                        out.push(candidate);
-                    }
-                }
+                Some(Value::String(text)) => match self.measure(message, None, text, model) {
+                    Ok(candidate) => out.push(candidate),
+                    Err(skip) => rejected.add(skip),
+                },
                 Some(Value::Array(parts)) => {
                     for (index, part) in parts.iter().enumerate() {
                         // Multimodal parts (images, files) carry no `text`.
                         let Some(Value::String(text)) = part.get("text") else {
                             continue;
                         };
-                        if let Some(candidate) = self.measure(message, Some(index), text, model) {
-                            out.push(candidate);
+                        match self.measure(message, Some(index), text, model) {
+                            Ok(candidate) => out.push(candidate),
+                            Err(skip) => rejected.add(skip),
                         }
                     }
                 }
@@ -953,17 +1141,16 @@ impl Compressor {
         out
     }
 
-    /// Whether one text is worth an inference, and what it would cost.
+    /// Whether one text is worth an inference, and why not when it is not.
     fn measure(
         &self,
         message: usize,
         part: Option<usize>,
         text: &str,
         model: &Loaded,
-    ) -> Option<Candidate> {
+    ) -> Result<Candidate, Skip> {
         if self.config.skip_structured && looks_structured(text) {
-            eprintln!("kompress: skipping structured content");
-            return None;
+            return Err(Skip::Structured);
         }
 
         // A message that cannot possibly clear the byte floor is not worth a
@@ -971,21 +1158,13 @@ impl Compressor {
         // raw length. `MIN_SAVED_BYTES` is a lower bound on what a rewrite must
         // remove, so anything shorter than it can never qualify.
         if text.len() < MIN_SAVED_BYTES {
-            eprintln!(
-                "kompress: skipping {} byte message, below the {} byte floor",
-                text.len(),
-                MIN_SAVED_BYTES
-            );
-            return None;
+            return Err(Skip::TooShort);
         }
 
-        let encoding = match model.encode(text) {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                eprintln!("kompress: {e}");
-                return None;
-            }
-        };
+        let encoding = model.encode(text).map_err(|e| {
+            eprintln!("kompress: {e}");
+            Skip::Unavailable
+        })?;
         let tokens = encoding.get_ids().len();
 
         // The window is checked on the tokenizer's output, before the graph is
@@ -993,14 +1172,10 @@ impl Compressor {
         // destined to be discarded still loaded 1.1 GB and ran a full forward
         // pass, and 93% of messages were discarded.
         if tokens < self.min_tokens || tokens > self.max_tokens {
-            eprintln!(
-                "kompress: skipping {} token message (window {}..={})",
-                tokens, self.min_tokens, self.max_tokens
-            );
-            return None;
+            return Err(Skip::OutsideWindow);
         }
 
-        Some(Candidate {
+        Ok(Candidate {
             message,
             part,
             tokens,
@@ -1009,12 +1184,19 @@ impl Compressor {
 
     /// Choose which candidates to run under the memory and time budgets.
     ///
-    /// The accounting is deliberately pessimistic about memory. ONNX Runtime's
-    /// arena never returns what it took, and it fragments when input shapes
-    /// differ: five *identically* sized 2.7k-token messages reused one arena
-    /// (2.1 GB total), while a real request with ~20 different sizes reached
-    /// 26 GB. Summing the per-message attention cost reproduces the worst case
-    /// instead of the best one.
+    /// Memory is charged as **reuse**, not as a sum. ONNX Runtime's arena keeps
+    /// the largest allocation it has made and reuses it for later messages, so
+    /// summing `n²` over the request is wrong in the direction that matters: it
+    /// halved real sessions (8 × 1,500 tokens predicted 2,822 MB against a
+    /// measured 1.6 GB peak, so only 4 of 8 messages ran). The largest shape is
+    /// charged in full and every smaller one at [`FRAGMENT_SHARE`], which keeps
+    /// the estimate above the measurement without pretending extra shapes are
+    /// free.
+    ///
+    /// Time is charged as a sum, because unlike memory it really is spent once
+    /// per message: each forward pass pays its own quadratic term plus
+    /// [`PER_MESSAGE_SECS`]. Ignoring that fixed part made 120 small messages
+    /// forecast 2.8 s while they took 8.2 s.
     fn plan(&self, mut candidates: Vec<Candidate>) -> Selection {
         candidates.sort_by(by_cost);
 
@@ -1022,14 +1204,20 @@ impl Compressor {
         let time_budget = self.budget_ms as f64 / 1000.0;
         // The graph is mapped once and stays; only the attention buffers are
         // marginal. Everything below is charged against those.
-        let mut spent_mb = 0.0;
         let mut spent_secs = MODEL_LOAD_SECS;
+        // Marginal costs, kept as (plain sum, largest) so the reuse estimate can
+        // be recomputed as `largest + share * rest` after every candidate.
+        let mut shape_sum = 0.0f64;
+        let mut largest = 0.0f64;
 
         for candidate in candidates {
             // Candidates are sorted smallest first and both costs grow with
             // `n`, so once one does not fit, nothing later can either.
             let marginal_mb = predicted_peak_mb(candidate.tokens) - MODEL_RESIDENT_MB;
-            let next_mb = MODEL_RESIDENT_MB + spent_mb + marginal_mb;
+            let next_sum = shape_sum + marginal_mb;
+            let next_largest = largest.max(marginal_mb);
+            let marginal = next_largest + FRAGMENT_SHARE * (next_sum - next_largest);
+            let next_mb = MODEL_RESIDENT_MB + marginal;
             if next_mb > self.budget_mb as f64 {
                 eprintln!(
                     "kompress: stopping at {} tokens: {:.0} MB predicted, {} MB budget",
@@ -1038,7 +1226,8 @@ impl Compressor {
                 break;
             }
 
-            let marginal_secs = predicted_secs(candidate.tokens) - MODEL_LOAD_SECS;
+            let marginal_secs =
+                predicted_secs(candidate.tokens) - MODEL_LOAD_SECS + PER_MESSAGE_SECS;
             let next_secs = spent_secs + marginal_secs;
             if next_secs > time_budget {
                 eprintln!(
@@ -1048,9 +1237,10 @@ impl Compressor {
                 break;
             }
 
-            spent_mb += marginal_mb;
+            shape_sum = next_sum;
+            largest = next_largest;
             spent_secs = next_secs;
-            selection.mb += marginal_mb;
+            selection.mb = marginal;
             selection.secs += marginal_secs;
             selection.chosen.push(candidate);
         }
@@ -1412,17 +1602,20 @@ impl Compressor {
     fn on_request(&self, payload: Value) -> Option<Value> {
         let model = self.model()?;
         let started = Instant::now();
+        let mut rejected = Rejections::default();
 
         // Measure everything first: an inference is only started once the
         // planner has decided it fits the budget. Collecting candidates also
         // applies every cheap rejection (role, shape, structured content, token
         // window) before the graph is ever mapped.
-        let candidates = self.candidates(&payload, model);
+        let candidates = self.candidates(&payload, model, &mut rejected);
         if candidates.is_empty() {
+            rejected.report();
             return None;
         }
         let selection = self.plan(candidates);
         if selection.chosen.is_empty() {
+            rejected.report();
             return None;
         }
 
@@ -1435,11 +1628,23 @@ impl Compressor {
             // The planner predicts from measured costs, but the wall clock is
             // the thing klava actually kills us on. A loaded machine can run
             // slower than the fit, so check reality before spending more.
-            if started.elapsed().as_millis() as usize >= self.budget_ms {
+            let elapsed = started.elapsed().as_millis() as usize;
+
+            // A forward pass cannot be interrupted. Checking only "am I out of
+            // time" is not enough: starting a 3,000-token message with two
+            // seconds left overruns the host's deadline and loses the whole
+            // reply, including the rewrites already applied. Only start work
+            // this message can finish.
+            let remaining = (self.budget_ms as f64 / 1000.0) - elapsed as f64 / 1000.0;
+            let needed = predicted_secs(candidate.tokens) - MODEL_LOAD_SECS + PER_MESSAGE_SECS;
+            if remaining <= 0.0 || needed > remaining {
                 eprintln!(
-                    "kompress: out of time after {} of {} planned message(s)",
+                    "kompress: out of time after {} of {} planned message(s) ({:.1}s left, {:.1}s needed at {} tokens)",
                     touched,
-                    selection.chosen.len()
+                    selection.chosen.len(),
+                    remaining.max(0.0),
+                    needed,
+                    candidate.tokens
                 );
                 break;
             }
@@ -1473,20 +1678,23 @@ impl Compressor {
                 Ok(encoding) => encoding,
                 Err(e) => {
                     eprintln!("kompress: {e}");
+                    rejected.add(Skip::Unavailable);
                     continue;
                 }
             };
 
-            let Some((rewritten, before, after)) = self.compress_text(model, &encoding, text)
-            else {
-                continue;
-            };
-            *text = rewritten;
-            before_total += before;
-            after_total += after;
-            touched += 1;
+            match self.compress_text(model, &encoding, text) {
+                Ok((rewritten, before, after)) => {
+                    *text = rewritten;
+                    before_total += before;
+                    after_total += after;
+                    touched += 1;
+                }
+                Err(skip) => rejected.add(skip),
+            }
         }
 
+        rejected.report();
         if touched == 0 || after_total >= before_total {
             return None;
         }
@@ -1672,6 +1880,11 @@ const PROTECTED_WORDS: &[&str] = &[
 ///
 /// Deliberately conservative: a false negative costs a compression opportunity,
 /// a false positive corrupts a request.
+///
+/// Silent by design. This runs once per message and a rejection is reported
+/// through [`Skip::MeaningLost`], aggregated into one line per request: printing
+/// which word was dropped produced a line per message, and on a 40-message log
+/// payload that buried the summary klava actually forwards.
 fn meaning_preserved(original: &str, compressed: &str) -> bool {
     let kept: Vec<&str> = compressed.split_whitespace().collect();
     let kept_lower: Vec<String> = kept.iter().map(|w| w.to_ascii_lowercase()).collect();
@@ -1689,13 +1902,11 @@ fn meaning_preserved(original: &str, compressed: &str) -> bool {
         if PROTECTED_WORDS.contains(&lower.as_str())
             && !kept_lower.iter().any(|w| w.contains(&lower))
         {
-            eprintln!("kompress: refusing rewrite, dropped protected word '{trimmed}'");
             return false;
         }
 
         // 2. Numbers, error codes, ports, versions, dates.
         if trimmed.chars().any(|c| c.is_ascii_digit()) && !compressed.contains(trimmed) {
-            eprintln!("kompress: refusing rewrite, dropped number '{trimmed}'");
             return false;
         }
 
@@ -1707,7 +1918,6 @@ fn meaning_preserved(original: &str, compressed: &str) -> bool {
                 || trimmed.contains("::")
                 || trimmed.contains('.'));
         if looks_like_identifier && !compressed.contains(trimmed) {
-            eprintln!("kompress: refusing rewrite, dropped identifier '{trimmed}'");
             return false;
         }
 
@@ -1719,7 +1929,6 @@ fn meaning_preserved(original: &str, compressed: &str) -> bool {
                 .filter(|c| c.is_alphabetic())
                 .all(|c| c.is_ascii_uppercase());
         if all_caps && !compressed.contains(trimmed) {
-            eprintln!("kompress: refusing rewrite, dropped marker '{trimmed}'");
             return false;
         }
     }
@@ -2694,6 +2903,26 @@ mod tests {
         assert_eq!(compressor.max_tokens, tokens_that_fit(MAX_BUDGET_MB));
     }
 
+    #[test]
+    fn a_configured_time_budget_cannot_outlast_the_host() {
+        // Reproduced on 0.1.5: budget_ms = 60000 against a 20 s host timeout ran
+        // to 20.05 s and was killed before printing anything, so klava got an
+        // empty stdout and fail-opened. The setting is a ceiling reducer, never a
+        // licence to overrun the deadline.
+        let over = compressor_with(MAX_BUDGET_MB, 60_000);
+        assert_eq!(over.budget_ms, MAX_BUDGET_MS);
+        assert!(over.budget_ms < HOST_TIMEOUT_MS);
+
+        // A value that already fits is honoured exactly.
+        let under = compressor_with(MAX_BUDGET_MB, 2_000);
+        assert_eq!(under.budget_ms, 2_000);
+
+        // The default is still the modest 8 s, well inside the clamp.
+        let default = compressor_with(MAX_BUDGET_MB, 0);
+        assert_eq!(default.budget_ms, DEFAULT_BUDGET_MS);
+        const { assert!(DEFAULT_BUDGET_MS <= MAX_BUDGET_MS) };
+    }
+
     // -----------------------------------------------------------------------
     // The window is enforced before the graph exists
     // -----------------------------------------------------------------------
@@ -2711,7 +2940,10 @@ mod tests {
         });
 
         let text = "word ".repeat(200);
-        assert!(compressor.measure(0, None, &text, &model).is_none());
+        assert_eq!(
+            compressor.measure(0, None, &text, &model),
+            Err(Skip::OutsideWindow)
+        );
         assert!(
             model.scorer.get().is_none(),
             "the graph must not be mapped for a message the window rejects"
@@ -2739,7 +2971,10 @@ mod tests {
         let model = loaded_without_a_model();
         let compressor = compressor_with(2_048, DEFAULT_BUDGET_MS);
         let text = "short log line";
-        assert!(compressor.measure(0, None, text, &model).is_none());
+        assert_eq!(
+            compressor.measure(0, None, text, &model),
+            Err(Skip::TooShort)
+        );
         assert!(model.scorer.get().is_none());
     }
 
@@ -2748,7 +2983,10 @@ mod tests {
         let model = loaded_without_a_model();
         let compressor = compressor_with(2_048, DEFAULT_BUDGET_MS);
         let sql = "SELECT * FROM users WHERE id = 1; ".repeat(20);
-        assert!(compressor.measure(0, None, &sql, &model).is_none());
+        assert_eq!(
+            compressor.measure(0, None, &sql, &model),
+            Err(Skip::Structured)
+        );
         assert!(model.scorer.get().is_none());
     }
 
@@ -2770,7 +3008,9 @@ mod tests {
             ]
         });
 
-        let found = compressor.candidates(&payload, &model);
+        let mut rejected = Rejections::default();
+        let found = compressor.candidates(&payload, &model, &mut rejected);
+        assert!(rejected.counts.is_empty(), "{:?}", rejected.counts);
         assert_eq!(found.len(), 3, "{found:?}");
         assert_eq!(found[0].message, 2);
         assert_eq!(found[0].part, None);
@@ -2856,11 +3096,103 @@ mod tests {
     #[test]
     fn the_planner_reports_marginal_cost_not_the_model_load() {
         // `mb`/`secs` describe what the plan adds on top of the resident graph.
-        // Adding the load back in must give the per-message prediction.
+        // Adding the load back in must give the per-message prediction, which for
+        // time also carries the fixed per-message cost.
         let compressor = compressor_with(MAX_BUDGET_MB, 60_000);
         let selection = compressor.plan(vec![candidate(0, 2_000)]);
         assert_eq!(selection.chosen.len(), 1);
         assert!((MODEL_RESIDENT_MB + selection.mb - predicted_peak_mb(2_000)).abs() < 1e-6);
-        assert!((MODEL_LOAD_SECS + selection.secs - predicted_secs(2_000)).abs() < 1e-6);
+        assert!(
+            (MODEL_LOAD_SECS + selection.secs - (predicted_secs(2_000) + PER_MESSAGE_SECS)).abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn many_small_messages_are_not_rejected_for_their_combined_arena() {
+        // The arena is reused across messages, so eight 1,500-token messages cost
+        // one arena, not eight. Summing every message predicted 2,822 MB against a
+        // measured 1.6 GB peak and admitted only four of the eight — the traffic
+        // this extension exists for.
+        let compressor = compressor_with(MAX_BUDGET_MB, 60_000);
+        let selection = compressor.plan((0..8).map(|i| candidate(i, 1_500)).collect());
+        assert_eq!(selection.chosen.len(), 8, "{:?}", selection.chosen);
+
+        // The plan must still be above the measured peak: reuse is not free.
+        let planned = MODEL_RESIDENT_MB + selection.mb;
+        assert!(
+            planned >= 1_500.0,
+            "planned {planned:.0} MB, below the measurement"
+        );
+        assert!(planned <= MAX_BUDGET_MB as f64, "planned {planned:.0} MB");
+    }
+
+    #[test]
+    fn a_second_larger_shape_still_has_to_fit() {
+        // Reuse must not make a huge message free: the largest shape is charged in
+        // full even after smaller ones have been planned.
+        let compressor = compressor_with(1_300, 600_000);
+        let selection = compressor.plan(vec![candidate(0, 100), candidate(1, 3_900)]);
+        assert_eq!(selection.chosen.len(), 1, "{:?}", selection.chosen);
+        assert_eq!(selection.chosen[0].tokens, 100);
+    }
+
+    #[test]
+    fn the_time_plan_charges_every_message_not_just_the_quadratic_term() {
+        // 120 small messages measured 8.2 s while the quadratic term alone
+        // predicted 2.8 s. The planner has to see that.
+        let compressor = compressor_with(MAX_BUDGET_MB, 8_000);
+        let selection = compressor.plan((0..120).map(|i| candidate(i, 200)).collect());
+        assert!(selection.chosen.len() < 120, "{:?}", selection.chosen.len());
+        assert!(MODEL_LOAD_SECS + selection.secs <= 8.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // The rebuilt text, not the keep-flags, has to clear the floors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_empty_rebuild_is_refused_even_though_nothing_was_dropped() {
+        // Reproduced on 0.1.5: threshold 0.9 on CJK text gave 432 -> 0 tokens and
+        // a `replace` with `content: ""`. `meaning_preserved` cannot see it: with
+        // no words left, no protected word is missing.
+        assert_eq!(judge_rebuilt("text", "", 432, 0, 0.0), Err(Skip::Empty));
+        assert_eq!(
+            judge_rebuilt("text", "   \n", 432, 0, 0.0),
+            Err(Skip::Empty)
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_does_not_shrink_the_message_is_refused() {
+        assert_eq!(
+            judge_rebuilt("a b c", "a b c", 3, 3, 0.0),
+            Err(Skip::NotShorter)
+        );
+        assert_eq!(
+            judge_rebuilt("a b c d", "a b c d e", 5, 5, 0.0),
+            Err(Skip::NotShorter)
+        );
+    }
+
+    #[test]
+    fn the_savings_floor_is_measured_on_the_rebuilt_text() {
+        // The model can call 60% of tokens droppable and still return a message
+        // that saves 20% after whole-word removal. The plan has to see 20%.
+        assert_eq!(
+            judge_rebuilt("one two three four five", "one two three four", 5, 4, 0.5),
+            Err(Skip::BelowRebuiltSavings)
+        );
+        assert_eq!(
+            judge_rebuilt("one two three four five", "one two", 5, 2, 0.5),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_zero_savings_setting_still_cannot_empty_a_message() {
+        // `min_savings = 0` used to remove the percentage guard entirely, leaving
+        // only the byte floor — and an emptied message is 100% saved.
+        assert_eq!(judge_rebuilt("text", "", 100, 0, 0.0), Err(Skip::Empty));
     }
 }

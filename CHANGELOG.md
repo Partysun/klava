@@ -11,7 +11,40 @@
 ### Fixed
 
 - **`klava-compress` ran inference on messages it had already decided to discard.** The size guard ran *after* the forward pass, so a request the extension was certain to leave untouched still mapped the 600 MB graph and paid full inference — measured, 93% of all messages. Rejection now happens on the tokenizer's output, before the graph is loaded.
+- **`klava-compress` could answer with an empty message.** The savings floors were
+  applied to the model's per-token keep-flags, not to the text that would be sent,
+  so at a high `threshold` a message whose words all scored low was rebuilt to
+  nothing and returned as `replace` with `content: ""` — reported as a 100%
+  saving, and invisible to the meaning guard because there was no text left to
+  lose. Measured on 0.1.5: a 432-token CJK message became 0 tokens. The floors now
+  run on the rebuilt text, and an empty rewrite is refused outright.
+- **`klava-compress` could be killed by klava's 20 s deadline with no reply at
+  all.** `budget_ms` was not clamped against the host timeout, so `budget_ms =
+  60000` over a long request ran to 20.05 s, was killed, and printed nothing —
+  klava saw "produced no output" and passed the payload through unchanged. The
+  setting is now clamped to 17 s, and a forward pass is only started when the
+  measurement says it can finish before the deadline (a pass cannot be
+  interrupted, so starting one late loses the whole reply, not just that
+  message). `600 small messages` now stops itself at 16 s and returns 202
+  compressed messages.
+- **`klava-compress` halved the sessions it exists for.** The planner summed the
+  quadratic memory cost of every message as if each one allocated a fresh arena,
+  so 8 × 1,500 tokens predicted 2,822 MB and ran only 4 of the 8, while the
+  measured peak was 1.6 GB. Memory is now charged as arena *reuse* (largest shape
+  in full, smaller ones at a fraction), and all 8 run; 12 × 1,100-token messages
+  went from 6 to 12.
+- **`klava-compress` under-predicted the time of many-message requests.** The cost
+  model charged only the quadratic term, so 120 × 200 tokens forecast 2.8 s while
+  taking 8.2 s. Each message now also pays a fixed per-inference cost.
+- **`klava-compress` logged one line per message.** A 40-message payload produced
+  40 identical "dropped marker" lines, and klava forwards at most 20 stderr lines,
+  so the summary that says what happened was flushed out. Rejections are now
+  counted by reason and reported once per request.
 - `klava-compress` no longer rewrites a message to remove less than 200 bytes. A percentage-only floor let a 40-token message "save 50%" and contribute nothing while the inference that produced it could have removed far more elsewhere.
+- Documented that `klava-compress` is not a redaction tool: it removes low-scoring
+  text, and a secret that looks like prose is scored like prose. Card and account
+  numbers survive only because numbers and identifiers are protected, not because
+  the tool looks for secrets.
 
 ## [0.3.0] - 2026-10-20
 

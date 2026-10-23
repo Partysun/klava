@@ -119,9 +119,9 @@ klava extensions show klava-compress
 | `threshold` | `0.7` | Keep a token when its score is ≥ this. Lower keeps more. |
 | `min_tokens` | `0` = derived | Skip shorter messages. Derived from the 200-byte savings floor, near 100 tokens. |
 | `max_tokens` | `0` = derived | Only lowers the budget's own ceiling; a larger value is clamped to it. |
-| `min_savings` | `0.10` | Discard a result below this saving fraction or below 200 bytes. |
-| `budget_mb` | `0` = detected | Megabytes one request may spend on inference. `0` measures the machine: cgroup v2 headroom then `MemAvailable` on Linux, Mach VM statistics on macOS, `ullAvailPhys` on Windows. |
-| `budget_ms` | `0` = 8000 | Milliseconds one request may spend on inference; klava kills the extension at 20 s. |
+| `min_savings` | `0.10` | Discard a result below this saving fraction or below 200 bytes, measured on the rebuilt text. |
+| `budget_mb` | `0` = detected | Megabytes one request may spend on inference. `0` measures the machine: cgroup v2 headroom then `MemAvailable` on Linux, Mach VM statistics on macOS, `ullAvailPhys` on Windows. Only lowers the ceiling; capped at 2,560 MB. |
+| `budget_ms` | `0` = 8000 | Milliseconds one request may spend on inference; clamped to 17,000 because klava kills the extension at 20 s and a killed extension prints nothing. |
 | `roles` | `["tool"]` | Which message roles may be rewritten. |
 | `skip_structured` | `true` | Skip content that is mostly code, SQL, JSON, or diffs. |
 
