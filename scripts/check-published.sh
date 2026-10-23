@@ -6,8 +6,12 @@
 #
 # Usage: scripts/check-published.sh [version] [extensions-version]
 #   the CLI version defaults to Cargo.toml [package]
-#   the extension version defaults to Cargo.toml [workspace.package]
+#   the extension version defaults to each crate's own version, read from
+#     crates/<crate>/Cargo.toml ([package] or [workspace.package])
 #   pass an empty extensions version (or "none") to check only the CLI
+#
+# The extensions are versioned independently: a bump to one must not imply a
+# bump to the others, so each is checked at the version it actually ships.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -18,12 +22,11 @@ if [ -z "$version" ]; then
 fi
 [ -n "$version" ] || { echo "cannot read version from Cargo.toml" >&2; exit 2; }
 
+# An explicit second argument pins every extension to one version (useful when
+# they happen to have been bumped together); otherwise read them individually.
 ext_version="${2-}"
 if [ "$ext_version" = "none" ]; then
   ext_version=""
-elif [ -z "$ext_version" ]; then
-  # all three crates share [workspace.package]; take the first
-  ext_version="$(node scripts/ext-npm.js versions | awk 'NR == 1 { print $2 }')"
 fi
 
 checked=0
@@ -54,8 +57,9 @@ check "@zatsepin/klava-linux-x64-gnu $version (npm)" "https://registry.npmjs.org
 check "@zatsepin/klava-linux-arm64-gnu $version (npm)" "https://registry.npmjs.org/@zatsepin%2fklava-linux-arm64-gnu/$version"
 check "@zatsepin/klava-win32-x64-msvc $version (npm)" "https://registry.npmjs.org/@zatsepin%2fklava-win32-x64-msvc/$version"
 
-# The extensions carry their own version (Cargo.toml [workspace.package]) and
-# ship as one package per crate and platform.
+# The extensions ship as one package per crate and platform, and are versioned
+# independently of each other and of the CLI: a fix to one must not force a bump
+# on another, so each is checked at its own version unless one was pinned above.
 if [ -n "$ext_version" ]; then
   echo "checking extension version $ext_version"
   for crate in klava-compress klava-pii-guardrail klava-model-escalation; do
@@ -65,6 +69,15 @@ if [ -n "$ext_version" ]; then
         "https://registry.npmjs.org/${encoded}/${ext_version}"
     done
   done
+else
+  while read -r crate crate_version; do
+    echo "checking extensions: $crate $crate_version"
+    for platform in linux-x64-gnu linux-arm64-gnu darwin win32-x64-msvc; do
+      encoded="@zatsepin%2f${crate}-${platform}"
+      check "@zatsepin/${crate}-${platform} $crate_version (npm)" \
+        "https://registry.npmjs.org/${encoded}/${crate_version}"
+    done
+  done < <(node scripts/ext-npm.js versions)
 fi
 
 echo

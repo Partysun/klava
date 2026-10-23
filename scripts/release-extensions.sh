@@ -19,9 +19,11 @@
 # every package here carries its own prebuilt binary and the platform is part of
 # the name.
 #
-# Versions come from the crates (0.1.x, [workspace.package]) and not from
+# Versions come from the crates' own manifests (0.1.x) and not from
 # CI_COMMIT_TAG: a v0.3.0 tag releases the CLI, and the extensions are versioned
-# independently.
+# independently. A crate may pin its own `[package] version`; one that inherits
+# `version.workspace = true` uses [workspace.package], so bumping a single
+# extension does not move the others.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

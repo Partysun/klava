@@ -40,9 +40,9 @@ if [ -n "${CI_COMMIT_TAG:-}" ]; then
   echo "tag: $CI_COMMIT_TAG"
 fi
 
-# The extension crates are versioned independently ([workspace.package]) and
-# publish to npm from their own manifest at publish time, so they are not part
-# of the CLI's manifest check — only surface them for context.
+# The extension crates are versioned independently of the CLI and of each other,
+# and publish to npm from their own manifest at publish time, so they are not
+# part of the CLI's manifest check — only surface them for context.
 if command -v node >/dev/null 2>&1; then
   node scripts/ext-npm.js versions | while read -r crate version; do
     echo "extension $crate: $version (independent)"
