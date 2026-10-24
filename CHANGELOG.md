@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-24
+
 ### Added
 
 - **`klava check` now checks the proxy, not just the providers.** It probes the managed service (`systemctl`/`launchctl` state), the port (`GET /health`) and real routing (a `POST /v1/chat/completions` through the proxy) as three separate layers, and reports which one is broken along with the command that fixes it. Previously it only called each provider's API directly, so a dead or misrouting proxy still reported healthy. The proxy probe runs first, so a dead proxy now fails in milliseconds instead of after a 30-second provider timeout.
