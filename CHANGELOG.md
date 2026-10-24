@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`klava-pii-guardrail` timed out on large tool output and failed the request
+  closed.** Redaction called `pii::Anonymizer::anonymize`, which rewrites spans
+  back-to-front with `String::replace_range` — every match moved the rest of the
+  string, so cost was O(matches × length). A 16 MB binary-RE dump with 400k
+  matches took 57 s against klava's 20 s deadline, and because the manifest sets
+  `fail_closed = true` a timed-out guardrail rejects the request outright;
+  `klava-compress`, which runs first and fails open, had already handed the same
+  payload on. Redaction is now one forward splice instead of a replacement per
+  span: the same 400k-match input measures 12.1 s through the crate and 21 ms
+  through the splice, so the linear path stays three orders of magnitude away
+  from the deadline. The operators are local copies (the crate keeps them
+  private), and a test pins their output to the crate's, byte for byte.
+- **`klava-pii-guardrail` no longer analyses unbounded payloads.** Requests with
+  more than 3 MiB of text are refused with `decision: "deny"` and a reason
+  instead of being passed through unredacted. 3 MiB keeps the worst case inside
+  klava's 8 MiB `MAX_STDOUT` reply cap even when redaction roughly doubles the
+  text, and bounds peak memory (the analyzer allocates a token per word).
+
 ### Added
 
 - **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.

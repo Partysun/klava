@@ -1429,9 +1429,11 @@ dependencies = [
 name = "klava-pii-guardrail"
 version = "0.1.5"
 dependencies = [
+ "hex",
  "pii",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml 1.1.6+spec-1.1.0",
 ]
 

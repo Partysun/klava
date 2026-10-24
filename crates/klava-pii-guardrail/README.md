@@ -75,6 +75,16 @@ Entity names: `Email`, `Phone`, `IpAddress`, `Ipv6`, `CreditCard`, `Iban`,
   `~/.local/share/klava/extensions/klava-pii-guardrail.toml`) means an internal
   crash would let unredacted text through. Do it only if you would rather have
   the request go out than fail.
+- Requests with more than 3 MiB of text are **refused** (`decision: "deny"`)
+  rather than analyzed. klava gives an extension 20 s and caps its reply at
+  8 MiB, so a multi-megabyte dump could only be half-processed before the host
+  killed it. Forwarding it unanalyzed instead would let the payload through
+  unchecked — the leak this extension exists to prevent — so the request is
+  denied with a reason naming the size. Ordinary prompts and accumulated tool
+  output fit comfortably below the limit.
+- Redaction is one forward pass over the text. Spans are replaced in a single
+  copy rather than by repeated in-place `replace_range` calls, so a payload with
+  tens of thousands of matches costs milliseconds instead of minutes.
 
 See [klava's EXTENSIONS.md](https://github.com/Partysun/klava/blob/master/EXTENSIONS.md)
 for the wire protocol.
