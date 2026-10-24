@@ -117,6 +117,31 @@ short-lived child/foreground proxy instead — e.g. for CI or custom ports.
 On Windows the managed service is not available yet; `klava up` keeps
 working there.
 
+#### Checking the proxy end to end
+
+`klava check` verifies the local proxy before it tests any provider, because a
+working upstream API does not mean the thing your agent talks to is working:
+
+```
+✓ proxy (~deepseek/deepseek-flash-latest) → http://127.0.0.1:48017 → 1217ms
+  ✓ klava-48017.service is running
+  ✓ something answers on http://127.0.0.1:48017
+  ✓ proxy routed a completion: "verified"
+```
+
+The three layers are reported separately, so the failure names the fix:
+
+| Layer   | What it proves                     | When it fails                                      |
+| ------- | ---------------------------------- | -------------------------------------------------- |
+| Service | the unit/agent is running          | `klava restart` (or `klava launch` if absent)      |
+| Port    | the process answers `GET /health`  | wrong port, dead process, unit points elsewhere    |
+| Routing | a real `POST /v1/chat/completions` | broken auth, hooks/extensions, upstream errors     |
+
+Only the routing step decides success. The proxy probe runs before the
+per-model upstream tests, so a dead proxy fails in milliseconds instead of
+after the 30-second provider timeout. The command exits non-zero if any layer
+fails.
+
 Supported code agents:
 
 | Agent      | Description    | Link                      |

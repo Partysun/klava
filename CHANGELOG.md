@@ -4,6 +4,7 @@
 
 ### Added
 
+- **`klava check` now checks the proxy, not just the providers.** It probes the managed service (`systemctl`/`launchctl` state), the port (`GET /health`) and real routing (a `POST /v1/chat/completions` through the proxy) as three separate layers, and reports which one is broken along with the command that fixes it. Previously it only called each provider's API directly, so a dead or misrouting proxy still reported healthy. The proxy probe runs first, so a dead proxy now fails in milliseconds instead of after a 30-second provider timeout.
 - **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.
 - **PyPI wheels for every supported platform.** Alongside the sdist, releases now ship `manylinux_2_17` wheels for x86_64 and aarch64 (aarch64 cross-compiled on the amd64 agent with zig), a macOS universal2 wheel and a Windows wheel, so `pip install klava` / `uvx klava` no longer compile from source. The macOS wheel had been missing since 0.2.0 because the release step passed a flag maturin does not have.
 

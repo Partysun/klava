@@ -359,7 +359,20 @@ async fn main() -> anyhow::Result<()> {
         Command::Check { provider, model } => {
             // `--provider` filters by model-entry name (the old flag name is
             // kept so existing scripts keep working).
-            klava::diagnostic::run_tests(&config, provider.as_deref(), model.as_deref()).await;
+            //
+            // The service state is read here, in the binary, because service
+            // management (systemd/launchd) lives outside the library.
+            let instance = service::instance_state(config.port);
+            let active = instance.is_active();
+            let status = klava::diagnostic::ServiceStatus {
+                unit: instance.unit,
+                installed: instance.installed,
+                active,
+                state: instance.state,
+                logs_command: service::logs_command(config.port),
+            };
+            klava::diagnostic::run_tests(&config, provider.as_deref(), model.as_deref(), status)
+                .await;
             Ok(())
         }
         Command::Login { force } => handle_klava_login(force).await,

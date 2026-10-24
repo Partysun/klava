@@ -268,8 +268,9 @@ pub enum Command {
 
     /// Check configuration and model connectivity
     ///
-    /// Sends a small, cheap test request to every configured model
-    /// to verify everything is working.
+    /// Checks the local proxy first (managed service, port, and a real routed
+    /// completion), then sends a small, cheap test request to every configured
+    /// model to verify the upstream APIs are working.
     #[command(after_help = "Examples:\n  \
                      klava check\n  \
                      klava check --provider ~deepseek/deepseek-flash-latest")]

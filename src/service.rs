@@ -436,6 +436,95 @@ pub fn logs_command(port: u16) -> String {
     }
 }
 
+/// State of the managed service for one port, as the service manager sees it.
+///
+/// Query only: nothing here starts, stops or rewrites a unit. `klava check`
+/// uses it to say *which* layer is broken when a request fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceState {
+    /// Name of the unit/agent, e.g. `klava-48017.service`.
+    pub unit: String,
+    /// Whether a unit/agent file exists at all.
+    pub installed: bool,
+    /// `active`, `inactive`, `failed`, … or `absent`.
+    pub state: String,
+    /// `enabled`, `disabled`, … or `unknown`; on launchd, `loaded`/`unloaded`.
+    pub enabled: String,
+}
+
+impl InstanceState {
+    /// Whether the service manager reports the instance as running.
+    pub fn is_active(&self) -> bool {
+        matches!(self.state.as_str(), "active" | "running")
+    }
+}
+
+/// Read the service-manager state for `port` without touching it.
+pub fn instance_state(port: u16) -> InstanceState {
+    if systemd_available() {
+        return systemd_instance_state(port);
+    }
+    if launchd_available() {
+        return launchd_instance_state(port);
+    }
+    InstanceState {
+        unit: instance_name(port),
+        installed: false,
+        state: "absent".into(),
+        enabled: "unknown".into(),
+    }
+}
+
+fn systemd_instance_state(port: u16) -> InstanceState {
+    let name = unit_name(port);
+    let installed = unit_path(port).exists();
+    if !installed {
+        return InstanceState {
+            unit: name,
+            installed: false,
+            state: "absent".into(),
+            enabled: "unknown".into(),
+        };
+    }
+    // A unit file that has never been loaded reports `inactive`, which is
+    // true but reads like a crash; callers only care that it is not running.
+    let state = match run_systemctl(&["is-active", &name]) {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Err(_) => "unknown".into(),
+    };
+    let enabled = match run_systemctl(&["is-enabled", &name]) {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Err(_) => "unknown".into(),
+    };
+    InstanceState {
+        unit: name,
+        installed,
+        state,
+        enabled,
+    }
+}
+
+fn launchd_instance_state(port: u16) -> InstanceState {
+    let label = instance_name(port);
+    let installed = launchd_plist_path(port).exists();
+    if !installed {
+        return InstanceState {
+            unit: label,
+            installed: false,
+            state: "absent".into(),
+            enabled: "unknown".into(),
+        };
+    }
+    let running = launchd_is_running(&label);
+    let loaded = launchd_is_loaded(&label);
+    InstanceState {
+        unit: label,
+        installed,
+        state: if running { "running" } else { "stopped" }.into(),
+        enabled: if loaded { "loaded" } else { "unloaded" }.into(),
+    }
+}
+
 /// Report the state of every managed instance.
 pub fn status() -> Result<()> {
     if systemd_available() {
