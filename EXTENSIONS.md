@@ -471,6 +471,7 @@ klava extensions show <name>            # status, notice, declared settings, eff
 klava extensions install <source> --trust
 klava extensions install <source> --trust --no-setup   # enable, but do not provision
 klava extensions setup <name>           # run the [setup] hook now (re-runs it)
+klava extensions stats <name> [--json]  # run the binary's `--stats`, if it has one
 klava extensions refresh-manifest <name>  # re-ask the binary for its manifest
 klava extensions enable <name> [--trust|--no-setup]
 klava extensions disable <name>
@@ -481,6 +482,12 @@ klava extensions remove <name>
 
 `set` parses values as JSON when it can, so `threshold=0.7` and
 `roles=["tool"]` both work.
+
+`stats` is a pass-through: klava runs `<binary> --stats` and prints whatever it
+says. Whether an extension reports anything, and in what shape, is its own
+business — klava interprets no outcome and counts nothing, so it has nothing to
+invent here. Any extension may implement `--stats`, and one that does not simply
+fails with its own usage text.
 
 `install` adopts a manifest the extension prints: after a `cargo:`/`npm:`
 install, klava runs `<binary> --print-manifest` once and stores valid TOML as

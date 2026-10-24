@@ -1,10 +1,11 @@
 [package]
 name = "klava-compress"
-# Versioned on its own, not from [workspace.package]: this crate ships fixes that
-# the other two extensions do not have, and crates.io cannot republish a version.
-# 0.1.6 fixes four defects in 0.1.5 (empty rewrites, budget_ms overrunning the
-# host timeout, per-message memory summing, per-message log lines).
-version = "0.1.6"
+# Versioned on its own, not from [workspace.package]: this crate ships changes
+# that the other two extensions do not have, and crates.io cannot republish a
+# version. 0.1.7 adds self-recorded statistics (`--stats`); 0.1.6 fixed four
+# defects in 0.1.5 (empty rewrites, budget_ms overrunning the host timeout,
+# per-message memory summing, per-message log lines).
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -33,12 +33,13 @@ pub fn run(config: &mut Config, args: Vec<String>) -> Result<()> {
         }
         "setup" => setup(config, rest),
         "refresh-manifest" => refresh_manifest(rest),
+        "stats" => stats(rest),
         "enable" => set_enabled(config, rest, true),
         "disable" => set_enabled(config, rest, false),
         "set" => set_key(config, rest),
         other => bail!(
             "unknown action '{other}'; expected list, path, install, remove, verify, \
-             show, setup, refresh-manifest, enable, disable or set"
+             show, setup, refresh-manifest, stats, enable, disable or set"
         ),
     }
 }
@@ -273,6 +274,53 @@ fn refresh_manifest(rest: &[String]) -> Result<()> {
             "{} produced no manifest; the existing one (if any) is unchanged",
             name
         );
+    }
+    Ok(())
+}
+
+/// `klava extensions stats <name> [--json]`
+///
+/// What an extension has saved is its own business: klava does not interpret
+/// the protocol's outcomes, so it does not count them either. This asks the
+/// binary instead — `<name> --stats` — which means the numbers come from the
+/// code that produced them, keep working when the proxy is stopped, and do not
+/// depend on a log line having survived rotation.
+///
+/// A binary that does not implement `--stats` fails with its own usage text,
+/// which says more than anything klava could invent here.
+fn stats(rest: &[String]) -> Result<()> {
+    let (name, flags) = rest
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("usage: klava extensions stats <name> [--json]"))?;
+    let ext =
+        find(name).ok_or_else(|| anyhow::anyhow!("no extension named '{name}' is installed"))?;
+
+    let mut command = std::process::Command::new(&ext.path);
+    command.arg("--stats");
+    if flags.iter().any(|flag| flag == "--json") {
+        command.arg("--json");
+    }
+    // `--stats` reads the extension's own state file and prints it; it never
+    // wants a request on stdin.
+    command.stdin(std::process::Stdio::null());
+
+    let output = crate::utils::spawn_retrying_busy(&mut command)
+        .and_then(|child| child.wait_with_output())
+        .map_err(|e| anyhow::anyhow!("cannot run {}: {e}", ext.path.display()))?;
+
+    // The extension's own explanation of why there is nothing to report is
+    // worth printing, so stderr is passed through rather than swallowed.
+    let text = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    print!("{text}");
+    if !text.is_empty() && !text.ends_with('\n') {
+        println!();
+    }
+    if !output.status.success() {
+        bail!("'{} --stats' exited with {}", ext.name, output.status);
     }
     Ok(())
 }
@@ -702,5 +750,20 @@ mod tests {
     fn an_unknown_extension_is_an_error() {
         let c = config();
         assert!(show(&c, "definitely-not-installed").is_err());
+    }
+
+    #[test]
+    fn stats_names_the_extension_it_needs() {
+        let error = stats(&[]).unwrap_err().to_string();
+        assert!(error.contains("usage"), "got: {error}");
+        assert!(error.contains("--json"), "got: {error}");
+    }
+
+    #[test]
+    fn stats_reports_a_missing_extension_rather_than_running_anything() {
+        let error = stats(&["definitely-not-installed".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no extension named"), "got: {error}");
     }
 }

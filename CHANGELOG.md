@@ -7,6 +7,25 @@
 - **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.
 - **PyPI wheels for every supported platform.** Alongside the sdist, releases now ship `manylinux_2_17` wheels for x86_64 and aarch64 (aarch64 cross-compiled on the amd64 agent with zig), a macOS universal2 wheel and a Windows wheel, so `pip install klava` / `uvx klava` no longer compile from source. The macOS wheel had been missing since 0.2.0 because the release step passed a flag maturin does not have.
 
+## [klava-compress 0.1.7] - 2026-10-24
+
+### Added
+
+- **`klava-compress` reports what it has saved.** The extension now appends one
+  JSON line per request to `$XDG_DATA_HOME/klava/compress-stats.jsonl`
+  (`~/.local/share/klava/` by default) and prints the totals back with
+  `klava-compress --stats` (`--json` for scripts) — or `klava extensions stats
+  klava-compress`, which runs the installed binary. The output has a per-day
+  table and the skip mix, so "where did the savings go" is answerable from the
+  same file. Two totals are reported: one summed over runs, and one deduplicated
+  by content hash, because the agent re-sends its history every turn and summing
+  counts the same tool output again each time. Counting lives in the extension
+  rather than in log scraping: klava forwards at most 20 stderr lines and the
+  summary line was printed last, so a noisy request lost exactly the numbers
+  worth measuring. Recording a run is best-effort — a failed write warns and never
+  affects compression — the file rotates at 16 MiB, and `stats = false` turns it
+  off. A new `stats` setting declares this.
+
 ## [klava-pii-guardrail 0.1.6] - 2026-10-24
 
 ### Fixed

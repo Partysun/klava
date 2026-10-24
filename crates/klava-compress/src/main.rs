@@ -57,6 +57,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tokenizers::Tokenizer;
 
+/// What this extension has saved, recorded one line per run.
+mod stats;
+
 /// The protocol version klava sends. We answer whatever we understand.
 const PROTOCOL: u32 = 1;
 
@@ -88,6 +91,7 @@ budget_mb = 0
 budget_ms = 0
 roles = ["tool"]
 skip_structured = true
+stats = true
 "#;
 
 /// Where the model files come from.
@@ -184,6 +188,17 @@ pub struct CompressConfig {
     /// from a Rust function. Structural content is left untouched.
     #[serde(default = "default_skip_structured")]
     pub skip_structured: bool,
+    /// Append one line per run to the stats file.
+    ///
+    /// On by default: without it there is no way to answer "has this been worth
+    /// it" except by grepping a log that rotates. The file holds timings, token
+    /// counts, and a hash of each rewritten message — never its text.
+    #[serde(default = "default_true")]
+    pub stats: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_threshold() -> f32 {
@@ -224,6 +239,7 @@ impl Default for CompressConfig {
             budget_ms: default_budget_ms(),
             roles: default_roles(),
             skip_structured: default_skip_structured(),
+            stats: default_true(),
         }
     }
 }
@@ -734,16 +750,24 @@ impl Rejections {
 
     /// One line, in [`Skip::ALL`] order, or nothing when every message ran.
     fn report(&self) {
-        if self.counts.is_empty() {
+        let counts: Vec<String> = self
+            .counts()
+            .map(|(skip, count)| format!("{count} {}", skip.label()))
+            .collect();
+        if counts.is_empty() {
             return;
         }
-        let mut parts = Vec::with_capacity(self.counts.len());
-        for skip in Skip::ALL {
-            if let Some((_, count)) = self.counts.iter().find(|(seen, _)| *seen == skip) {
-                parts.push(format!("{count} {}", skip.label()));
-            }
-        }
-        eprintln!("kompress: skipped {}", parts.join(", "));
+        eprintln!("kompress: skipped {}", counts.join(", "));
+    }
+
+    /// The counted reasons, in [`Skip::ALL`] order, for the stats record.
+    fn counts(&self) -> impl Iterator<Item = (Skip, usize)> + '_ {
+        Skip::ALL.into_iter().filter_map(move |skip| {
+            self.counts
+                .iter()
+                .find(|(seen, _)| *seen == skip)
+                .map(|(_, count)| (skip, *count))
+        })
     }
 }
 
@@ -1268,6 +1292,8 @@ enum Mode {
     FetchModel { dir: Option<PathBuf> },
     /// Print the manifest klava should store beside this binary.
     PrintManifest,
+    /// Print what this extension has saved, from its own state file.
+    Stats { json: bool },
     /// Print usage.
     Help,
 }
@@ -1275,12 +1301,15 @@ enum Mode {
 fn parse_args(args: &[String]) -> Result<Mode, String> {
     let mut mode = Mode::Serve;
     let mut dir: Option<PathBuf> = None;
+    let mut json = false;
     let mut iter = args.iter();
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--fetch-model" => mode = Mode::FetchModel { dir: None },
             "--print-manifest" => mode = Mode::PrintManifest,
+            "--stats" => mode = Mode::Stats { json: false },
+            "--json" => json = true,
             "-h" | "--help" => mode = Mode::Help,
             "--dir" => {
                 let value = iter.next().ok_or("--dir needs a value")?;
@@ -1298,7 +1327,198 @@ fn parse_args(args: &[String]) -> Result<Mode, String> {
         }
     }
 
+    // `--json` only means something together with `--stats`. Accepting it alone
+    // would silently ignore it and print the human table.
+    if json {
+        match mode {
+            Mode::Stats { .. } => mode = Mode::Stats { json: true },
+            _ => return Err("--json is only valid with --stats".into()),
+        }
+    }
+
     Ok(mode)
+}
+
+// ---------------------------------------------------------------------------
+// `--stats`: what the recorded runs add up to
+// ---------------------------------------------------------------------------
+
+/// Print the totals, a per-day table and the skip mix.
+///
+/// Two figures for saved tokens, both labelled, because there are two honest
+/// questions. `summed` answers "how much did every run shorten what it sent".
+/// `unique` answers "how much shorter is each distinct message than it was" —
+/// the agent re-sends its history every turn, so summing counts the same tool
+/// output again on every turn it appears in.
+fn print_stats(json: bool) -> Result<(), String> {
+    let history = stats::History::load(&stats::files());
+    let agg = stats::Aggregate::of(&history.runs);
+    let malformed = history.malformed;
+    let unreadable: Vec<String> = history
+        .unreadable
+        .iter()
+        .map(|(path, error)| format!("{}: {error}", path.display()))
+        .collect();
+
+    if json {
+        let mut value = serde_json::to_value(&agg).map_err(|e| e.to_string())?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("saved".into(), agg.saved().into());
+            object.insert("unique_saved".into(), agg.unique_saved().into());
+            object.insert("malformed".into(), malformed.into());
+            object.insert("file".into(), stats::path().display().to_string().into());
+            object.insert("unreadable".into(), unreadable.clone().into());
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".into())
+        );
+        return Ok(());
+    }
+
+    if agg.runs == 0 {
+        // Only claim "nothing recorded" when that is what happened; an
+        // unreadable file is a different answer and must not look like zero.
+        if unreadable.is_empty() {
+            println!("No compression runs recorded yet.");
+            println!();
+            println!("Stats are written by the extension itself, one line per run:");
+            println!("  {}", stats::path().display());
+            println!(
+                "They start with the first request klava sends after this version is installed."
+            );
+        } else {
+            println!("Cannot read the stats file:");
+            for entry in &unreadable {
+                println!("  {entry}");
+            }
+            println!();
+            println!("Compression still works; only the record of what it saved is lost.");
+        }
+        if malformed > 0 {
+            println!();
+            println!("{malformed} unreadable line(s) in the file were skipped.");
+        }
+        return Ok(());
+    }
+
+    let span = match (agg.first_ts, agg.last_ts) {
+        (Some(first), Some(last)) => {
+            format!(
+                "{} (UTC), {} day(s)",
+                stats::date_of(first),
+                (last - first) / 86_400 + 1
+            )
+        }
+        _ => "unknown".into(),
+    };
+
+    println!("klava-compress {}", env!("CARGO_PKG_VERSION"));
+    println!("Covers {span}");
+    println!();
+
+    println!(
+        "{:<16} {:>12} {:>12} {:>12} {:>16}",
+        "", "MESSAGES", "TOKENS IN", "TOKENS OUT", "SAVED"
+    );
+    print_row("Every run", agg.before, agg.after, agg.messages);
+    print_row(
+        "Distinct msgs",
+        agg.unique_before,
+        agg.unique_after,
+        agg.unique_messages,
+    );
+    println!();
+    println!(
+        "  {} run(s), {} of them shortening something.",
+        thousands(agg.runs),
+        thousands(agg.runs_compressed)
+    );
+    println!();
+    println!("  Summed counts a re-sent message again on every turn it appears in.");
+    println!("  Distinct counts each message once, by content, so it is the figure");
+    println!("  that matches what the provider would not have received.");
+    println!("  Both are this extension's tokenizer, not the provider's billing.");
+
+    if agg.days.len() > 1 || agg.days.values().any(|d| d.messages > 0) {
+        println!();
+        println!(
+            "{:<12} {:>7} {:>9} {:>12} {:>12} {:>8}",
+            "UTC DAY", "RUNS", "MESSAGES", "TOKENS IN", "TOKENS OUT", "SAVED"
+        );
+        for (day, totals) in &agg.days {
+            let pct = percent(totals.before.saturating_sub(totals.after), totals.before);
+            println!(
+                "{:<12} {:>7} {:>9} {:>12} {:>12} {:>8}",
+                day,
+                totals.runs,
+                totals.messages,
+                thousands(totals.before),
+                thousands(totals.after),
+                pct
+            );
+        }
+    }
+
+    if !agg.skipped.is_empty() {
+        println!();
+        println!("Messages left alone, by reason:");
+        let mut reasons: Vec<(&String, &usize)> = agg.skipped.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (reason, count) in reasons {
+            println!("  {count:>7}  {reason}");
+        }
+    }
+
+    println!();
+    if !unreadable.is_empty() {
+        println!("Not included above — the file could not be read:");
+        for entry in &unreadable {
+            println!("  {entry}");
+        }
+        println!();
+    }
+    println!("Recorded in {}", stats::path().display());
+    if malformed > 0 {
+        println!(
+            "{malformed} unreadable line(s) were skipped (a partial write from a killed run)."
+        );
+    }
+    Ok(())
+}
+
+fn print_row(label: &str, before: usize, after: usize, messages: usize) {
+    let saved = before.saturating_sub(after);
+    println!(
+        "{:<16} {:>12} {:>12} {:>12} {:>16}",
+        label,
+        thousands(messages),
+        thousands(before),
+        thousands(after),
+        format!("{} ({})", thousands(saved), percent(saved, before))
+    );
+}
+
+/// Percentage of `total` that `part` is, as `17.7%`, or `-` when the
+/// denominator is zero.
+fn percent(part: usize, total: usize) -> String {
+    if total == 0 {
+        return "-".into();
+    }
+    format!("{:.1}%", 100.0 * part as f64 / total as f64)
+}
+
+/// `2353266` as `2,353,266`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Where klava hands the hook its effective config (manifest merged with the
@@ -1504,16 +1724,23 @@ Usage:
   klava-compress                  # serve one JSON request on stdin (klava does this)
   klava-compress --fetch-model    # download the model (~573 MB)
   klava-compress --print-manifest # print the manifest klava stores beside this binary
+  klava-compress --stats          # what it has saved, from its own records
 
 Options:
   --fetch-model        Download {} and {} into the model directory.
   --dir <DIR>          With --fetch-model: download into DIR instead of the cache.
+  --stats              Print totals, a per-day table and the skip mix.
+  --json               With --stats: machine-readable output.
   -h, --help           Show this help.
 
 The model directory is, in order: --dir, model_dir from
 $KLAVA_EXTENSION_CONFIG (set by klava when it runs the setup hook, with the
 manifest merged with your settings), $KLAVA_COMPRESS_MODEL_DIR,
 $XDG_CACHE_HOME/klava/kompress, ~/.cache/klava/kompress.
+
+Statistics are appended to compress-stats.jsonl in $XDG_DATA_HOME/klava
+(default ~/.local/share/klava) once per request, by the extension itself. Turn
+that off with: klava extensions set klava-compress stats=false
 ",
         TOKENIZER_FILE,
         MODEL_FILE,
@@ -1543,6 +1770,12 @@ fn main() {
         Mode::Help => print!("{}", usage()),
         Mode::FetchModel { dir } => {
             if let Err(e) = fetch_model(dir.as_deref(), std::env::var(CONFIG_ENV).ok().as_deref()) {
+                eprintln!("klava-compress: {e}");
+                std::process::exit(1);
+            }
+        }
+        Mode::Stats { json } => {
+            if let Err(e) = print_stats(json) {
                 eprintln!("klava-compress: {e}");
                 std::process::exit(1);
             }
@@ -1611,11 +1844,15 @@ impl Compressor {
         let candidates = self.candidates(&payload, model, &mut rejected);
         if candidates.is_empty() {
             rejected.report();
+            // A run that considered messages and rewrote none is still a run:
+            // it is the half of the picture that says where the savings went.
+            self.record_run(&rejected, &Selection::default(), 0, 0, 0, &[]);
             return None;
         }
         let selection = self.plan(candidates);
         if selection.chosen.is_empty() {
             rejected.report();
+            self.record_run(&rejected, &selection, 0, 0, 0, &[]);
             return None;
         }
 
@@ -1623,6 +1860,9 @@ impl Compressor {
         let mut before_total = 0usize;
         let mut after_total = 0usize;
         let mut touched = 0usize;
+        // Per-message detail for the deduplicated total, capped so one line
+        // stays small even for a request with hundreds of rewrites.
+        let mut saves: Vec<stats::MessageSave> = Vec::new();
 
         for candidate in &selection.chosen {
             // The planner predicts from measured costs, but the wall clock is
@@ -1685,6 +1925,15 @@ impl Compressor {
 
             match self.compress_text(model, &encoding, text) {
                 Ok((rewritten, before, after)) => {
+                    if saves.len() < stats::MAX_SAVES {
+                        // The hash is of what we were asked to compress, so a
+                        // message re-sent on the next turn hashes the same.
+                        saves.push(stats::MessageSave {
+                            hash: stats::hash_text(text),
+                            before,
+                            after,
+                        });
+                    }
                     *text = rewritten;
                     before_total += before;
                     after_total += after;
@@ -1695,6 +1944,16 @@ impl Compressor {
         }
 
         rejected.report();
+        // Recorded even when nothing cleared the floor: `touched == 0` is the
+        // common case and exactly what `--stats` needs to explain.
+        self.record_run(
+            &rejected,
+            &selection,
+            touched,
+            before_total,
+            after_total,
+            &saves,
+        );
         if touched == 0 || after_total >= before_total {
             return None;
         }
@@ -1707,6 +1966,67 @@ impl Compressor {
             selection.chosen.len()
         );
         Some(payload)
+    }
+
+    /// Append this run to the stats file.
+    ///
+    /// Called where the numbers are final, not at process exit, so a later
+    /// panic cannot lose them. A failure is a warning on stderr and nothing
+    /// else: statistics are a convenience, compression is the job.
+    fn record_run(
+        &self,
+        rejected: &Rejections,
+        selection: &Selection,
+        touched: usize,
+        before: usize,
+        after: usize,
+        saves: &[stats::MessageSave],
+    ) {
+        let Some(run) = self.run_record(rejected, selection, touched, before, after, saves) else {
+            return;
+        };
+        if let Err(e) = stats::record(&run) {
+            eprintln!(
+                "kompress: cannot record stats in {}: {e}",
+                stats::path().display()
+            );
+        }
+    }
+
+    /// What would be written, or `None` when there is nothing worth writing.
+    ///
+    /// Split from [`Self::record_run`] so the content can be checked without a
+    /// model and without touching the user's data directory.
+    fn run_record(
+        &self,
+        rejected: &Rejections,
+        selection: &Selection,
+        touched: usize,
+        before: usize,
+        after: usize,
+        saves: &[stats::MessageSave],
+    ) -> Option<stats::RunRecord> {
+        if !self.config.stats {
+            return None;
+        }
+        // A request with no message in a compressed role considers nothing and
+        // plans nothing. Recording it would grow the file with lines that carry
+        // no information, and the file is read back in full.
+        if touched == 0 && selection.chosen.is_empty() && rejected.counts.is_empty() {
+            return None;
+        }
+
+        let mut run = stats::RunRecord::new();
+        run.messages = touched;
+        run.before = before;
+        run.after = after;
+        run.planned = selection.chosen.len();
+        run.skipped = rejected
+            .counts()
+            .map(|(skip, count)| (skip.label().to_string(), count))
+            .collect();
+        run.saved = saves.to_vec();
+        Some(run)
     }
 }
 
@@ -2445,6 +2765,37 @@ mod tests {
     fn help_is_recognised() {
         assert_eq!(parse_args(&args(&["--help"])).unwrap(), Mode::Help);
         assert_eq!(parse_args(&args(&["-h"])).unwrap(), Mode::Help);
+    }
+
+    #[test]
+    fn stats_is_a_mode_of_its_own() {
+        assert_eq!(
+            parse_args(&args(&["--stats"])).unwrap(),
+            Mode::Stats { json: false }
+        );
+        assert_eq!(
+            parse_args(&args(&["--stats", "--json"])).unwrap(),
+            Mode::Stats { json: true }
+        );
+        // Order must not matter; `klava extensions stats` passes the flag alone.
+        assert_eq!(
+            parse_args(&args(&["--json", "--stats"])).unwrap(),
+            Mode::Stats { json: true }
+        );
+    }
+
+    #[test]
+    fn json_without_stats_is_rejected() {
+        // Silently ignoring it would print the human table to a `--json`
+        // caller, which is worse than an error.
+        let error = parse_args(&args(&["--json"])).unwrap_err();
+        assert!(error.contains("--stats"), "got: {error}");
+    }
+
+    #[test]
+    fn the_manifest_declares_the_stats_switch() {
+        let value: toml::Value = toml::from_str(MANIFEST).unwrap();
+        assert_eq!(value["settings"]["stats"].as_bool(), Some(true));
     }
 
     #[test]
@@ -3194,5 +3545,152 @@ mod tests {
         // `min_savings = 0` used to remove the percentage guard entirely, leaving
         // only the byte floor — and an emptied message is 100% saved.
         assert_eq!(judge_rebuilt("text", "", 100, 0, 0.0), Err(Skip::Empty));
+    }
+
+    // -----------------------------------------------------------------------
+    // The stats record
+    // -----------------------------------------------------------------------
+
+    fn compressor(stats: bool) -> Compressor {
+        Compressor::new(CompressConfig {
+            stats,
+            ..CompressConfig::default()
+        })
+    }
+
+    fn skip_counts(skips: &[(Skip, usize)]) -> Rejections {
+        let mut rejected = Rejections::default();
+        for &(skip, count) in skips {
+            for _ in 0..count {
+                rejected.add(skip);
+            }
+        }
+        rejected
+    }
+
+    fn selection_of(messages: &[usize]) -> Selection {
+        Selection {
+            chosen: messages
+                .iter()
+                .map(|&message| Candidate {
+                    message,
+                    part: None,
+                    tokens: 1_000,
+                })
+                .collect(),
+            mb: 0.0,
+            secs: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_run_that_compressed_nothing_is_still_recorded_with_its_reasons() {
+        // Half of all requests rewrite nothing. Dropping them would make
+        // `--stats` a list of successes with no denominator.
+        let rejected = skip_counts(&[(Skip::Structured, 42), (Skip::TooShort, 7)]);
+        let run = compressor(true)
+            .run_record(&rejected, &Selection::default(), 0, 0, 0, &[])
+            .expect("a run that considered messages must be recorded");
+
+        assert_eq!(run.messages, 0);
+        assert_eq!(run.planned, 0);
+        assert_eq!(run.skipped["structured content"], 42);
+        assert_eq!(run.skipped["shorter than the byte floor"], 7);
+        assert_eq!(run.v, stats::VERSION);
+        assert_eq!(run.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_request_with_nothing_to_consider_is_not_recorded() {
+        // Every request klava sends would otherwise add a line to a file that is
+        // read back in full; a compressed-role match is what makes a run news.
+        assert!(
+            compressor(true)
+                .run_record(&Rejections::default(), &Selection::default(), 0, 0, 0, &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_stats_switch_stops_the_record() {
+        let rejected = skip_counts(&[(Skip::Structured, 1)]);
+        assert!(
+            compressor(false)
+                .run_record(&rejected, &Selection::default(), 0, 0, 0, &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_compressed_run_records_its_totals_and_per_message_detail() {
+        let rejected = skip_counts(&[(Skip::MeaningLost, 3)]);
+        let selection = selection_of(&[0, 1]);
+        let saves = vec![
+            stats::MessageSave {
+                hash: stats::hash_text("first"),
+                before: 700,
+                after: 500,
+            },
+            stats::MessageSave {
+                hash: stats::hash_text("second"),
+                before: 252,
+                after: 235,
+            },
+        ];
+
+        let run = compressor(true)
+            .run_record(&rejected, &selection, 2, 952, 735, &saves)
+            .unwrap();
+
+        assert_eq!(run.messages, 2);
+        assert_eq!(run.before, 952);
+        assert_eq!(run.after, 735);
+        assert_eq!(run.planned, 2);
+        assert_eq!(run.skipped["would have dropped protected content"], 3);
+        assert_eq!(run.saved, saves);
+    }
+
+    #[test]
+    fn the_record_line_is_one_line_of_json() {
+        // The append path relies on this: a newline inside a line would break
+        // every reader, starting with `--stats`.
+        let mut run = compressor(true)
+            .run_record(
+                &skip_counts(&[(Skip::Structured, 1)]),
+                &Selection::default(),
+                0,
+                0,
+                0,
+                &[],
+            )
+            .unwrap();
+        // A hash of text full of newlines must not leak a newline into the line.
+        run.saved.push(stats::MessageSave {
+            hash: stats::hash_text("line one\nline two"),
+            before: 10,
+            after: 5,
+        });
+        let line = serde_json::to_string(&run).unwrap();
+        assert!(!line.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<stats::RunRecord>(&line).unwrap(),
+            run
+        );
+    }
+
+    #[test]
+    fn thousands_separators_group_from_the_right() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(2_353_266), "2,353,266");
+        assert_eq!(thousands(1_935_961), "1,935,961");
+    }
+
+    #[test]
+    fn percent_never_divides_by_zero() {
+        assert_eq!(percent(0, 0), "-");
+        assert_eq!(percent(417, 2_353), "17.7%");
+        assert_eq!(percent(10, 10), "100.0%");
     }
 }
