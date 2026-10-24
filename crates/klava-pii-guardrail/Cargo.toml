@@ -1,6 +1,10 @@
 [package]
 name = "klava-pii-guardrail"
-version.workspace = true
+# Versioned on its own, not from [workspace.package]: crates.io cannot
+# republish a version, and a guardrail fix must not force a bump on the other
+# extensions. 0.1.6 fixes the quadratic redaction that timed out on large tool
+# output, and refuses payloads too large to analyze.
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

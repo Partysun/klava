@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.
+- **PyPI wheels for every supported platform.** Alongside the sdist, releases now ship `manylinux_2_17` wheels for x86_64 and aarch64 (aarch64 cross-compiled on the amd64 agent with zig), a macOS universal2 wheel and a Windows wheel, so `pip install klava` / `uvx klava` no longer compile from source. The macOS wheel had been missing since 0.2.0 because the release step passed a flag maturin does not have.
+
+## [klava-pii-guardrail 0.1.6] - 2026-10-24
+
 ### Fixed
 
 - **`klava-pii-guardrail` timed out on large tool output and failed the request
@@ -22,10 +29,12 @@
   klava's 8 MiB `MAX_STDOUT` reply cap even when redaction roughly doubles the
   text, and bounds peak memory (the analyzer allocates a token per word).
 
-### Added
+### Changed
 
-- **npm distribution.** `npm install --global @zatsepin/klava` (or `npx @zatsepin/klava`) now installs a prebuilt binary picked from a per-platform package (`@zatsepin/klava-linux-x64-gnu`, `-linux-arm64-gnu`, `-darwin` universal2, `-win32-x64-msvc`) — no Rust toolchain involved. Alpine/musl is not packaged yet; use `cargo install klava` there.
-- **PyPI wheels for every supported platform.** Alongside the sdist, releases now ship `manylinux_2_17` wheels for x86_64 and aarch64 (aarch64 cross-compiled on the amd64 agent with zig), a macOS universal2 wheel and a Windows wheel, so `pip install klava` / `uvx klava` no longer compile from source. The macOS wheel had been missing since 0.2.0 because the release step passed a flag maturin does not have.
+- `klava-pii-guardrail` is now versioned in its own `Cargo.toml` instead of
+  inheriting `[workspace.package]`, so a guardrail fix no longer forces a bump on
+  `klava-model-escalation`. `klava-compress` already pins its own version the
+  same way.
 
 ## [klava-compress 0.1.6] - 2026-10-23
 
