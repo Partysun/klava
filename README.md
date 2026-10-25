@@ -43,6 +43,15 @@ Or you can build klava from source. You need to install rustup, clone the reposi
 cargo install --path . --locked
 ```
 
+### Upgrading
+
+`klava upgrade` detects how klava was installed — cargo, npm, uv, or pip —
+prints the exact install command it would run, and asks once before running it
+(`--yes` skips the prompt). `klava upgrade --check` only reports what is
+available. An install done in any other way (a source build outside a package
+manager, a manually placed binary) is left alone, with the documented commands
+printed instead.
+
 ### Releasing (maintainers)
 
 Version and tag come from `Cargo.toml` `[package]` — bump it, plus

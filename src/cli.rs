@@ -251,19 +251,45 @@ pub enum Command {
                      klava extensions install cargo-path:./my-crate --trust\n  \
                      klava extensions install npm:my-ext --trust\n  \
                      klava extensions install cargo:klava-compress --trust --no-setup\n  \
+                     klava extensions update --check\n  \
+                     klava extensions update --trust\n  \
+                     klava extensions update klava-compress --trust\n  \
                      klava extensions list\n  \
                      klava extensions verify\n  \
                      klava extensions setup klava-compress\n  \
                      klava extensions enable <name>\n  \
                      klava extensions remove <name>")]
     Extensions {
-        /// Subcommand: list (default), path, install, remove, verify, show, setup, refresh-manifest, enable, disable, set
+        /// Subcommand: list (default), path, install, update, remove, verify, show, setup, refresh-manifest, enable, disable, set
         #[arg(
             required = false,
             trailing_var_arg = true,
             help = "Action and arguments"
         )]
         args: Vec<String>,
+    },
+
+    /// Upgrade klava itself
+    ///
+    /// Detects how the running klava was installed (cargo, npm, uv, pip) and
+    /// runs the same install command the user would, after printing it. `--check`
+    /// only reports what is available; `--yes` skips the confirmation.
+    #[command(after_help = "Examples:\n  \
+                     klava upgrade\n  \
+                     klava upgrade --check\n  \
+                     klava upgrade --yes")]
+    Upgrade {
+        /// Report what is available without upgrading.
+        #[arg(long, help = "Only report what is available; build nothing")]
+        check: bool,
+
+        /// Skip the confirmation prompt.
+        #[arg(short, long, help = "Upgrade without asking")]
+        yes: bool,
+
+        /// Reinstall even when already at the latest version.
+        #[arg(long, help = "Reinstall even when already at the latest version")]
+        force: bool,
     },
 
     /// Check configuration and model connectivity

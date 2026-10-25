@@ -1,6 +1,39 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.2] - 2026-10-25
+
+### Added
+
+- **`klava extensions update`** reinstall every extension from the source
+  recorded beside its artifact (`<name>.source.toml`) — cargo crate, npm
+  package, local file, or git — through the same staged, atomic installer as
+  `install`. `update <name>…` targets a subset, `--check` reports what is
+  available without building, and `--force` rebuilds even when already at the
+  latest version. `--trust`/`-y` and `--no-setup` mean exactly what they mean
+  on `install`; without a terminal and without `--trust` the run is refused
+  up front. Version pins (`cargo:x@0.1.0`, `cargo-git:url#rev`) move to the
+  latest release and the record is rewritten. A skip is reported with a reason
+  (installed by a package manager, no recorded source, unreachable registry);
+  a failure never stops the batch, never touches settings or enabled state,
+  and leaves the previous binary in place. A new binary re-runs the `[setup]`
+  hook automatically because the setup record fingerprints the artifact.
+  `upgrade` is an alias.
+- **Install now records the resolved version.** `cargo install`'s ledger and
+  the extracted npm `package.json` say which version actually landed for an
+  unpinned install, so `extensions list` shows a real `VERSION` column and
+  `update` can skip a no-op rebuild after comparing with the registry
+  (`cargo search`, `npm view`). Extensions installed before this report
+  `<unknown>` until their first update.
+- **`klava upgrade` upgrades klava itself** through the package manager that
+  installed it. It detects cargo (`$CARGO_HOME/.crates.toml`), npm (the
+  running binary under `npm prefix --global`), uv (`uv tool list` /
+  `uv pip show klava`), or plain pip, prints the exact command it would run
+  (`cargo install --force klava`, `npm install --global @zatsepin/klava@latest`,
+  `uv tool upgrade klava`, `uv pip install --upgrade klava`, …), and asks once
+  before running it. `--check` reports the current and latest versions without
+  touching anything, `--force` reinstalls even when already at the latest, and
+  an install with no detectable manager is left alone with the documented
+  commands printed. The startup update notice now points at `klava upgrade`.
 
 ## [0.3.1] - 2026-10-24
 

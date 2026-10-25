@@ -23,6 +23,7 @@ pub fn run(config: &mut Config, args: Vec<String>) -> Result<()> {
         "list" | "ls" => list(config),
         "path" | "paths" => path(),
         "install" | "add" => install(config, rest),
+        "update" | "upgrade" => update(config, rest),
         "remove" | "uninstall" | "rm" => remove(config, rest),
         "verify" => verify(rest),
         "show" => {
@@ -38,10 +39,22 @@ pub fn run(config: &mut Config, args: Vec<String>) -> Result<()> {
         "disable" => set_enabled(config, rest, false),
         "set" => set_key(config, rest),
         other => bail!(
-            "unknown action '{other}'; expected list, path, install, remove, verify, \
+            "unknown action '{other}'; expected list, path, install, update, remove, verify, \
              show, setup, refresh-manifest, stats, enable, disable or set"
         ),
     }
+}
+
+/// `klava extensions update [name…] [--check] [--force] [--trust]`
+///
+/// Reinstalls every installed extension from the source recorded beside its
+/// artifact (see `EXTENSIONS.md`). `--check` only reports what is available;
+/// `--force` reinstalls even when the recorded version is already the latest;
+/// `--trust`/`-y` consent to rebuilding third-party code and to re-running a
+/// setup hook, exactly as on `install`.
+fn update(config: &mut Config, rest: &[String]) -> Result<()> {
+    let flags = ext_setup::take_flags(rest);
+    crate::ext_update::run(config, flags)
 }
 
 /// `klava extensions path` — where klava looks, in order.
@@ -185,7 +198,10 @@ fn install(config: &mut Config, rest: &[String]) -> Result<()> {
 ///
 /// The extension is enabled regardless: it fails open at request time, and a
 /// failed download should not undo an otherwise successful install.
-fn run_setup(
+///
+/// `pub(crate)` because `extensions update` provisions a freshly updated
+/// extension through the same path.
+pub(crate) fn run_setup(
     config: &Config,
     ext: &InstalledExtension,
     consent: Consent,

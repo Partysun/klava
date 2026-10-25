@@ -174,9 +174,16 @@ impl Sha256 {
 /// goes with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRecord {
-    /// The source string exactly as the user typed it.
+    /// The source string the artifact was installed from.
+    ///
+    /// Normally exactly what the user typed. `extensions update` rewrites it
+    /// when it drops a version pin to move to the latest release.
     pub source: String,
-    /// Resolved version, when the source had one.
+    /// The resolved version, when the installer reports one.
+    ///
+    /// Not the requested version: `cargo:klava-compress` (no pin) resolves to
+    /// whatever `cargo install` picked. This is what `extensions update`
+    /// compares against the registry to skip a no-op rebuild.
     #[serde(default)]
     pub version: Option<String>,
     pub sha256: String,
@@ -313,6 +320,41 @@ impl Source {
             },
         }
     }
+
+    /// Whether the source pins an exact artifact (a version tag or git revision).
+    ///
+    /// Local paths never pin: there is nothing to resolve against a registry.
+    pub fn is_pinned(&self) -> bool {
+        match self {
+            Source::Cargo { version, .. } | Source::Npm { version, .. } => version.is_some(),
+            Source::CargoGit { rev, .. } => rev.is_some(),
+            Source::Local(_) | Source::CargoPath(_) => false,
+        }
+    }
+
+    /// The same source with any version or revision pin dropped.
+    ///
+    /// `extensions update` means "move to the newest artifact": a pinned
+    /// registry version becomes the crate/package name, and a pinned git
+    /// revision becomes the repository's default branch. Local paths have no
+    /// upstream and are returned unchanged.
+    pub fn latest(&self) -> Source {
+        match self {
+            Source::Cargo { krate, .. } => Source::Cargo {
+                krate: krate.clone(),
+                version: None,
+            },
+            Source::Npm { package, .. } => Source::Npm {
+                package: package.clone(),
+                version: None,
+            },
+            Source::CargoGit { url, .. } => Source::CargoGit {
+                url: url.clone(),
+                rev: None,
+            },
+            other => other.clone(),
+        }
+    }
 }
 
 /// Split `name@version`, treating a leading `@` (npm scopes) as part of the name.
@@ -383,7 +425,10 @@ pub fn install(source: &Source, dest_dir: &Path, name_override: Option<&str>) ->
 ///
 /// A directory is accepted when it contains exactly one obvious candidate:
 /// `<dir>/<dirname>` or a single executable file.
-fn resolve_local_executable(path: &Path) -> Result<PathBuf> {
+///
+/// Public so `extensions update` can fingerprint a local source before deciding
+/// whether re-copying it would change anything.
+pub(crate) fn resolve_local_executable(path: &Path) -> Result<PathBuf> {
     let path = std::fs::canonicalize(path)
         .with_context(|| format!("cannot resolve {}", path.display()))?;
 
@@ -572,13 +617,24 @@ fn install_cargo(
     }
 
     let chosen = match name_override {
-        Some(name) => executables
+        Some(name) => match executables
             .iter()
             .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(name))
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("cargo produced no binary named '{name}'"))?,
+        {
+            Some(path) => path.clone(),
+            // `--name` may rename a crate whose single binary has a different
+            // file name. `extensions update` relies on this: it replays the
+            // install under the extension's existing name, which the user may
+            // have chosen freely.
+            None if executables.len() == 1 => executables[0].clone(),
+            None => bail!("cargo produced no binary named '{name}'"),
+        },
         None => executables.into_iter().next().unwrap(),
     };
+    let binary_name = chosen
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
 
     let name = name_override
         .map(str::to_string)
@@ -594,13 +650,51 @@ fn install_cargo(
     std::fs::copy(&chosen, &staged)?;
     make_executable(&staged)?;
 
-    commit(
-        staging,
-        &name,
-        dest_dir,
-        name.clone(),
-        version.map(str::to_string),
-    )
+    // The requested `--version` is absent for an unpinned install, but the
+    // update check needs the version cargo actually picked.
+    let resolved =
+        cargo_installed_version(&root, binary_name).or_else(|| version.map(str::to_string));
+
+    commit(staging, &name, dest_dir, name.clone(), resolved)
+}
+
+/// The version `cargo install --root <root>` resolved, from its install ledger.
+///
+/// `<root>/.crates.toml` maps `"<package> <version> (<source>)"` to the list of
+/// binaries the package provides. That is the only place the resolved version
+/// appears when the user did not pass `--version`.
+fn cargo_installed_version(root: &Path, binary_name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(".crates.toml")).ok()?;
+    version_from_crates_toml(&text, binary_name)
+}
+
+/// Parse `<root>/.crates.toml`; split out so tests need no `cargo install`.
+pub(crate) fn version_from_crates_toml(text: &str, binary_name: &str) -> Option<String> {
+    let table: toml::Value = toml::from_str(text).ok()?;
+    let entries = table.get("v1")?.as_table()?;
+
+    let version_of = |key: &str| key.split_whitespace().nth(1).map(str::to_string);
+    let mut single: Option<String> = None;
+
+    for (key, bins) in entries {
+        let version = version_of(key);
+        let provides = bins
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .any(|bin| bin == binary_name)
+            })
+            .unwrap_or(false);
+        if provides {
+            return version;
+        }
+        if entries.len() == 1 {
+            single = version;
+        }
+    }
+    single
 }
 
 fn install_npm(
@@ -682,13 +776,15 @@ fn install_npm(
     std::fs::copy(&executable, &staged)?;
     make_executable(&staged)?;
 
-    commit(
-        staging,
-        &name,
-        dest_dir,
-        name.clone(),
-        version.map(str::to_string),
-    )
+    // `package.json` carries the version `npm pack` resolved, which is what an
+    // unpinned install needs to record for `extensions update`.
+    let resolved = metadata
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| version.map(str::to_string));
+
+    commit(staging, &name, dest_dir, name.clone(), resolved)
 }
 
 /// Ask a freshly installed binary for a manifest and store it beside it.
@@ -920,12 +1016,19 @@ pub fn refresh_manifest_for(name: &str) -> Result<Refreshed> {
         .path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", found.path.display()))?;
-    let replaced = dir.join(format!("{name}.toml")).exists();
+    Ok(refresh_manifest_in(&found.path, name, dir))
+}
 
-    Ok(Refreshed {
-        wrote: refresh_manifest(&found.path, name, dir),
+/// [`refresh_manifest_for`], against an explicit binary and directory.
+///
+/// Used by `extensions update`, which knows the freshly installed path without
+/// re-running discovery.
+pub(crate) fn refresh_manifest_in(binary: &Path, name: &str, dir: &Path) -> Refreshed {
+    let replaced = dir.join(format!("{name}.toml")).exists();
+    Refreshed {
+        wrote: refresh_manifest(binary, name, dir),
         replaced,
-    })
+    }
 }
 
 /// Remove an installed extension from the directory that owns it.
@@ -967,6 +1070,48 @@ mod tests {
     fn parse_local_requires_an_existing_path() {
         let missing = Source::parse("./definitely-not-here").unwrap_err();
         assert!(missing.to_string().contains("no such path"));
+    }
+
+    #[test]
+    fn latest_drops_cargo_and_npm_pins_but_keeps_local_paths() {
+        assert_eq!(
+            Source::parse("cargo:klava-compress@0.1.0")
+                .unwrap()
+                .latest(),
+            Source::parse("cargo:klava-compress").unwrap()
+        );
+        assert_eq!(
+            Source::parse("npm:@scope/pkg@1.2.3").unwrap().latest(),
+            Source::parse("npm:@scope/pkg").unwrap()
+        );
+        assert_eq!(
+            Source::parse("cargo-git:https://example.com/repo#abc123")
+                .unwrap()
+                .latest(),
+            Source::parse("cargo-git:https://example.com/repo").unwrap()
+        );
+        // A local path has no upstream: latest() must not drop anything.
+        let here = Source::parse(".").unwrap();
+        assert_eq!(here.latest(), here);
+    }
+
+    #[test]
+    fn pins_are_a_cargo_npm_or_git_rev_only() {
+        assert!(Source::parse("cargo:x@1.0.0").unwrap().is_pinned());
+        assert!(Source::parse("npm:x@1.0.0").unwrap().is_pinned());
+        assert!(
+            Source::parse("cargo-git:https://x/repo#r1")
+                .unwrap()
+                .is_pinned()
+        );
+        assert!(!Source::parse("cargo:x").unwrap().is_pinned());
+        assert!(
+            !Source::parse("cargo-git:https://x/repo")
+                .unwrap()
+                .is_pinned()
+        );
+        let here = Source::parse(".").unwrap();
+        assert!(!here.is_pinned());
     }
 
     #[test]
@@ -1235,6 +1380,24 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_cargo_ledger_version_is_found_by_binary_name() {
+        // The shape `cargo install --root` actually writes.
+        let ledger = "[v1]\n\
+            \"klava-compress 0.1.7 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"klava-compress\"]\n";
+        assert_eq!(
+            version_from_crates_toml(ledger, "klava-compress"),
+            Some("0.1.7".into())
+        );
+        // A ledger with exactly one entry still answers for a renamed binary:
+        // the binary may have been installed under the user's own name.
+        assert_eq!(
+            version_from_crates_toml(ledger, "renamed-by-user"),
+            Some("0.1.7".into())
+        );
+        assert_eq!(version_from_crates_toml("", "x"), None);
     }
 
     #[test]

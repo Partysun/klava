@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     {
         eprintln!(
             "{}",
-            "A new version of klava is available! Please update using your package manager.\n"
+            "A new version of klava is available! Run `klava upgrade` or update via your package manager.\n"
                 .truecolor(255, 151, 0)
         );
     }
@@ -356,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Config { setup } => handle_config_command(setup).await,
         Command::Providers { args } => handle_providers_command(args).await,
         Command::Extensions { args } => klava::ext_cli::run(&mut config, args),
+        Command::Upgrade { check, yes, force } => klava::self_upgrade::run(check, yes, force),
         Command::Check { provider, model } => {
             // `--provider` filters by model-entry name (the old flag name is
             // kept so existing scripts keep working).
@@ -591,6 +592,7 @@ fn subcommand_name(command: &cli::Command) -> &'static str {
         cli::Command::Config { .. } => "config",
         cli::Command::Providers { .. } => "providers",
         cli::Command::Extensions { .. } => "extensions",
+        cli::Command::Upgrade { .. } => "upgrade",
         cli::Command::Check { .. } => "check",
         cli::Command::Login { .. } => "login",
         cli::Command::Logout { .. } => "logout",

@@ -21,7 +21,7 @@ struct CratesIoVersionsResponse {
 }
 
 // Separate the version comparison logic for easier testing
-fn compare_versions(current_version: &str, latest_version: &str) -> bool {
+pub(crate) fn compare_versions(current_version: &str, latest_version: &str) -> bool {
     // Simple semver comparison
     fn parse_version(v: &str) -> Vec<u32> {
         v.split('.').map(|s| s.parse().unwrap_or(0)).collect()

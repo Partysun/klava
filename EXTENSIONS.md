@@ -39,6 +39,63 @@ activating it. `--no-setup` enables it but skips its provisioning hook (see
 [Provisioning](#provisioning-setup)); an extension with a hook and no model yet
 is `pending` in `klava extensions list`.
 
+## Update
+
+An installed extension records where it came from in `<name>.source.toml` right
+next to the artifact. `update` replays that recorded source through the same
+staged, atomic installer — klava never guesses a registry name or re-derives a
+URL:
+
+```sh
+klava extensions update                  # every installed extension
+klava extensions update <name>…         # just these
+klava extensions update --check         # report only; nothing is built
+klava extensions update --force         # rebuild even when already at the latest
+klava extensions update --trust         # consent to building + setup, as on install
+```
+
+What one update does:
+
+- **Skips** extensions klava does not manage (installed into `/usr/share` by a
+  package manager — update them there) and extensions with no recorded source
+  (reinstall them explicitly). Both are reported with a reason.
+- **Compares versions first** so a no-op costs nothing: `npm:` packages and
+  `cargo:` crates are checked against the registry (`npm view`,
+  `cargo search`), local files are compared by content, and a local crate's
+  `[package].version` is read from its manifest. Nothing is built when the
+  recorded version already is the latest, unless `--force` says otherwise. The
+  comparison is best effort: no network or registry access, a git branch (which
+  moves without a version bump), or a missing manifest all mean "rebuild".
+- **Drops pins**: `cargo:x@0.1.0` moves to the newest release and the record is
+  rewritten as `cargo:x`; `cargo-git:url#rev` tracks the default branch. The
+  move is printed. Pin again with `install …@ver`.
+- **Never touches settings or enabled state** — both live in the klava config,
+  which update only reads.
+- **Provisions again** when the update landed a new binary: the setup record
+  fingerprints the artifact, so the hook re-runs with the same consent and
+  network warning as an install. The extension stays enabled if a model
+  download fails; `klava extensions setup <name>` is the retry.
+- **Continues after a failure**: one broken source does not stop the batch.
+  The summary prints `updated` / `up to date` / `skipped` / `failed` and the
+  exit code is non-zero exactly when something failed. A failed update leaves
+  the previous binary in place — `commit` moves it aside first, never halfway.
+
+Consent works like `install`: updating rebuilds third-party code, so without a
+terminal and without `--trust` the whole run is refused before anything is
+built. With a terminal, one prompt lists every source and covers the batch;
+`--trust` also authorises re-running setup hooks, `--no-setup` opts out.
+
+`--check` answers "what would change" without building or writing anything: the
+table shows `current`, `available` (with the version it would move to), or
+`rebuild (version unknown)` for sources whose version cannot be learned cheaply.
+It exits 0 even when updates are available; having updates is not an error.
+
+The resolved version — what the installer actually picked, not what the source
+requested — is recorded at install time (`cargo install`'s ledger for crates,
+the extracted `package.json` for npm), so `extensions list`'s `VERSION` column
+and the comparison both work for unpinned installs. Extensions installed before
+this existed report `<unknown>` until their first update.
+
 Other commands:
 
 ```sh
@@ -120,6 +177,11 @@ version = "0.1.0"
 sha256 = "..."
 installed_at = "2026-10-18T12:00:00+00:00"
 ```
+
+`source` is exactly what the user typed (an update may rewrite it when it drops
+a pin). `version` is the **resolved** version the installer actually picked —
+the crate version `cargo install` chose, or the npm `package.json` version —
+which is what `extensions update` compares and `extensions list` shows.
 
 `klava extensions verify` re-hashes the artifact and reports a mismatch. A
 changed binary is not blocked at load time — that would cost a full hash on
@@ -470,6 +532,9 @@ klava extensions                        # list: name, status, setup, version, so
 klava extensions show <name>            # status, notice, declared settings, effective config
 klava extensions install <source> --trust
 klava extensions install <source> --trust --no-setup   # enable, but do not provision
+klava extensions update                 # reinstall from each recorded source
+klava extensions update <name> --trust  # one extension; latest version
+klava extensions update --check         # report what is available, build nothing
 klava extensions setup <name>           # run the [setup] hook now (re-runs it)
 klava extensions stats <name> [--json]  # run the binary's `--stats`, if it has one
 klava extensions refresh-manifest <name>  # re-ask the binary for its manifest
@@ -480,8 +545,10 @@ klava extensions verify
 klava extensions remove <name>
 ```
 
-`set` parses values as JSON when it can, so `threshold=0.7` and
-`roles=["tool"]` both work.
+`update` (alias `upgrade`) skips extensions it does not manage, compares the
+recorded version against the registry first, and drops version pins — see
+[Update](#update). `set` parses values as JSON when it can, so `threshold=0.7`
+and `roles=["tool"]` both work.
 
 `stats` is a pass-through: klava runs `<binary> --stats` and prints whatever it
 says. Whether an extension reports anything, and in what shape, is its own
