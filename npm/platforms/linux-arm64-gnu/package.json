@@ -1,6 +1,6 @@
 {
   "name": "@zatsepin/klava-linux-arm64-gnu",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "klava binary for linux arm64 (glibc)",
   "os": [
     "linux"
