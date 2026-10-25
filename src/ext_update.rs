@@ -826,7 +826,7 @@ mod tests {
         };
         run_in(&mut config(), flags, c.install_dir.clone()).expect("update ran");
 
-        let after = std::fs::read_to_string(&c.install_dir.join("demo")).expect("installed");
+        let after = std::fs::read_to_string(c.install_dir.join("demo")).expect("installed");
         assert!(after.contains("changed"), "got: {after}");
         let record = SourceRecord::load(&c.install_dir, "demo").expect("new record");
         assert_eq!(record.source, src.display().to_string());
@@ -995,7 +995,7 @@ mod tests {
         );
         // …but the good extension was still updated.
         let good_now =
-            std::fs::read_to_string(&c.install_dir.join("good")).expect("good still installed");
+            std::fs::read_to_string(c.install_dir.join("good")).expect("good still installed");
         assert!(good_now.contains("one"), "got: {good_now}");
         let _ = std::fs::remove_dir_all(&sources);
         let _ = std::fs::remove_dir_all(&c.install_dir);

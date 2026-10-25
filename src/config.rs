@@ -302,8 +302,8 @@ impl Config {
 # type = "openai-compatible"
 # base_url = "https://openrouter.ai/api"
 # api_key_name = "OPENROUTER_API_KEY"
-# # optional: upstream id when the public name differs
-# # upstream_model = "deepseek/deepseek-flash-latest"
+# # optional: real upstream model id when the public name differs
+# # model = "deepseek/deepseek-flash-latest"
 
 # Qwen Code model (mimics qwen-code; you need a qwen-code paid plan)
 # [[models]]
@@ -1085,7 +1085,7 @@ reasoning_model = "think"
             completion_model: Some("~deepseek/deepseek-flash-latest".to_string()),
             reasoning_model: Some("~deepseek/deepseek-flash-latest".to_string()),
             models: vec![Model {
-                upstream_model: Some("deepseek/deepseek-flash-latest".to_string()),
+                model: Some("deepseek/deepseek-flash-latest".to_string()),
                 ..model(
                     "~deepseek/deepseek-flash-latest",
                     "https://openrouter.ai/api",
@@ -1102,7 +1102,61 @@ reasoning_model = "think"
                 .upstream_model(),
             "deepseek/deepseek-flash-latest"
         );
+        assert!(
+            text.contains("model = \"deepseek/deepseek-flash-latest\""),
+            "{text}"
+        );
+        assert!(!text.contains("upstream_model"), "{text}");
         assert!(!text.contains("providers"), "{text}");
+    }
+
+    #[test]
+    fn legacy_upstream_model_deserializes_as_model() {
+        let config: Config = toml::from_str(
+            r#"
+port = 48017
+
+[[models]]
+name = "friendly"
+type = "openai-compatible"
+base_url = "https://openrouter.ai/api"
+upstream_model = "vendor/real-id"
+"#,
+        )
+        .unwrap();
+
+        let entry = &config.models[0];
+        assert_eq!(entry.name, "friendly");
+        assert_eq!(entry.model.as_deref(), Some("vendor/real-id"));
+        assert_eq!(entry.upstream_model(), "vendor/real-id");
+
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("model = \"vendor/real-id\""), "{text}");
+        assert!(!text.contains("upstream_model"), "{text}");
+    }
+
+    #[test]
+    fn an_omitted_model_falls_back_to_the_public_name() {
+        let config: Config = toml::from_str(
+            r#"
+port = 48017
+
+[[models]]
+name = "vendor/real-id"
+type = "openai-compatible"
+base_url = "https://openrouter.ai/api"
+"#,
+        )
+        .unwrap();
+
+        let entry = &config.models[0];
+        assert_eq!(entry.model, None);
+        assert_eq!(entry.upstream_model(), "vendor/real-id");
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !text.lines().any(|line| line.starts_with("model = ")),
+            "{text}"
+        );
     }
 
     #[test]

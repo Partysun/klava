@@ -112,7 +112,7 @@ pub fn entry(
         chat_completions_path: None,
         api_key: key.map(str::to_string),
         api_key_name: key_env.map(str::to_string),
-        upstream_model: None,
+        model: None,
         jigor: None,
         reasoning_model: None,
         completion_model: None,
@@ -143,7 +143,7 @@ pub fn merge(config: &mut Config, entries: Vec<Model>) {
                 && m.api_key_name == entry.api_key_name
                 && m.api_key == entry.api_key
         }) {
-            existing.upstream_model = entry.upstream_model;
+            existing.model = entry.model;
             continue;
         }
         config.models.push(entry);

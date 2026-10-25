@@ -308,10 +308,16 @@ mod tests {
     fn upstream_model_defaults_to_the_name() {
         assert_eq!(entry("https://x.example", None).upstream_model(), "test");
         let aliased = Model {
-            upstream_model: Some("real-id".to_string()),
+            model: Some("real-id".to_string()),
             ..entry("https://x.example", None)
         };
         assert_eq!(aliased.upstream_model(), "real-id");
+
+        let empty = Model {
+            model: Some(String::new()),
+            ..entry("https://x.example", None)
+        };
+        assert_eq!(empty.upstream_model(), "test");
     }
 
     fn minimal(name: &str) -> Model {

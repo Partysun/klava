@@ -89,8 +89,7 @@ impl JigorBackend {
 /// request for one model id.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Model {
-    /// Public model id. This is what harnesses send and see; it is also the
-    /// upstream model id unless `upstream_model` overrides it. Several
+    /// Public model name. This is what harnesses send and see. Several
     /// entries may share a name — they form a pool.
     pub name: String,
     #[serde(rename = "type")]
@@ -103,10 +102,15 @@ pub struct Model {
     pub chat_completions_path: Option<String>,
     pub api_key: Option<String>,
     pub api_key_name: Option<String>,
-    /// Upstream model id, when it differs from `name` (e.g. a friendly alias
-    /// that fans out to a differently named upstream model).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_model: Option<String>,
+    /// Real upstream model id. When omitted or empty, `name` is sent upstream.
+    /// The legacy `upstream_model` key is accepted when loading but never
+    /// written.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "upstream_model"
+    )]
+    pub model: Option<String>,
     /// Explicit jigor backend, overriding URL-based detection. Normally unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jigor: Option<String>,
@@ -131,9 +135,9 @@ impl Model {
         }
     }
 
-    /// The model id sent upstream.
+    /// The model id sent upstream: `model` when non-empty, otherwise `name`.
     pub fn upstream_model(&self) -> String {
-        self.upstream_model
+        self.model
             .clone()
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| self.name.clone())

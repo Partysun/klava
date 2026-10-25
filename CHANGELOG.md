@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **The `[[models]]` upstream id is now `model`.** `name` remains the public
+  alias agents send and see; when `model` is omitted, `name` is sent upstream.
+  Existing configs using `upstream_model` still load, and saving writes only
+  the new `model` key.
+
 ## [0.3.2] - 2026-10-25
 
 ### Added

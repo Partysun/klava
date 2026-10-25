@@ -241,8 +241,10 @@ Notice: an entry with neither `api_key` nor `api_key_name` sends no
 `Authorization` header — that is how a local server (Ollama, llama.cpp) is
 configured. Naming an `api_key_name` whose variable is empty is an error.
 
-Notice: `upstream_model` overrides the id sent upstream when the public name
-differs (e.g. a friendly alias). `name` is what agents send and see.
+Notice: `model` is the real upstream model id sent to the provider. `name` is
+the public alias agents send and see; when `model` is omitted, `name` is also
+sent upstream. The old `upstream_model` key is still accepted when loading an
+existing config, but klava writes new configs with `model`.
 
 Notice: klava model names may start with `~`, which the shell expands. Quote
 them on the command line: `klava providers set '~deepseek/deepseek-flash-latest'`.

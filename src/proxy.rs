@@ -1318,10 +1318,10 @@ mod tests {
     #[test]
     fn route_writes_the_upstream_id_and_restores_the_client_name() {
         let mut config = route_config("chat-model", "chat-model");
-        config.models[0].upstream_model = Some("vendor/real-id".to_string());
+        config.models[0].model = Some("vendor/real-id".to_string());
         config
             .models
-            .retain(|m| m.name != "chat-model" || m.upstream_model.is_some());
+            .retain(|m| m.name != "chat-model" || m.model.is_some());
         let route = ModelRoute::new(&config, "chat-model", false).unwrap();
         let req = openai::OpenAIRequest {
             model: "chat-model".to_string(),
