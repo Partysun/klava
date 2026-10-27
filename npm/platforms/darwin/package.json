@@ -1,6 +1,6 @@
 {
   "name": "@zatsepin/klava-darwin",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "klava binary for macOS — universal2 fat binary (Intel x64 and Apple Silicon arm64)",
   "os": [
     "darwin"
