@@ -84,6 +84,58 @@ impl OpencodeRunner {
         names
     }
 
+    /// Write klava's effort policy into an opencode model entry.
+    ///
+    /// `reasoning: true` tells opencode the model reasons, which is what makes
+    /// it offer effort variants for a provider model it has no models.dev entry
+    /// for. `variants.<level>.disabled` hides the levels the configured cap
+    /// forbids, so the picker never offers a value klava would only clamp.
+    ///
+    /// opencode turns the selected variant into `reasoning_effort` in the
+    /// request body; klava then treats it as the client's own level, which
+    /// outranks every configured default.
+    fn apply_effort_settings(
+        map: &mut serde_json::Map<String, serde_json::Value>,
+        config: &crate::config::Config,
+        name: &str,
+    ) {
+        let Some(entry) = config.pool(name).first().copied() else {
+            return;
+        };
+        let policy = crate::effort::EffortPolicy::for_entry(config, entry);
+        if !policy.is_configured() {
+            return;
+        }
+
+        map.insert("reasoning".to_string(), serde_json::json!(true));
+
+        let Some(cap) = policy.cap() else {
+            return;
+        };
+        let mut disabled = serde_json::Map::new();
+        for level in crate::models::openai::ReasoningEffort::ALL {
+            if level.rank() > cap.rank() {
+                disabled.insert(
+                    level.variant_name().to_string(),
+                    serde_json::json!({ "disabled": true }),
+                );
+            }
+        }
+        if disabled.is_empty() {
+            return;
+        }
+        match map.get_mut("variants") {
+            Some(serde_json::Value::Object(existing)) => {
+                for (level, value) in disabled {
+                    existing.insert(level, value);
+                }
+            }
+            _ => {
+                map.insert("variants".to_string(), serde_json::Value::Object(disabled));
+            }
+        }
+    }
+
     pub fn is_klava_model(cfg: &serde_json::Map<String, serde_json::Value>) -> bool {
         if let Some(serde_json::Value::Bool(true)) = cfg.get("_klava") {
             return true;
@@ -210,8 +262,9 @@ impl AgentRunner for OpencodeRunner {
         // the model label show e.g. `~deepseek/deepseek-flash-latest` instead
         // of a synthetic proxy name. klava routes by that name.
         let model_names = Self::configured_model_names();
+        let klava_config = crate::config::Config::load().ok();
         for name in &model_names {
-            let entry = if let Some(existing) = provider.models.get(name) {
+            let mut entry = if let Some(existing) = provider.models.get(name) {
                 let mut entry = existing.clone();
                 if let serde_json::Value::Object(ref mut map) = entry {
                     map.entry("_klava".to_string())
@@ -224,16 +277,35 @@ impl AgentRunner for OpencodeRunner {
                     "_klava": true
                 })
             };
+
+            // Mirror klava's effort policy into opencode's model entry: the
+            // capability unlocks the variant picker, and levels above the
+            // configured cap are marked unsupported so the picker cannot offer
+            // a value klava would only clamp anyway.
+            if let Some(config) = &klava_config
+                && let serde_json::Value::Object(ref mut map) = entry
+            {
+                Self::apply_effort_settings(map, config, name);
+            }
+
             provider.models.insert(name.clone(), entry);
         }
 
-        // Drop the old synthetic entry once real models are configured.
+        // Drop klava-managed entries that are no longer configured (and the
+        // old synthetic one), so the picker stops offering a model klava would
+        // silently reroute to a default.
         if !model_names.is_empty() {
-            let synthetic = provider.models.get("klava").is_some_and(|m| {
-                Self::is_klava_model(m.as_object().unwrap_or(&Default::default()))
-            });
-            if synthetic && !model_names.iter().any(|n| n == "klava") {
-                provider.models.remove("klava");
+            let stale: Vec<String> = provider
+                .models
+                .iter()
+                .filter(|(name, cfg)| {
+                    !model_names.contains(name)
+                        && Self::is_klava_model(cfg.as_object().unwrap_or(&Default::default()))
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in stale {
+                provider.models.remove(&name);
             }
         }
 
@@ -330,6 +402,7 @@ impl Default for ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use serde_json::json;
 
     #[test]
@@ -346,6 +419,61 @@ mod tests {
 
         let cfg3 = Map::new();
         assert!(!OpencodeRunner::is_klava_model(&cfg3));
+    }
+
+    fn effort_config(global: Option<&str>, model: Option<&str>, cap: Option<&str>) -> Config {
+        Config {
+            reasoning_effort: global.map(str::to_string),
+            reasoning_effort_cap: cap.map(str::to_string),
+            models: vec![crate::providers::Model {
+                name: "~deepseek/deepseek-flash-latest".to_string(),
+                reasoning_effort: model.map(str::to_string),
+                ..crate::providers::Model::default()
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn effort_settings_unlock_the_variant_picker() {
+        let config = effort_config(Some("high"), None, None);
+        let mut entry = serde_json::Map::new();
+        OpencodeRunner::apply_effort_settings(
+            &mut entry,
+            &config,
+            "~deepseek/deepseek-flash-latest",
+        );
+        assert_eq!(entry["reasoning"], json!(true));
+        // No cap: every level opencode knows stays available.
+        assert!(entry.get("variants").is_none());
+    }
+
+    #[test]
+    fn the_cap_disables_the_variants_above_it() {
+        let config = effort_config(None, Some("max"), Some("high"));
+        let mut entry = serde_json::Map::new();
+        OpencodeRunner::apply_effort_settings(
+            &mut entry,
+            &config,
+            "~deepseek/deepseek-flash-latest",
+        );
+        let variants = entry["variants"].as_object().unwrap();
+        assert_eq!(variants["xhigh"]["disabled"], json!(true));
+        assert_eq!(variants["max"]["disabled"], json!(true));
+        assert!(!variants.contains_key("high"));
+        assert!(!variants.contains_key("low"));
+    }
+
+    #[test]
+    fn no_effort_config_leaves_the_model_entry_alone() {
+        let config = effort_config(None, None, None);
+        let mut entry = serde_json::Map::new();
+        OpencodeRunner::apply_effort_settings(
+            &mut entry,
+            &config,
+            "~deepseek/deepseek-flash-latest",
+        );
+        assert!(entry.is_empty(), "entry: {entry:?}");
     }
 
     #[test]

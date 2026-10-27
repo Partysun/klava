@@ -57,6 +57,20 @@ pub struct Config {
     /// `[[models]]` entry; falls back to `completion_model`.
     #[serde(default)]
     pub reasoning_model: Option<String>,
+    /// Default reasoning effort sent upstream, e.g. `"high"` or `"max"`.
+    ///
+    /// Applied when the client asks for nothing (many harnesses never send an
+    /// effort) and clamped by `reasoning_effort_cap`. A client that explicitly
+    /// disables reasoning is never overridden, and when this is unset the
+    /// field is omitted from the request entirely — which is what endpoints
+    /// that reject `reasoning_effort` need. A `[[models]]` entry may override
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Highest effort any request may use, e.g. `"high"`. Useful when one
+    /// config serves several models and some do not accept `xhigh`/`max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_cap: Option<String>,
     /// How duplicate `[[models]]` names are routed: `shuffle` (default),
     /// `round_robin` or `first`.
     #[serde(default = "default_routing")]
@@ -181,6 +195,8 @@ impl Default for Config {
             enable_token_stats: false,
             completion_model: None,
             reasoning_model: None,
+            reasoning_effort: None,
+            reasoning_effort_cap: None,
             routing: default_routing(),
             models: vec![],
             enable_websearch: default_enable_websearch(),
@@ -254,6 +270,9 @@ impl Config {
         println!();
         println!("completion_model: Default model for ordinary requests");
         println!("reasoning_model:  Default model when the client asks for reasoning");
+        println!("reasoning_effort: Default effort sent upstream: none|minimal|low|");
+        println!("                  medium|high|xhigh|max. Omitted when unset.");
+        println!("reasoning_effort_cap: Clamp every request to this level or below");
         println!("models:           List of [[models]] entries (name, type, base_url, ...)");
         println!("                  Add entries with 'klava providers add'");
         println!();
@@ -286,6 +305,16 @@ impl Config {
 #completion_model = "~deepseek/deepseek-flash-latest"
 #reasoning_model = "~deepseek/deepseek-flash-latest"
 
+# Default reasoning effort sent upstream when the client does not ask for one.
+# A client's own level (opencode variants, Claude Code /effort, codex
+# reasoning.effort) always wins; this only fills the gap. Leave it unset to
+# send no `reasoning_effort` at all, which is what endpoints that reject the
+# field need.
+#reasoning_effort = "high"
+# Highest level any request may use, clamping both this default and a level the
+# client asked for. Useful when one config serves models that reject xhigh/max.
+#reasoning_effort_cap = "max"
+
 # How duplicate model names are routed: "shuffle" (default), "round_robin",
 # or "first" (declaration order = failover priority).
 #routing = "shuffle"
@@ -295,6 +324,7 @@ impl Config {
 # [[models]]
 # name = "~deepseek/deepseek-flash-latest"
 # type = "klava"
+# reasoning_effort = "max"       # overrides the top-level default
 
 # OpenAI-compatible model (OpenRouter, Cloudflare, DeepSeek, local LLMs)
 # [[models]]
@@ -676,6 +706,10 @@ impl Config {
         // The decide model must be unambiguous when the config names one of
         // the configured entries.
         self.decide_entry()?;
+
+        // Effort values are free-form strings in TOML; catch a typo here
+        // rather than silently ignoring it on every request.
+        crate::effort::validate(self)?;
 
         Ok(())
     }

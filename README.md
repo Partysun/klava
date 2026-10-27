@@ -69,6 +69,7 @@ The `launch` command starts the proxy server and launches an AI code agent with 
 klava launch
 klava launch claude
 klava launch claude --provider ~deepseek/deepseek-flash-latest
+klava launch claude --effort max
 klava launch opencode
 klava launch pi
 ```
@@ -194,12 +195,15 @@ port = 48017
 verbose = false
 completion_model = "~deepseek/deepseek-flash-latest"
 reasoning_model = "~deepseek/deepseek-flash-latest"
+reasoning_effort = "high"                # default when the client asks for none
+reasoning_effort_cap = "max"             # clamp every request to this level
 routing = "shuffle"                      # shuffle | round_robin | first
 decide_model = "typesafe/jev-1.13"       # one entry; backend auto-detected
 
 [[models]]
 name = "~deepseek/deepseek-flash-latest"
 type = "klava"                           # klava login, no key in the file
+reasoning_effort = "max"                 # per-model override of the default
 
 [[models]]
 name = "~deepseek/deepseek-flash-latest"  # same name = pool with the entry above
@@ -226,6 +230,44 @@ type = "qwen-code"
 ```
 
 Notice: base_url should not include /v1 at the end!
+
+#### Reasoning effort
+
+`reasoning_effort` is the level sent upstream as `reasoning_effort`
+(`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). It exists
+because most harnesses never send one: Claude Code only adds
+`output_config.effort` when it recognises the model, and opencode/pi depend on
+a per-model variant the user may never pick. klava fills that gap, and gets out
+of the way when the client does have an opinion:
+
+| Who asks | What klava sends |
+| --- | --- |
+| the client (opencode variant `high`, Claude Code `/effort max`, codex `reasoning.effort`) | that level, clamped by the cap |
+| the client explicitly disables reasoning (`reasoning_effort: "none"`, `thinking.type: "disabled"`) | nothing is added; the config default does not re-enable it |
+| nobody | the `[[models]]` level, else the top-level one, then clamped |
+| nobody, and neither is configured | no `reasoning_effort` field at all |
+
+The last row matters: the field is omitted rather than defaulted, so local
+endpoints that reject it (Ollama, llama.cpp, some vLLM builds) keep working.
+
+`reasoning_effort_cap` is a ceiling, not a default — it clamps both the
+configured level and whatever the client asks for, which is how one config can
+serve a model that accepts `max` next to one that only accepts `high`.
+`klava launch --effort <level>` overrides the top-level default for one launch
+(it still cannot exceed a per-model cap); the managed service renders the same
+flag into its unit/plist, so a launch-scoped level applies for as long as that
+service config is in place.
+
+klava also mirrors the policy into the harness where it has a config hook:
+`klava launch opencode` marks each klava model as reasoning-capable (so the
+variant picker offers levels) and disables the variants above the configured
+cap. A variant you pick in opencode is sent as `reasoning_effort` and wins over
+klava's default, exactly as the table above says.
+
+Notice: `xhigh` and `max` are extensions, not universal OpenAI values. The
+klava gateway advertises `reasoning_effort` for its models, but a plain
+OpenAI-compatible endpoint may 400 on them — set `reasoning_effort_cap = "high"`
+for those, or keep the higher level on the specific entry that supports it.
 
 Notice: If your provider exposes the chat completions endpoint at a nested
 path (e.g. `…/v1/endpoints/generate/chat/completions`), set

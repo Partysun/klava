@@ -82,8 +82,18 @@ fn env_entries(config: &Config) -> Vec<(String, String)> {
 }
 
 /// Render the systemd user unit for a proxy on `port`.
-pub fn render_unit(exe: &Path, port: u16, env: &[(String, String)], search: bool) -> String {
+pub fn render_unit(
+    exe: &Path,
+    port: u16,
+    env: &[(String, String)],
+    search: bool,
+    effort: Option<&str>,
+) -> String {
     let search_arg = if search { " --search" } else { "" };
+    let effort_arg = match effort {
+        Some(level) if !level.is_empty() => format!(" --effort {level}"),
+        _ => String::new(),
+    };
     let mut unit = format!(
         "{UNIT_MARKER}\n\
          [Unit]\n\
@@ -93,7 +103,7 @@ pub fn render_unit(exe: &Path, port: u16, env: &[(String, String)], search: bool
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={} up --port {port} --foreground --no-provider-check{search_arg}\n",
+         ExecStart={} up --port {port} --foreground --no-provider-check{search_arg}{effort_arg}\n",
         exe.display(),
     );
     for (key, value) in env {
@@ -257,7 +267,13 @@ async fn ensure_systemd_service(config: &Config) -> Result<ServiceAction> {
     let port = config.port;
     let exe = exe_path();
     let env = env_entries(config);
-    let expected = render_unit(&exe, port, &env, config.enable_websearch);
+    let expected = render_unit(
+        &exe,
+        port,
+        &env,
+        config.enable_websearch,
+        config.reasoning_effort.as_deref(),
+    );
     let path = unit_path(port);
     let name = unit_name(port);
 
@@ -607,6 +623,7 @@ pub fn render_plist(
     env: &[(String, String)],
     log_path: &Path,
     search: bool,
+    effort: Option<&str>,
 ) -> String {
     let label = instance_name(port);
     let log = log_path.display();
@@ -614,6 +631,14 @@ pub fn render_plist(
         "\t\t<string>--search</string>\n"
     } else {
         ""
+    };
+    // launchd has no shell, so the flag and its value are two array entries.
+    let effort_arg = match effort.filter(|level| !level.is_empty()) {
+        Some(level) => format!(
+            "\t\t<string>--effort</string>\n\t\t<string>{}</string>\n",
+            xml_escape(level)
+        ),
+        None => String::new(),
     };
     let mut plist = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -632,7 +657,7 @@ pub fn render_plist(
          \t\t<string>{port}</string>\n\
          \t\t<string>--foreground</string>\n\
          \t\t<string>--no-provider-check</string>\n\
-         {search_arg}\t</array>\n",
+         {search_arg}{effort_arg}\t</array>\n",
         xml_escape(&exe.display().to_string()),
     );
     if !env.is_empty() {
@@ -729,7 +754,14 @@ async fn ensure_launchd_service(config: &Config) -> Result<ServiceAction> {
         .ok_or_else(|| anyhow!("cannot determine home directory"))?
         .join("Library/Logs");
     let log_path = log_dir.join(format!("{label}.log"));
-    let expected = render_plist(&exe, port, &env, &log_path, config.enable_websearch);
+    let expected = render_plist(
+        &exe,
+        port,
+        &env,
+        &log_path,
+        config.enable_websearch,
+        config.reasoning_effort.as_deref(),
+    );
 
     let loaded = launchd_is_loaded(&label);
     if loaded
@@ -846,6 +878,7 @@ mod tests {
             &[],
             Path::new("/tmp/klava-48017.log"),
             false,
+            None,
         );
         assert!(plist.contains(UNIT_MARKER));
         assert!(plist.contains("<string>klava-48017</string>"));
@@ -864,6 +897,7 @@ mod tests {
             &[("KEY".to_string(), "a&b<c>d\"e".to_string())],
             Path::new("/tmp/klava-48017.log"),
             false,
+            None,
         );
         assert!(plist.contains("<key>KEY</key>"));
         assert!(plist.contains("<string>a&amp;b&lt;c&gt;d&quot;e</string>"));
@@ -898,7 +932,7 @@ mod tests {
 
     #[test]
     fn render_unit_has_marker_port_and_no_provider_check() {
-        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], false);
+        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], false, None);
         assert!(unit.contains(UNIT_MARKER));
         assert!(unit.contains("Description=klava proxy (port 48017)"));
         assert!(
@@ -911,7 +945,7 @@ mod tests {
 
     #[test]
     fn render_unit_adds_search_flag_when_enabled() {
-        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], true);
+        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], true, None);
         assert!(
             unit.contains(
                 "ExecStart=/opt/klava up --port 48017 --foreground --no-provider-check --search"
@@ -925,6 +959,7 @@ mod tests {
             &[],
             Path::new("/tmp/klava-48017.log"),
             true,
+            None,
         );
         assert!(
             plist.contains("<string>--search</string>"),
@@ -939,8 +974,34 @@ mod tests {
             48017,
             &[("OPENROUTER_API_KEY".to_string(), "sk-123".to_string())],
             false,
+            None,
         );
         assert!(unit.contains("Environment=OPENROUTER_API_KEY=sk-123"));
+    }
+
+    #[test]
+    fn render_unit_and_plist_carry_the_effort_flag() {
+        let unit = render_unit(Path::new("/opt/klava"), 48017, &[], false, Some("max"));
+        assert!(
+            unit.contains(
+                "ExecStart=/opt/klava up --port 48017 --foreground --no-provider-check --effort max"
+            ),
+            "unit: {unit}"
+        );
+
+        let plist = render_plist(
+            Path::new("/opt/klava"),
+            48017,
+            &[],
+            Path::new("/tmp/klava-48017.log"),
+            true,
+            Some("high"),
+        );
+        assert!(
+            plist.contains("<string>--effort</string>"),
+            "plist: {plist}"
+        );
+        assert!(plist.contains("<string>high</string>"), "plist: {plist}");
     }
 
     #[test]

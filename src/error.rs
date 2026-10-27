@@ -32,6 +32,9 @@ pub enum Error {
     #[error("model '{0}' is configured {1} times - the decide model must be unique")]
     AmbiguousModel(String, usize),
 
+    #[error("invalid reasoning effort: {0}")]
+    InvalidReasoningEffort(String),
+
     /// Provider authentication errors
     #[error("provider authentication error: {0}")]
     Provider(String),
@@ -94,6 +97,10 @@ impl IntoResponse for Error {
                     "Model '{}' is configured {} times - the decide model must be unique",
                     name, count
                 ),
+            ),
+            Error::InvalidReasoningEffort(msg) => (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid reasoning effort: {}", msg),
             ),
             Error::Provider(msg) => (
                 StatusCode::UNAUTHORIZED,

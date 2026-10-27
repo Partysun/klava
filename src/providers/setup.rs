@@ -114,6 +114,8 @@ pub fn entry(
         api_key_name: key_env.map(str::to_string),
         model: None,
         jigor: None,
+        reasoning_effort: None,
+        reasoning_effort_cap: None,
         reasoning_model: None,
         completion_model: None,
     }

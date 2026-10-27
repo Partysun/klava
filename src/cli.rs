@@ -1,9 +1,38 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use klava::agents::CodeAgents;
 use std::path::PathBuf;
 
 // Centralized default values
 const DEFAULT_PID_FILE: &str = "/tmp/klava.pid";
+
+/// `--effort` values.
+///
+/// Kept in the CLI layer so the wire model (`klava::models::openai`) stays
+/// free of clap. The names are the ones `ReasoningEffort` serializes to.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffortArg {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl EffortArg {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EffortArg::None => "none",
+            EffortArg::Minimal => "minimal",
+            EffortArg::Low => "low",
+            EffortArg::Medium => "medium",
+            EffortArg::High => "high",
+            EffortArg::Xhigh => "xhigh",
+            EffortArg::Max => "max",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -104,6 +133,15 @@ pub enum Command {
             help = "Model used for web-search requests (implies --search)"
         )]
         search_model: Option<String>,
+
+        /// Default reasoning effort for this launch (overrides the config)
+        #[arg(
+            long,
+            value_enum,
+            value_name = "LEVEL",
+            help = "Default reasoning effort: none, minimal, low, medium, high, xhigh, max"
+        )]
+        effort: Option<EffortArg>,
     },
     /// Start the proxy server
     ///
@@ -140,6 +178,17 @@ pub enum Command {
         /// service; normally comes from the config file).
         #[arg(long, hide = true, help = "Enable web search")]
         search: bool,
+
+        /// Default reasoning effort (set by `klava launch --effort` for the
+        /// managed service; normally comes from the config file).
+        #[arg(
+            long,
+            value_enum,
+            value_name = "LEVEL",
+            hide = true,
+            help = "Default reasoning effort"
+        )]
+        effort: Option<EffortArg>,
     },
 
     /// Stop a running daemon

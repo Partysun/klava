@@ -201,8 +201,14 @@ pub async fn run_server(
             continue;
         };
         let pool = config.pool(&name).len();
+        // Show the effort an undecided client would get, so a config default
+        // is visible at startup instead of only in the request log.
+        let effort = match crate::effort::EffortPolicy::for_entry(&config, model).default_level() {
+            Some(level) => format!(", effort {}", level.variant_name()),
+            None => String::new(),
+        };
         tracing::info!(
-            "Model: {} -> {} (upstream {}), {} entr{}",
+            "Model: {} -> {} (upstream {}), {} entr{}{}",
             name,
             model
                 .chat_completions_url()
@@ -210,6 +216,7 @@ pub async fn run_server(
             model.upstream_model(),
             pool,
             if pool == 1 { "y" } else { "ies" },
+            effort,
         );
     }
     if config.model_names().is_empty() {
@@ -987,6 +994,191 @@ json.dump({"decision": "replace", "payload": payload}, sys.stdout)
         assert_eq!(status, 200);
         let sent = log.lock().unwrap();
         assert_eq!(sent[0]["model"], "reasoning-model");
+    }
+
+    /// Proxy with an effort policy on the completion entry.
+    fn build_proxy_with_effort(
+        base_url: &str,
+        global: Option<&str>,
+        model: Option<&str>,
+        cap: Option<&str>,
+    ) -> Router {
+        #[cfg(feature = "klava")]
+        let provider_type = ProviderType::Klava;
+        #[cfg(not(feature = "klava"))]
+        let provider_type = ProviderType::OpenAICompatible;
+
+        let config = Arc::new(Config {
+            port: 0,
+            completion_model: Some("completion-model".to_string()),
+            reasoning_model: Some("reasoning-model".to_string()),
+            reasoning_effort: global.map(str::to_string),
+            reasoning_effort_cap: cap.map(str::to_string),
+            models: vec![
+                ProviderConfig {
+                    name: "completion-model".to_string(),
+                    provider_type: provider_type.clone(),
+                    base_url: Some(base_url.to_string()),
+                    api_key: Some("test-key".to_string()),
+                    reasoning_effort: model.map(str::to_string),
+                    ..ProviderConfig::default()
+                },
+                ProviderConfig {
+                    name: "reasoning-model".to_string(),
+                    provider_type,
+                    base_url: Some(base_url.to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..ProviderConfig::default()
+                },
+            ],
+            search_decide: false,
+            ..Config::default()
+        });
+        let client = reqwest::Client::new();
+        create_app(
+            config,
+            client,
+            create_cors_layer(),
+            Arc::new(HookChain::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_configured_effort_fills_a_silent_openai_client() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy_with_effort(
+            &format!("http://127.0.0.1:{port}"),
+            Some("high"),
+            None,
+            None,
+        );
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(log.lock().unwrap()[0]["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn the_clients_openai_effort_beats_the_configured_default() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy_with_effort(
+            &format!("http://127.0.0.1:{port}"),
+            Some("high"),
+            None,
+            None,
+        );
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({
+                "model": "m",
+                "reasoning_effort": "low",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(log.lock().unwrap()[0]["reasoning_effort"], "low");
+    }
+
+    #[tokio::test]
+    async fn a_per_model_effort_beats_the_global_one() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy_with_effort(
+            &format!("http://127.0.0.1:{port}"),
+            Some("low"),
+            Some("max"),
+            None,
+        );
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/responses",
+            json!({"model": "m", "input": "hi"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(log.lock().unwrap()[0]["reasoning_effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn the_effort_cap_clamps_the_clients_level() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy_with_effort(
+            &format!("http://127.0.0.1:{port}"),
+            None,
+            Some("max"),
+            Some("high"),
+        );
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({
+                "model": "m",
+                "reasoning_effort": "max",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(log.lock().unwrap()[0]["reasoning_effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn anthropic_output_config_effort_reaches_upstream() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/messages",
+            json!({
+                "model": "claude-opus-5",
+                "max_tokens": 100,
+                "output_config": {"effort": "max"},
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(log.lock().unwrap()[0]["reasoning_effort"], "max");
+    }
+
+    #[tokio::test]
+    async fn no_configured_effort_omits_the_field() {
+        let log = Arc::new(Mutex::new(vec![]));
+        let port = spawn_fake_upstream(FakeMode::ChatJson, log.clone()).await;
+        let router = build_proxy(&format!("http://127.0.0.1:{port}"));
+
+        let (status, _) = send(
+            &router,
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            log.lock().unwrap()[0].get("reasoning_effort").is_none(),
+            "an unconfigured effort must not add the field"
+        );
     }
 
     #[tokio::test]

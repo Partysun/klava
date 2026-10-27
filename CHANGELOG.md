@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Reasoning effort, per model.** `reasoning_effort = "high"` on a
+  `[[models]]` entry (or at the top level) sets what klava sends upstream when
+  the client asks for nothing; `reasoning_effort_cap` clamps every request,
+  including a level the client asked for. A client's own level always wins, a
+  client that explicitly disables reasoning is never overridden, and with
+  nothing configured the field is omitted entirely so endpoints that reject it
+  keep working. The Anthropic surface now forwards Claude Code's
+  `output_config.effort`, which used to be dropped.
+- **`klava launch --effort <level>`** (and `klava up --effort`) overrides the
+  default for one launch; the managed service renders it into the unit/plist.
+- **`klava launch opencode` declares each model's reasoning capability** so the
+  variant picker offers effort levels, disables the variants above the
+  configured cap, and drops klava-managed models that are no longer configured.
+
 ## [0.3.3] - 2026-10-25
 
 ### Changed

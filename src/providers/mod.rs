@@ -114,6 +114,14 @@ pub struct Model {
     /// Explicit jigor backend, overriding URL-based detection. Normally unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jigor: Option<String>,
+    /// Default reasoning effort for this entry (`low` … `max`). Overrides the
+    /// top-level `reasoning_effort` for requests that arrive without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Highest effort this entry accepts, clamping both the default and a
+    /// level the client asked for. Useful for models that reject `xhigh`/`max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_cap: Option<String>,
 
     // ---- Legacy fields (pre-`[[models]]` `[[providers]]` only) ------------
     // Read for migration and cleared when the config is rewritten; never

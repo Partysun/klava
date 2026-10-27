@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             no_service,
             search,
             search_model,
+            effort,
         } => {
             use inquire::Select;
 
@@ -84,6 +85,13 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(model) = search_model {
                 current_config.search_model = Some(model);
+            }
+
+            // `--effort <level>` sets the default for this launch. Per-model
+            // `reasoning_effort` in the config still wins, and a client that
+            // asks for its own level still wins over both.
+            if let Some(level) = effort {
+                current_config.reasoning_effort = Some(level.as_str().to_string());
             }
 
             // `--provider <model>` switches the active model for this launch.
@@ -272,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
             port,
             no_provider_check,
             search,
+            effort,
             ..
         } => {
             if cli.verbose {
@@ -286,6 +295,12 @@ async fn main() -> anyhow::Result<()> {
             // web search even though it only receives a port on its command line.
             if search {
                 config.enable_websearch = true;
+            }
+
+            // Same for --effort: the unit/plist carries it, and the proxy
+            // process re-reads the config file from disk.
+            if let Some(level) = effort {
+                config.reasoning_effort = Some(level.as_str().to_string());
             }
 
             // Daemon mode: prefer the managed service (systemd on Linux,
@@ -1296,11 +1311,13 @@ mod tests {
                     foreground,
                     no_provider_check,
                     search,
+                    effort,
                 } => {
                     assert_eq!(port, Some(8080));
                     assert!(foreground);
                     assert!(!no_provider_check);
                     assert!(!search);
+                    assert!(effort.is_none());
                 }
                 _ => panic!("Expected up command"),
             }
@@ -1350,6 +1367,37 @@ mod tests {
             match cli.command {
                 Command::Launch { search, .. } => assert!(search),
                 _ => panic!("Expected launch command"),
+            }
+        }
+    }
+
+    #[test]
+    fn cli_parses_launch_effort_and_maps_it_to_the_config_name() {
+        let parsed = Cli::try_parse_from(["klava", "launch", "opencode", "--effort", "max"]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Launch { effort, .. } => {
+                    assert_eq!(effort, Some(crate::cli::EffortArg::Max));
+                    assert_eq!(effort.unwrap().as_str(), "max");
+                }
+                _ => panic!("Expected launch command"),
+            }
+        }
+
+        // The value must be one of the wire levels; a typo is a clap error
+        // instead of a silently ignored config value.
+        let parsed = Cli::try_parse_from(["klava", "launch", "opencode", "--effort", "turbo"]);
+        assert!(parsed.is_err());
+
+        let parsed = Cli::try_parse_from(["klava", "up", "--effort", "xhigh"]);
+        assert!(parsed.is_ok());
+        if let Ok(cli) = parsed {
+            match cli.command {
+                Command::Up { effort, .. } => {
+                    assert_eq!(effort.map(|e| e.as_str()), Some("xhigh"));
+                }
+                _ => panic!("Expected up command"),
             }
         }
     }

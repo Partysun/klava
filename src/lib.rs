@@ -3,6 +3,7 @@ pub mod anthropic;
 pub mod config;
 pub mod decision;
 pub mod diagnostic;
+pub mod effort;
 pub mod error;
 pub mod ext_api;
 pub mod ext_cli;

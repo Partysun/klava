@@ -1,6 +1,7 @@
 use crate::anthropic::AnthropicStreamConverter;
 use crate::anthropic::transform::{anthropic_to_openai, openai_to_anthropic};
 use crate::config::Config;
+use crate::effort::{EffortPolicy, EffortRequest};
 use crate::error::{Error, Result};
 use crate::hooks::{HookChain, HookStage};
 use crate::models::{anthropic, openai};
@@ -33,6 +34,8 @@ use std::sync::Arc;
 struct ModelRoute {
     entry: Arc<crate::providers::Model>,
     client_model: String,
+    /// The configured effort defaults for this entry, resolved per request.
+    effort: EffortPolicy,
 }
 
 impl ModelRoute {
@@ -40,9 +43,11 @@ impl ModelRoute {
         let entry = config
             .resolve_request_model(requested, is_reasoning)
             .ok_or(Error::NoModelsConfigured)?;
+        let effort = EffortPolicy::for_entry(config, entry);
         Ok(Self {
             entry: Arc::new(entry.clone()),
             client_model: requested.trim().to_string(),
+            effort,
         })
     }
 
@@ -54,6 +59,21 @@ impl ModelRoute {
     fn apply(&self, mut req: openai::OpenAIRequest) -> openai::OpenAIRequest {
         req.model = self.upstream_model();
         req
+    }
+
+    /// Apply the configured effort default.
+    ///
+    /// The client's own level always wins (it is already in the request), so
+    /// this only fills the gap when the client asked for nothing. A client
+    /// that explicitly disabled reasoning keeps its own value: `Suppress`
+    /// returns `None`, and we leave the field untouched rather than strip it.
+    fn apply_effort(&self, req: &mut openai::OpenAIRequest, request: EffortRequest) {
+        if matches!(request, EffortRequest::Suppress) {
+            return;
+        }
+        if let Some(level) = self.effort.resolve(request) {
+            req.reasoning_effort = Some(level);
+        }
     }
 
     /// Put the client-facing model name back into an upstream response.
@@ -178,9 +198,13 @@ pub async fn proxy_anthropic(
     // Anthropic carries thinking in `thinking.type` (not `reasoning_effort`),
     // so decide the reasoning/completion default before transforming.
     let is_reasoning = anthropic_request_is_reasoning(&anthropic_req);
+    // Claude Code's real effort knob is `output_config.effort`; read it off the
+    // original body, before the transform consumes it.
+    let effort = EffortRequest::from_anthropic(&anthropic_req);
     let openai_req = anthropic_to_openai(anthropic_req, None, None)?;
     let route = ModelRoute::new(&config, &openai_req.model, is_reasoning)?;
-    let openai_req = route.apply(openai_req);
+    let mut openai_req = route.apply(openai_req);
+    route.apply_effort(&mut openai_req, effort);
     tracing::debug!(
         "Transformed to OpenAI request for model: {} (routed to {})",
         openai_req.model,
@@ -189,7 +213,6 @@ pub async fn proxy_anthropic(
 
     // Extension chain. Runs on the normalized OpenAI payload so one extension
     // serves every client API; see `proxy_openai` for the rationale.
-    let mut openai_req = openai_req;
     if !extensions.is_empty() {
         let payload = serde_json::to_value(&openai_req)?;
         let outcome = crate::extensions::run_request_extensions(
@@ -297,12 +320,14 @@ pub async fn proxy_openai(
 
     // Route on the model the client sent; unknown names fall back to the
     // configured defaults (see `Config::resolve_request_model`).
+    let effort = EffortRequest::from_openai(&openai_req);
     let route = ModelRoute::new(
         &config,
         &openai_req.model,
         openai_request_is_reasoning(&openai_req),
     )?;
     let mut openai_req = route.apply(openai_req);
+    route.apply_effort(&mut openai_req, effort);
     tracing::debug!(
         "Requested model '{}' routed to entry '{}' (upstream {})",
         route.client_model,
@@ -1112,12 +1137,14 @@ pub async fn proxy_responses(
     // OpenAI-compatible providers reject the field), so the decision is made
     // here instead of inside `apply_openai_model_override`.
     let is_reasoning = responses_request_is_reasoning(&responses_req);
+    let effort = EffortRequest::from_responses(&responses_req);
 
     let openai_req = responses_to_openai(responses_req.clone())?;
 
     // Route on the model the client sent (see `proxy_openai`).
     let route = ModelRoute::new(&config, &openai_req.model, is_reasoning)?;
-    let openai_req = route.apply(openai_req);
+    let mut openai_req = route.apply(openai_req);
+    route.apply_effort(&mut openai_req, effort);
 
     tracing::debug!(
         "Requested model '{}' routed to entry '{}' (upstream {})",
@@ -1127,7 +1154,6 @@ pub async fn proxy_responses(
     );
 
     // Extension chain, on the normalized OpenAI payload (see `proxy_openai`).
-    let mut openai_req = openai_req;
     if !extensions.is_empty() {
         let payload = serde_json::to_value(&openai_req)?;
         let outcome = crate::extensions::run_request_extensions(

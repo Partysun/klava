@@ -1,8 +1,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Reasoning effort level for reasoning models
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Reasoning effort level for reasoning models.
+///
+/// Exactly the values that travel on the wire. A token budget is a different
+/// concept (Anthropic's `thinking.budget_tokens`, Qwen's `thinking_budget`)
+/// and deliberately not modelled here: it is not an effort level and would
+/// serialize as an invalid `reasoning_effort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     None,
@@ -11,22 +16,32 @@ pub enum ReasoningEffort {
     High,
     XHigh,
     Max,
-    Budget(u32),
 
     // Legacy reasoning for <= gpt
     Minimal,
 }
 
 impl ReasoningEffort {
+    /// Every level, weakest first — the order used for clamping.
+    pub const ALL: [ReasoningEffort; 7] = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ];
+
     /// Parse a lowercase effort name (as sent in a Responses `reasoning.effort`
     /// or an OpenAI request). Unknown values yield `None`.
     pub fn parse(name: &str) -> Option<Self> {
-        Some(match name {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
             "none" => ReasoningEffort::None,
             "low" => ReasoningEffort::Low,
             "medium" => ReasoningEffort::Medium,
             "high" => ReasoningEffort::High,
-            "xhigh" => ReasoningEffort::XHigh,
+            "xhigh" | "x-high" => ReasoningEffort::XHigh,
             "max" => ReasoningEffort::Max,
             "minimal" => ReasoningEffort::Minimal,
             _ => return None,
@@ -42,9 +57,21 @@ impl ReasoningEffort {
             ReasoningEffort::High => "high",
             ReasoningEffort::XHigh => "xhigh",
             ReasoningEffort::Max => "max",
-            ReasoningEffort::Budget(_) => "budget",
             // Legacy
             ReasoningEffort::Minimal => "minimal",
+        }
+    }
+
+    /// Position on the effort scale, used to clamp one level by another.
+    pub fn rank(&self) -> u8 {
+        match self {
+            ReasoningEffort::None => 0,
+            ReasoningEffort::Minimal => 1,
+            ReasoningEffort::Low => 2,
+            ReasoningEffort::Medium => 3,
+            ReasoningEffort::High => 4,
+            ReasoningEffort::XHigh => 5,
+            ReasoningEffort::Max => 6,
         }
     }
 }
