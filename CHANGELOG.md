@@ -1,5 +1,52 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`klava launch claude` now persists its settings into Claude Code's own
+  `~/.claude/settings.json`.** The `env` block carries `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN` and the configured model mapping, so a plain `claude`
+  invocation — or `klava launch claude --config`, which never launches Claude —
+  picks up the same base URL and models without going through klava's launcher.
+  Unrelated settings and any pre-existing `env` entries are preserved, a run that
+  changes nothing reports "already up to date", and the diff is shown for
+  approval before writing (with a backup). `run()` exports the same variables
+  from one shared source, so the persisted block and the launched child cannot
+  drift apart. `run()` additionally maps Claude's built-in model aliases
+  (`ANTHROPIC_DEFAULT_OPUS_MODEL`, `…_SONNET_MODEL`, `…_HAIKU_MODEL`,
+  `ANTHROPIC_SMALL_FAST_MODEL`) to the configured models, so `/model` lists real
+  upstream models instead of Anthropic ones that do not exist.
+
+### Fixed
+
+- **`/v1/messages` returned 502 for tool schemas that use `$ref`/`$defs`.** The
+  Anthropic surface runs each tool's JSON Schema through `clean_schema`, which
+  only stripped `format: "uri"`, so a `$ref` into `$defs` — or a `oneOf` reached
+  through one — was forwarded verbatim. An upstream rejects those with a bare
+  `invalid_request`, which surfaced as a 502 for the whole request. The smallest
+  failing payload is 187 bytes, so this was never about payload size; Claude
+  Code's MCP tools (which lean on `$ref`) hit it on almost every session.
+  `clean_schema` now inlines `$ref`s (keeping sibling keywords such as
+  `description`), drops the `$defs` block, and terminates on cyclic definitions.
+  A 194-tool / 535 KB replay and a doubled 776-tool / 2.1 MB payload both went
+  from 502 to 200.
+- **`clean_schema` now recurses over the whole schema vocabulary, not just
+  `properties` and `items`.** Nested `oneOf`/`anyOf`/`allOf`, `$defs`,
+  `additionalProperties`, `patternProperties` and the other sub-schema keywords
+  are cleaned too, so a `format: "uri"` buried in a union branch is no longer
+  left for the provider to reject. Inlined output is capped at 96 KiB per tool by
+  collapsing the largest sub-schemas to `{"type": "object"}`, since inlining can
+  inflate a definition that is referenced repeatedly. Expansion depth is capped
+  at 24 and a dangling `$ref` degrades to a permissive object instead of failing.
+- **A model requested as `<model>[1m]` fell back to the default model.** Claude
+  Code spells a 1M-context request with a `[1m]` suffix, which no `[[models]]`
+  entry carries, so the lookup always missed and silently routed to the default
+  entry — and therefore to the wrong provider, base URL and upstream id. The
+  suffix is now stripped before matching in `resolve_request_model` and
+  `resolve_model`; the upstream id still comes from the matched entry, so the
+  tag never reaches the provider.
+
 ## [0.3.4] - 2026-10-27
 
 ### Added

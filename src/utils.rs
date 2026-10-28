@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use colored::*;
 use inquire::Confirm;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use similar::{ChangeTag, TextDiff};
 use std::fs;
 use std::io::Write;
@@ -255,27 +255,278 @@ pub fn ask_user_approval(prompt: &str) -> Result<bool> {
     Ok(answer)
 }
 
-/// Clean JSON schema by removing unsupported formats
-pub fn clean_schema(mut schema: Value) -> Value {
-    if let Some(obj) = schema.as_object_mut() {
-        // Remove "format": "uri"
-        if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
-            obj.remove("format");
-        }
+/// Keyword that carries a *map* of sub-schemas (name -> schema).
+const SCHEMA_MAP_KEYWORDS: [&str; 3] = ["properties", "patternProperties", "$defs"];
 
-        // Recursively clean nested schemas
-        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
+/// Keywords that carry a single sub-schema.
+const SCHEMA_KEYWORDS: [&str; 11] = [
+    "items",
+    "additionalItems",
+    "additionalProperties",
+    "propertyNames",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+];
+
+/// Keywords that carry a *list* of sub-schemas.
+const SCHEMA_LIST_KEYWORDS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
+
+/// Keywords that carry a map of `value -> schema` (discriminated unions).
+const SCHEMA_VALUE_MAP_KEYWORDS: [&str; 2] = ["dependentSchemas", "dependencies"];
+
+/// Maximum serialized size of a single tool schema, in bytes.
+///
+/// Moonshot/Kimi rejects tool schemas larger than roughly 128 KiB with a bare
+/// `invalid_request`, so anything we emit must stay under that. The value is
+/// kept a little below the observed cliff to leave room for the surrounding
+/// request (name, description, sibling tools) and for byte-level variation in
+/// escaping.
+const MAX_SCHEMA_BYTES: usize = 96 * 1024;
+
+/// Maximum `$ref` expansion depth.
+///
+/// Guards against pathological or cyclic `$defs` graphs. Real-world tool
+/// schemas nest well below this; anything deeper is collapsed to a permissive
+/// object rather than dropped, so the model still sees a valid schema.
+const MAX_SCHEMA_DEPTH: usize = 24;
+
+/// Clean a JSON schema for providers that reject parts of JSON Schema.
+///
+/// Three things happen here, all of which real harnesses need:
+///
+/// 1. `"format": "uri"` is stripped (rejected by some upstreams).
+/// 2. `$ref`s into `$defs` are inlined and the `$defs` block is dropped.
+///    Harnesses that emit `zod`/`pydantic`-style schemas (Claude Code's MCP
+///    tools, for instance) lean heavily on `$ref`; several upstreams reject
+///    them outright.
+/// 3. The result is capped at [`MAX_SCHEMA_BYTES`] by collapsing the largest
+///    sub-schemas to `{"type": "object"}`. Inlining can inflate a schema by
+///    an order of magnitude when a definition is referenced repeatedly, and
+///    an oversized schema fails the whole request.
+///
+/// The recursion covers the full schema vocabulary (`properties`, `items`,
+/// `oneOf`/`anyOf`/`allOf`, `$defs`, ...), not just `properties` and `items`.
+pub fn clean_schema(schema: Value) -> Value {
+    let defs = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut cleaned = clean_schema_node(schema, &defs, &mut Vec::new(), 0);
+    if let Some(obj) = cleaned.as_object_mut() {
+        obj.remove("$defs");
+    }
+    shrink_to_fit(cleaned, MAX_SCHEMA_BYTES)
+}
+
+/// Recursive worker for [`clean_schema`].
+///
+/// `stack` holds the `$defs` names currently being expanded, so a self-
+/// referential schema terminates instead of recursing forever.
+fn clean_schema_node(
+    node: Value,
+    defs: &Map<String, Value>,
+    stack: &mut Vec<String>,
+    depth: usize,
+) -> Value {
+    if depth > MAX_SCHEMA_DEPTH {
+        return json!({"type": "object"});
+    }
+
+    match node {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| clean_schema_node(item, defs, stack, depth + 1))
+                .collect(),
+        ),
+        Value::Object(mut obj) => {
+            // Inline a `$ref` into `$defs`, keeping any sibling keywords
+            // (`description`, `default`, ...) which JSON Schema allows next to
+            // a `$ref` and which carry meaning for the model.
+            if let Some(target) = obj
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+                .map(str::to_string)
+            {
+                let sibling: Vec<(String, Value)> = obj
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "$ref")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                let resolved = if stack.iter().any(|seen| seen == &target) {
+                    // Recursive definition: stop and leave a permissive object.
+                    json!({"type": "object"})
+                } else {
+                    match defs.get(&target) {
+                        Some(definition) => {
+                            stack.push(target.clone());
+                            let resolved =
+                                clean_schema_node(definition.clone(), defs, stack, depth + 1);
+                            stack.pop();
+                            resolved
+                        }
+                        // Dangling reference: nothing to inline. Drop the `$ref`
+                        // so the provider does not choke on an unresolvable
+                        // pointer; siblings still describe the value.
+                        None => json!({"type": "object"}),
+                    }
+                };
+
+                let mut resolved = resolved;
+                if let Some(map) = resolved.as_object_mut() {
+                    for (key, value) in sibling {
+                        map.insert(key, clean_schema_node(value, defs, stack, depth + 1));
+                    }
+                }
+                return resolved;
             }
-        }
 
-        if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema(items.clone());
+            // `format: uri` is rejected by some upstreams.
+            if obj.get("format").and_then(Value::as_str) == Some("uri") {
+                obj.remove("format");
+            }
+
+            for keyword in SCHEMA_MAP_KEYWORDS {
+                if let Some(map) = obj.get_mut(keyword).and_then(Value::as_object_mut) {
+                    for value in map.values_mut() {
+                        let taken = std::mem::take(value);
+                        *value = clean_schema_node(taken, defs, stack, depth + 1);
+                    }
+                }
+            }
+
+            for keyword in SCHEMA_KEYWORDS {
+                if let Some(value) = obj.get_mut(keyword) {
+                    let taken = std::mem::take(value);
+                    *value = clean_schema_node(taken, defs, stack, depth + 1);
+                }
+            }
+
+            for keyword in SCHEMA_LIST_KEYWORDS {
+                if let Some(list) = obj.get_mut(keyword).and_then(Value::as_array_mut) {
+                    for value in list.iter_mut() {
+                        let taken = std::mem::take(value);
+                        *value = clean_schema_node(taken, defs, stack, depth + 1);
+                    }
+                }
+            }
+
+            for keyword in SCHEMA_VALUE_MAP_KEYWORDS {
+                if let Some(map) = obj.get_mut(keyword).and_then(Value::as_object_mut) {
+                    for value in map.values_mut() {
+                        // `dependencies` may hold an array of property names
+                        // rather than a schema; leave those untouched.
+                        if value.is_object() {
+                            let taken = std::mem::take(value);
+                            *value = clean_schema_node(taken, defs, stack, depth + 1);
+                        }
+                    }
+                }
+            }
+
+            Value::Object(obj)
+        }
+        other => other,
+    }
+}
+
+/// Collapse the biggest sub-schemas until `schema` serializes within `limit`.
+///
+/// Providers reject oversized tool schemas, and a rejected schema fails the
+/// entire request, so losing detail is strictly better than losing the call.
+/// Only `properties` and the `oneOf`/`anyOf`/`allOf` branches are collapsed:
+/// those are where large tool schemas put their bulk, and replacing one with a
+/// permissive object keeps the schema valid while costing the model only the
+/// detail of that one field.
+fn shrink_to_fit(schema: Value, limit: usize) -> Value {
+    let mut schema = schema;
+    while serde_json::to_string(&schema).map(|s| s.len()).unwrap_or(0) > limit {
+        if !collapse_largest(&mut schema) {
+            // Nothing left to collapse: the schema is irreducibly large.
+            break;
+        }
+    }
+    schema
+}
+
+/// Collapse the single largest collapsible sub-schema. Returns `false` when
+/// there is nothing left to collapse.
+fn collapse_largest(schema: &mut Value) -> bool {
+    let Some(target) = largest_collapsible(schema) else {
+        return false;
+    };
+    if let Some(slot) = schema.pointer_mut(&target) {
+        *slot = json!({"type": "object"});
+        true
+    } else {
+        false
+    }
+}
+
+/// Find the JSON pointer of the largest collapsible sub-schema.
+///
+/// Only children reachable through `properties`, `oneOf`, `anyOf` and `allOf`
+/// are considered, so the result always points at something `collapse_largest`
+/// can replace wholesale.
+fn largest_collapsible(schema: &Value) -> Option<String> {
+    fn walk(node: &Value, path: &str, best: &mut Option<(usize, String)>) {
+        if let Some(obj) = node.as_object() {
+            for keyword in SCHEMA_MAP_KEYWORDS {
+                if let Some(map) = obj.get(keyword).and_then(Value::as_object) {
+                    for (key, value) in map {
+                        let size = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
+                        if best.as_ref().map(|(b, _)| size > *b).unwrap_or(true) {
+                            *best =
+                                Some((size, format!("{path}/{keyword}/{}", escape_pointer(key))));
+                        }
+                        walk(
+                            value,
+                            &format!("{path}/{keyword}/{}", escape_pointer(key)),
+                            best,
+                        );
+                    }
+                }
+            }
+            for keyword in SCHEMA_LIST_KEYWORDS {
+                if let Some(list) = obj.get(keyword).and_then(Value::as_array) {
+                    for (index, value) in list.iter().enumerate() {
+                        let size = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
+                        if best.as_ref().map(|(b, _)| size > *b).unwrap_or(true) {
+                            *best = Some((size, format!("{path}/{keyword}/{index}")));
+                        }
+                        walk(value, &format!("{path}/{keyword}/{index}"), best);
+                    }
+                }
+            }
+            for keyword in SCHEMA_KEYWORDS {
+                if let Some(value) = obj.get(keyword) {
+                    let size = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
+                    if best.as_ref().map(|(b, _)| size > *b).unwrap_or(true) {
+                        *best = Some((size, format!("{path}/{keyword}")));
+                    }
+                    walk(value, &format!("{path}/{keyword}"), best);
+                }
+            }
         }
     }
 
-    schema
+    let mut best = None;
+    walk(schema, "", &mut best);
+    best.map(|(_, path)| path)
+}
+
+/// Escape a JSON pointer reference token (RFC 6901).
+fn escape_pointer(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
 }
 
 #[cfg(test)]
@@ -283,6 +534,131 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn clean_schema_inlines_refs_and_drops_defs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "point": { "$ref": "#/$defs/Point" }
+            },
+            "$defs": {
+                "Point": {
+                    "type": "object",
+                    "properties": { "x": { "type": "number" } }
+                }
+            }
+        });
+
+        let cleaned = clean_schema(schema);
+        assert_eq!(cleaned.get("$defs"), None, "$defs must be dropped");
+        assert_eq!(cleaned["properties"]["point"]["type"], "object");
+        assert_eq!(
+            cleaned["properties"]["point"]["properties"]["x"]["type"],
+            "number"
+        );
+    }
+
+    #[test]
+    fn clean_schema_keeps_sibling_keywords_next_to_ref() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "point": {
+                    "$ref": "#/$defs/Point",
+                    "description": "a point",
+                    "default": null
+                }
+            },
+            "$defs": {
+                "Point": { "type": "object", "properties": { "x": { "type": "number" } } }
+            }
+        });
+
+        let cleaned = clean_schema(schema);
+        assert_eq!(cleaned["properties"]["point"]["description"], "a point");
+        assert_eq!(cleaned["properties"]["point"]["type"], "object");
+    }
+
+    #[test]
+    fn clean_schema_terminates_on_recursive_refs() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "node": { "$ref": "#/$defs/Node" } },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": { "child": { "$ref": "#/$defs/Node" } }
+                }
+            }
+        });
+
+        // Must not hang or blow the stack.
+        let cleaned = clean_schema(schema);
+        assert_eq!(cleaned.get("$defs"), None);
+    }
+
+    #[test]
+    fn clean_schema_recurses_into_unions() {
+        let schema = json!({
+            "oneOf": [
+                { "type": "string", "format": "uri" },
+                { "type": "object", "properties": { "u": { "type": "string", "format": "uri" } } }
+            ]
+        });
+
+        let cleaned = clean_schema(schema);
+        assert_eq!(cleaned["oneOf"][0].get("format"), None);
+        assert_eq!(cleaned["oneOf"][1]["properties"]["u"].get("format"), None);
+    }
+
+    #[test]
+    fn clean_schema_handles_dangling_ref() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "x": { "$ref": "#/$defs/Missing" } }
+        });
+
+        let cleaned = clean_schema(schema);
+        assert_eq!(cleaned["properties"]["x"]["type"], "object");
+    }
+
+    #[test]
+    fn clean_schema_shrinks_oversized_schemas() {
+        // A schema far past the per-tool limit: many large sibling properties.
+        let mut properties = serde_json::Map::new();
+        for index in 0..400 {
+            properties.insert(
+                format!("field_{index}"),
+                json!({
+                    "type": "object",
+                    "description": "x".repeat(400),
+                    "properties": { "nested": { "type": "string", "description": "y".repeat(400) } }
+                }),
+            );
+        }
+        let schema = json!({ "type": "object", "properties": properties });
+        assert!(serde_json::to_string(&schema).unwrap().len() > MAX_SCHEMA_BYTES);
+
+        let cleaned = clean_schema(schema);
+        let size = serde_json::to_string(&cleaned).unwrap().len();
+        assert!(
+            size <= MAX_SCHEMA_BYTES,
+            "expected <= {MAX_SCHEMA_BYTES} bytes, got {size}"
+        );
+        // Shrinking must keep the schema structurally valid.
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned["properties"].is_object());
+    }
+
+    #[test]
+    fn clean_schema_leaves_small_schemas_intact() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" } }
+        });
+        assert_eq!(clean_schema(schema.clone()), schema);
+    }
 
     #[test]
     fn test_generate_diff() {

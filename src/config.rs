@@ -163,6 +163,16 @@ fn default_enable_websearch() -> bool {
     true
 }
 
+/// Strip a harness-appended context-window tag from a requested model name.
+///
+/// Claude Code spells a 1M-context request as `<model>[1m]`. The tag is not
+/// part of the model id and no `[[models]]` entry carries it, so matching
+/// against it always misses — which would silently route the request to the
+/// default model instead of the one the user picked.
+fn strip_context_suffix(name: &str) -> &str {
+    name.strip_suffix("[1m]").unwrap_or(name).trim_end()
+}
+
 fn default_search_engine() -> String {
     "auto".to_string()
 }
@@ -576,8 +586,13 @@ impl Config {
     /// A model name the client sent that matches a `[[models]]` entry routes
     /// to that pool; anything else (unknown name, empty, the placeholder ids
     /// some harnesses send) falls back to the configured defaults.
+    ///
+    /// Claude Code appends a `[1m]` tag to request the 1M-context variant
+    /// (`moonshotai/kimi-k3.1-pro[1m]`). The tag is not part of the model id,
+    /// so it is stripped before matching — otherwise the request silently
+    /// falls back to the default model instead of the one the user picked.
     pub fn resolve_request_model(&self, requested: &str, is_reasoning: bool) -> Option<&Model> {
-        let requested = requested.trim();
+        let requested = strip_context_suffix(requested.trim());
         if !requested.is_empty()
             && let Some(model) = self.pick(requested)
         {
@@ -593,7 +608,7 @@ impl Config {
     /// The model behind `name` (pool routing applies). Used by nested calls
     /// and extensions that name a model.
     pub fn resolve_model(&self, name: &str) -> Option<&Model> {
-        self.pick(name)
+        self.pick(strip_context_suffix(name.trim()))
     }
 
     /// Distinct model names, in declaration order — what harnesses see.
@@ -883,6 +898,33 @@ search_decide_model = "legacy/decider"
                 .as_deref(),
             Some("https://b.example")
         );
+    }
+
+    #[test]
+    fn context_suffix_is_stripped_before_matching() {
+        let config = Config {
+            completion_model: Some("chat".to_string()),
+            reasoning_model: Some("think".to_string()),
+            models: vec![
+                model("chat", "https://chat.example"),
+                model("think", "https://think.example"),
+            ],
+            ..Config::default()
+        };
+        // Claude Code appends `[1m]` for 1M-context requests. The tag must not
+        // defeat routing: without stripping, this falls back to `chat`.
+        assert_eq!(
+            config
+                .resolve_request_model("think[1m]", false)
+                .unwrap()
+                .name,
+            "think"
+        );
+        assert_eq!(
+            config.resolve_request_model("chat[1m]", true).unwrap().name,
+            "chat"
+        );
+        assert_eq!(config.resolve_model("think[1m]").unwrap().name, "think");
     }
 
     #[test]
