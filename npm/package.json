@@ -1,6 +1,6 @@
 {
   "name": "@zatsepin/klava",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Klava CLI — run code agents (Claude Code, OpenCode, Pi, Codex) against any OpenAI-compatible provider, with secrets filtered out of your filesystem first.",
   "homepage": "https://github.com/Partysun/klava",
   "repository": {
@@ -29,10 +29,10 @@
     "postinstall": "node postinstall.js"
   },
   "optionalDependencies": {
-    "@zatsepin/klava-darwin": "0.3.4",
-    "@zatsepin/klava-linux-arm64-gnu": "0.3.4",
-    "@zatsepin/klava-linux-x64-gnu": "0.3.4",
-    "@zatsepin/klava-win32-x64-msvc": "0.3.4"
+    "@zatsepin/klava-darwin": "0.3.5",
+    "@zatsepin/klava-linux-arm64-gnu": "0.3.5",
+    "@zatsepin/klava-linux-x64-gnu": "0.3.5",
+    "@zatsepin/klava-win32-x64-msvc": "0.3.5"
   },
   "bin": {
     "klava": "klava"
