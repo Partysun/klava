@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.6] - 2026-11-05
+
+### Fixed
+
+- **Claude Code no longer shows the auto-mode classifier billing notice behind
+  klava.** Server-side classifier review rides on the model request (`safeguards`
+  in, `safeguard_results` out) and only Anthropic's own API performs it. klava
+  forwards to OpenAI-compatible providers, so the server could never answer and
+  Claude Code fell back to its own classifier requests — printing "this session
+  isn't eligible" on accounts where those requests are billed. `klava launch
+  claude` now sets `CLAUDE_CODE_AUTO_MODE_SERVER=0`, and `setup()` persists it
+  into `~/.claude/settings.json`, opting out of a review the upstream cannot
+  provide. Auto mode keeps working and its classifier requests are billed as
+  before. The classifier is also pointed at the configured completion model
+  (`CLAUDE_CODE_AUTO_MODE_MODEL`), so background checks bill at the cheap
+  model's rate instead of the reasoning model's.
+
 ## [0.3.5] - 2026-10-28
 
 ### Added

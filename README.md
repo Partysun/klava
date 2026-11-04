@@ -362,6 +362,12 @@ It's a work-in-progress tool.
 - ❌ Wrong: `https://openrouter.ai/api/v1`
 - ✅ Correct: `https://openrouter.ai/api`
 - The proxy automatically adds `/v1/chat/completions`
+- Claude Code says auto mode's classifier requests "aren't eligible" for the
+  no-charge change? That notice is expected behind any gateway: the server-side
+  review only exists on Anthropic's API, while klava forwards to other
+  providers. `klava launch claude` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` (and
+  persists it into `~/.claude/settings.json`) so the notice is skipped. Auto
+  mode keeps working and its classifier requests are billed as before.
 
 ## Roadmap & Contributing
 

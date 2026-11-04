@@ -46,13 +46,23 @@ impl ClaudeRunner {
         let Ok(config) = crate::config::Config::load() else {
             return Vec::new();
         };
-        let completion = config.resolve_completion_model();
-        let reasoning = config.resolve_reasoning_model();
+        Self::model_env_for(
+            config.resolve_completion_model().as_deref(),
+            config.resolve_reasoning_model().as_deref(),
+        )
+    }
+
+    /// `model_env` with the configured models passed in, so the mapping is
+    /// testable without loading a config file.
+    fn model_env_for(
+        completion: Option<&str>,
+        reasoning: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
         // The heavy aliases (opus/sonnet) should land on the reasoning model;
         // the cheap ones (haiku/small-fast) on the completion model. Either
         // falls back to the other so a single-model config still works.
-        let heavy = reasoning.as_deref().or(completion.as_deref());
-        let cheap = completion.as_deref().or(reasoning.as_deref());
+        let heavy = reasoning.or(completion);
+        let cheap = completion.or(reasoning);
 
         let mut env = Vec::new();
         if let Some(model) = heavy {
@@ -62,8 +72,32 @@ impl ClaudeRunner {
         if let Some(model) = cheap {
             env.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL", model.to_string()));
             env.push(("ANTHROPIC_SMALL_FAST_MODEL", model.to_string()));
+            // Auto mode's classifier is a separate model call, and Claude Code
+            // otherwise picks a heavyweight default. Point it at the cheap
+            // configured model so background checks do not bill at the
+            // reasoning model's rate. klava routes the alias like any other
+            // model name.
+            env.push(("CLAUDE_CODE_AUTO_MODE_MODEL", model.to_string()));
         }
         env
+    }
+
+    /// Environment that keeps Claude Code's background features compatible with
+    /// a translation proxy. Shared by `run()` (child process) and `setup()`
+    /// (persisted settings), so the two cannot drift apart.
+    ///
+    /// Auto mode's server-side classifier review rides on the model request:
+    /// Claude Code sends a `safeguards` field and reads `safeguard_results` from
+    /// the response, and only Anthropic's own API performs that review. klava
+    /// translates every request to an OpenAI-compatible provider, so the server
+    /// can never answer for a klava session. Claude Code then falls back to its
+    /// own classifier requests and shows the "this session isn't eligible"
+    /// billing notice on accounts where those requests are billed. Asking for a
+    /// review the upstream cannot provide only produces that notice, so opt
+    /// out: auto mode keeps working and classifier requests are Claude Code's
+    /// own, exactly as before the server-side feature existed.
+    fn auto_mode_env() -> Vec<(&'static str, String)> {
+        vec![("CLAUDE_CODE_AUTO_MODE_SERVER", "0".to_string())]
     }
 }
 
@@ -132,6 +166,9 @@ impl AgentRunner for ClaudeRunner {
         for (key, value) in Self::model_env() {
             env.insert(key.to_string(), serde_json::json!(value));
         }
+        for (key, value) in Self::auto_mode_env() {
+            env.insert(key.to_string(), serde_json::json!(value));
+        }
 
         settings.insert("env".to_string(), serde_json::Value::Object(env));
 
@@ -191,6 +228,9 @@ impl AgentRunner for ClaudeRunner {
         for (key, value) in Self::model_env() {
             command.env(key, value);
         }
+        for (key, value) in Self::auto_mode_env() {
+            command.env(key, value);
+        }
         let mut child = command
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to launch Claude CLI: {}", e))?;
@@ -205,5 +245,71 @@ impl AgentRunner for ClaudeRunner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_value<'a>(entries: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
+        entries
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn auto_mode_opts_out_of_server_side_review() {
+        // klava cannot relay `safeguard_results`, so asking for the server's
+        // review would only produce Claude Code's "not eligible" notice.
+        assert_eq!(
+            ClaudeRunner::auto_mode_env(),
+            vec![("CLAUDE_CODE_AUTO_MODE_SERVER", "0".to_string())]
+        );
+    }
+
+    #[test]
+    fn model_env_maps_heavy_and_cheap_aliases() {
+        let env = ClaudeRunner::model_env_for(Some("cheap"), Some("heavy"));
+
+        assert_eq!(
+            env_value(&env, "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some("heavy")
+        );
+        assert_eq!(
+            env_value(&env, "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some("heavy")
+        );
+        assert_eq!(
+            env_value(&env, "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some("cheap")
+        );
+        assert_eq!(env_value(&env, "ANTHROPIC_SMALL_FAST_MODEL"), Some("cheap"));
+        assert_eq!(
+            env_value(&env, "CLAUDE_CODE_AUTO_MODE_MODEL"),
+            Some("cheap"),
+            "classifier checks should bill at the cheap model's rate"
+        );
+    }
+
+    #[test]
+    fn model_env_falls_back_when_only_one_model_is_configured() {
+        let env = ClaudeRunner::model_env_for(Some("only"), None);
+
+        assert_eq!(
+            env_value(&env, "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            Some("only")
+        );
+        assert_eq!(
+            env_value(&env, "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some("only")
+        );
+        assert_eq!(env_value(&env, "CLAUDE_CODE_AUTO_MODE_MODEL"), Some("only"));
+    }
+
+    #[test]
+    fn model_env_is_empty_without_models() {
+        assert!(ClaudeRunner::model_env_for(None, None).is_empty());
     }
 }
