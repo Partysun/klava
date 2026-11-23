@@ -202,7 +202,7 @@ pub struct ChoiceMessage {
     pub reasoning_content: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     #[serde(default = "default_tokens")]
     pub prompt_tokens: u32,
@@ -214,18 +214,30 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Usage fields added by the gateway rather than the OpenAI spec —
+    /// billing (`cost`, `cost_details`, `currency`) and provider-specific
+    /// counters. Kept verbatim so proxying a response never drops the
+    /// numbers the client needs to account for spend.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: u32,
+    /// Provider-specific counters such as `cache_write_tokens`; dropping these
+    /// would under-report cache usage to clients.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CompletionTokensDetails {
     #[serde(default)]
     pub reasoning_tokens: u32,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_tokens() -> u32 {
@@ -290,6 +302,39 @@ pub struct DeltaFunctionCall {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn usage_round_trips_gateway_billing_fields() {
+        let raw = json!({
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 2},
+            "completion_tokens_details": {"reasoning_tokens": 1, "audio_tokens": 0},
+            "cost": "0.000123",
+            "cost_details": {"prompt_rub": "0.000050", "total_rub": "0.000123"},
+            "currency": "RUB"
+        });
+
+        let usage: Usage = serde_json::from_value(raw).unwrap();
+        assert_eq!(usage.extra["cost"], json!("0.000123"));
+        assert_eq!(usage.extra["currency"], json!("RUB"));
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().unwrap().extra["cache_write_tokens"],
+            json!(2)
+        );
+
+        let out = serde_json::to_value(&usage).unwrap();
+        assert_eq!(out["cost"], json!("0.000123"));
+        assert_eq!(
+            out["cost_details"]["total_rub"],
+            json!("0.000123"),
+            "billing breakdown must survive re-serialization: {out}"
+        );
+        assert_eq!(out["currency"], json!("RUB"));
+        assert_eq!(out["prompt_tokens_details"]["cache_write_tokens"], json!(2));
+        assert_eq!(out["prompt_tokens_details"]["cached_tokens"], json!(4));
+    }
 
     #[test]
     fn openai_request_round_trips_unknown_fields() {

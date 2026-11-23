@@ -63,6 +63,13 @@ impl OpenaiPassthrough {
         result.choices[0].delta.tool_calls = Some(fixed_calls);
         result
     }
+
+    fn serialize_chunk(&self, chunk: &StreamChunk) -> Vec<Bytes> {
+        match serde_json::to_string(chunk) {
+            Ok(json_str) => vec![Bytes::from(format!("data: {}\n\n", json_str))],
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 impl Default for OpenaiPassthrough {
@@ -75,13 +82,23 @@ impl ChatChunkConverter for OpenaiPassthrough {
     type OutputEvent = Bytes;
 
     fn process(&mut self, chunk: &StreamChunk) -> Vec<Bytes> {
-        // Skip if already completed
-        if self.completed {
-            return Vec::new();
+        // A usage-bearing chunk is the only source of billed cost in a stream.
+        // Gateways send it either as a `choices: []` chunk or attached to a
+        // repeat of the finish chunk, and always *after* the finish chunk, so
+        // it must be forwarded even once this converter has completed.
+        let has_usage = chunk.usage.is_some();
+
+        // Empty-choices chunks without usage carry nothing for the client.
+        if chunk.choices.is_empty() {
+            return if has_usage {
+                self.serialize_chunk(chunk)
+            } else {
+                Vec::new()
+            };
         }
 
-        // Skip if empty choices
-        if chunk.choices.is_empty() {
+        // Skip trailing chunks after completion, except the usage-bearing one.
+        if self.completed && !has_usage {
             return Vec::new();
         }
 
@@ -99,11 +116,7 @@ impl ChatChunkConverter for OpenaiPassthrough {
         let fixed_chunk = self.fix_null_fields(chunk);
 
         // Serialize back - even if completed (passthrough should send final chunk)
-        if let Ok(json_str) = serde_json::to_string(&fixed_chunk) {
-            vec![Bytes::from(format!("data: {}\n\n", json_str))]
-        } else {
-            vec![]
-        }
+        self.serialize_chunk(&fixed_chunk)
     }
 
     fn serialize(&self, event: &Bytes) -> Vec<u8> {
@@ -213,6 +226,104 @@ mod tests {
 
         // Verify completion state
         assert!(converter.is_completed(), "Should be marked as completed");
+    }
+
+    #[tokio::test]
+    async fn test_usage_chunk_after_completion_is_forwarded() {
+        let mut converter = OpenaiPassthrough::new();
+
+        let finish = StreamChunk {
+            id: "test-id".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: None,
+        };
+        assert!(!converter.process(&finish).is_empty());
+        assert!(converter.is_completed());
+
+        // Gateways send the usage chunk after finish_reason; the completion
+        // guard must not swallow the only chunk that carries billed cost.
+        let usage = StreamChunk {
+            id: "test-id".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1,
+            model: "test-model".to_string(),
+            choices: vec![],
+            usage: Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 3,
+                total_tokens: 8,
+                ..Default::default()
+            }),
+        };
+
+        let events = converter.process(&usage);
+        assert_eq!(events.len(), 1, "usage chunk should be forwarded");
+        let text = String::from_utf8(events[0].to_vec()).unwrap();
+        assert!(text.contains("\"prompt_tokens\":5"), "got: {text}");
+        assert!(text.contains("\"choices\":[]"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_usage_attached_to_repeated_finish_chunk_is_forwarded() {
+        // Real gateway order: a finish chunk, then another finish chunk that
+        // carries `usage`. The second one must survive the completion guard,
+        // while a later usage-less duplicate is still dropped.
+        let mut converter = OpenaiPassthrough::new();
+        let finish = |usage: Option<Usage>| StreamChunk {
+            id: "test-id".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1,
+            model: "test-model".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta::default(),
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage,
+        };
+
+        assert_eq!(converter.process(&finish(None)).len(), 1);
+        assert!(converter.is_completed());
+
+        let mut usage = Usage {
+            prompt_tokens: 123,
+            completion_tokens: 45,
+            total_tokens: 168,
+            ..Default::default()
+        };
+        usage
+            .extra
+            .insert("cost".to_string(), serde_json::json!("0.012345"));
+        let events = converter.process(&finish(Some(usage)));
+        assert_eq!(events.len(), 1, "usage-bearing finish chunk was dropped");
+        let text = String::from_utf8(events[0].to_vec()).unwrap();
+        assert!(text.contains("\"cost\":\"0.012345\""), "got: {text}");
+
+        // A plain trailing finish chunk is still filtered.
+        assert!(converter.process(&finish(None)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_empty_choices_chunk_without_usage_is_dropped() {
+        let mut converter = OpenaiPassthrough::new();
+        let chunk = StreamChunk {
+            id: "test-id".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1,
+            model: "test-model".to_string(),
+            choices: vec![],
+            usage: None,
+        };
+        assert!(converter.process(&chunk).is_empty());
     }
 
     #[tokio::test]

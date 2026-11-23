@@ -623,6 +623,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
+                ..Default::default()
             },
             system_fingerprint: None,
         }
@@ -673,10 +674,15 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-                prompt_tokens_details: Some(openai::PromptTokensDetails { cached_tokens: 7 }),
+                prompt_tokens_details: Some(openai::PromptTokensDetails {
+                    cached_tokens: 7,
+                    ..Default::default()
+                }),
                 completion_tokens_details: Some(openai::CompletionTokensDetails {
                     reasoning_tokens: 3,
+                    ..Default::default()
                 }),
+                ..Default::default()
             },
             system_fingerprint: None,
         };

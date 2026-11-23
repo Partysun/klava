@@ -91,6 +91,7 @@ pub fn make_done_chunk(id: &str) -> String {
             total_tokens: 15,
             prompt_tokens_details: None,
             completion_tokens_details: None,
+            ..Default::default()
         }),
     })
     .unwrap()

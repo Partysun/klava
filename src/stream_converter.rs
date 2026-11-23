@@ -880,6 +880,7 @@ mod tests {
                 total_tokens: 177,
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
+                ..Default::default()
             }),
         };
 

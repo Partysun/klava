@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.7] - 2026-11-23
+
+### Fixed
+
+- **Streamed responses now carry the gateway's usage and billed cost.** An
+  OpenAI-compatible gateway sends the final `usage` chunk with `choices: []` —
+  or attached to a repeat of the finish chunk — after the finish chunk. The
+  passthrough converter dropped both, so streaming clients saw no token counts
+  and no cost. A usage-bearing chunk is now forwarded even after completion;
+  usage-less empty-choice chunks are still filtered.
+- **`usage` keeps provider-specific billing fields through the proxy.**
+  `cost`, `cost_details`, `currency`, `cache_write_tokens` and any other
+  gateway-specific counters are preserved verbatim instead of being dropped on
+  re-serialization. Non-streaming responses are unchanged.
+
 ## [0.3.6] - 2026-11-05
 
 ### Fixed

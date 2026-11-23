@@ -735,6 +735,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
+                ..Default::default()
             }),
         ));
 
@@ -826,6 +827,7 @@ mod tests {
                 total_tokens: 0,
                 prompt_tokens_details: None,
                 completion_tokens_details: None,
+                ..Default::default()
             }),
         ));
 

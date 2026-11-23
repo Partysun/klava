@@ -565,19 +565,37 @@ mod integration_tests {
                             sse_response("data: {\"error\":{\"message\":\"upstream boom\",\"code\":502}}\n\ndata: [DONE]\n\n")
                         }
                         FakeMode::SseUsageThenStop => {
+                            // A gateway repeats the finish chunk with `usage`
+                            // attached after the plain finish chunk; that
+                            // repeat is the only carrier of billed cost.
                             let usage_chunk = json!({
                                 "id": "c1",
                                 "object": "chat.completion.chunk",
                                 "created": 0,
                                 "model": "m",
-                                "choices": [],
-                                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": ""},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 5,
+                                    "completion_tokens": 3,
+                                    "total_tokens": 8,
+                                    "cost": "0.000123",
+                                    "cost_details": {
+                                        "prompt_rub": "0.000050",
+                                        "completion_rub": "0.000073",
+                                        "total_rub": "0.000123"
+                                    },
+                                    "currency": "RUB"
+                                }
                             });
                             sse_response(&format!(
                                 "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                                 content_chunk("hi"),
-                                usage_chunk,
-                                stop_chunk()
+                                stop_chunk(),
+                                usage_chunk
                             ))
                         }
                         FakeMode::SseReasoning => sse_response(&format!(
@@ -957,7 +975,7 @@ json.dump({"decision": "replace", "payload": payload}, sys.stdout)
     }
 
     #[tokio::test]
-    async fn streaming_usage_chunk_with_empty_choices_is_filtered() {
+    async fn streaming_usage_chunk_after_finish_is_forwarded() {
         let log = Arc::new(Mutex::new(vec![]));
         let port = spawn_fake_upstream(FakeMode::SseUsageThenStop, log.clone()).await;
         let router = build_proxy(&format!("http://127.0.0.1:{port}"));
@@ -970,12 +988,25 @@ json.dump({"decision": "replace", "payload": payload}, sys.stdout)
         )
         .await;
         assert_eq!(status, 200);
+        // Gateways attach `usage` to a repeat of the finish chunk (or send a
+        // `choices: []` chunk) after the plain finish chunk. It is the only
+        // carrier of billed cost in a streamed response, so it must reach the
+        // client instead of being suppressed as a post-completion duplicate.
+        assert!(body.contains("\"prompt_tokens\":5"), "body: {body}");
+        assert!(
+            body.contains("\"cost\":\"0.000123\""),
+            "streamed cost was dropped: {body}"
+        );
+        assert!(
+            body.contains("\"total_rub\":\"0.000123\""),
+            "streamed cost breakdown was dropped: {body}"
+        );
+        assert!(
+            body.contains("\"currency\":\"RUB\""),
+            "streamed currency was dropped: {body}"
+        );
         assert!(body.contains("\"finish_reason\":\"stop\""), "body: {body}");
         assert!(body.contains("[DONE]"), "body: {body}");
-        assert!(
-            !body.contains("prompt_tokens"),
-            "empty-choices usage chunk should be dropped: {body}"
-        );
     }
 
     #[tokio::test]
