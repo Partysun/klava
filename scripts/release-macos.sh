@@ -69,9 +69,13 @@ case "$phase" in
     maturin build --release --locked \
       --target universal2-apple-darwin --out dist
 
-    # the npm binary is the exact fat binary the wheel carries
-    bash scripts/wheel-binary.sh \
-      "$(ls dist/*universal2.whl)" npm/platforms/darwin/klava
+    # the npm binary is the exact fat binary the wheel carries. Do not match on
+    # the tag suffix: maturin emits a compressed platform tag whose component
+    # order varies (~0.3.0: ...universal2.whl, ~0.3.7: ...universal2.macosx_11_0_x86_64.whl),
+    # and `dist` is wiped above so there is exactly one wheel anyway.
+    wheel="$(ls dist/*.whl 2>/dev/null | head -n 1)" || true
+    [ -n "$wheel" ] || { echo "maturin produced no wheel in dist" >&2; exit 1; }
+    bash scripts/wheel-binary.sh "$wheel" npm/platforms/darwin/klava
     # `lipo -archs` prints the slices in no fixed order
     archs="$(lipo -archs npm/platforms/darwin/klava)"
     echo "npm binary architectures: $archs"
