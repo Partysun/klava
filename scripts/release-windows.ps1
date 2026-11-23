@@ -139,6 +139,20 @@ switch ($Phase) {
     }
 
     "extensions-build" {
+        # The local backend points USERPROFILE/HOME at a per-workflow temp dir
+        # ("isolated home"). Windows resolves FOLDERID_LocalAppData through
+        # USERPROFILE, so under that temp profile SHGetKnownFolderPath returns
+        # 0x80070003 and ort-sys panics with "could not determine cache
+        # directory" while fetching its ONNX Runtime binaries. Put the real
+        # profile back for this phase; it also lets cargo/rustup reuse their
+        # persistent caches instead of downloading into a fresh temp home.
+        $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        $realProfile = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+        if ($realProfile) {
+            $env:USERPROFILE = $realProfile
+            $env:HOME = $realProfile
+        }
+
         # Woodpecker's local backend gives every step the same per-pipeline
         # HOME, and the CLI's `build` runs at the same time as this step.
         # Both need a rustup toolchain there, and two concurrent
@@ -171,12 +185,9 @@ switch ($Phase) {
         # The three extension crates are independent binaries; `cargo build`
         # with several -p flags shares the dependency build.
         #
-        # Retried because ort-sys's build script can abort with "could not
-        # determine cache directory": it locates the cache through
-        # SHGetKnownFolderPath, which intermittently fails in a freshly
-        # spawned step process (the same commit has both passed and failed
-        # here). That is a transient shell-API failure, not a build error, and
-        # a retry reuses every dependency already compiled.
+        # Retry as a safety net for the ort-sys cache-dir panic explained
+        # above; a retry reuses every dependency already compiled, so it is
+        # cheap when it is not needed.
         $packages = @("klava-compress", "klava-pii-guardrail", "klava-model-escalation")
         $cargoArgs = @("build", "--release", "--locked")
         foreach ($p in $packages) { $cargoArgs += @("-p", $p) }
