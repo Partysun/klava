@@ -10,6 +10,16 @@
 # All logic lives in scripts/ so Woodpecker's envsubst never touches a dollar
 # sign; klava has no ONNX runtime in the CLI, so unlike jigor both slices are
 # plain cargo builds.
+
+# klava ships no LFS content, and plugin-git defaults `lfs: true`, which makes
+# the clone step fail hard on agents without git-lfs installed. Keep the clone
+# independent of host tooling.
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      lfs: false
+
 when:
   - event: deployment
     evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "macos", "npm", "pypi", "publish"]'

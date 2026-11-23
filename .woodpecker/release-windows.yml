@@ -9,6 +9,16 @@
 # Step environments DO reach powershell steps, but not the bash (WSL) steps,
 # so everything runs in powershell via a script file — which also keeps
 # Woodpecker's envsubst away from `$` signs.
+
+# klava ships no LFS content, and plugin-git defaults `lfs: true`, which makes
+# the clone step fail hard on agents without git-lfs installed. Keep the clone
+# independent of host tooling.
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      lfs: false
+
 when:
   - event: deployment
     evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "windows", "npm", "pypi", "publish"]'

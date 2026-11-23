@@ -14,6 +14,16 @@
 # The extensions build in rust:bookworm, not the maturin image: ONNX runtime's
 # prebuilt aarch64 objects give klava-compress a glibc 2.34 floor, so it needs a
 # real GNU aarch64 cross toolchain (zig cannot link them) and a matching libc.
+
+# klava ships no LFS content, and plugin-git defaults `lfs: true`, which makes
+# the clone step fail hard on agents without git-lfs installed. Keep the clone
+# independent of host tooling.
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      lfs: false
+
 when:
   - event: deployment
     evaluate: '(CI_PIPELINE_DEPLOY_TASK ?? "") in ["", "linux", "npm", "pypi", "publish"]'
