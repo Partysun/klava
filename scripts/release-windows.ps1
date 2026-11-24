@@ -99,24 +99,27 @@ switch ($Phase) {
         $artifacts = @(Get-ChildItem -Path dist -File)
         if ($artifacts.Count -eq 0) { throw "no artifacts in dist\" }
         $missing = @()
+        # Query PyPI with curl.exe, not PowerShell's Invoke-RestMethod: on some
+        # Windows agents Invoke-RestMethod fails to connect to pypi.org while
+        # curl reaches it (no proxy, TLS OK — a HttpWebRequest->Fastly issue),
+        # which would abort every publish before anything is uploaded.
+        $pypiTmp = Join-Path $env:TEMP ("klava-pypi-" + $version + ".json")
+        $code = (& curl.exe -s -o $pypiTmp -w "%{http_code}" "https://pypi.org/pypi/klava/$version/json").Trim()
+        # A 404 means "version not on PyPI yet" (publish everything); anything
+        # else (network, auth) must not silently turn into "publish everything"
+        # and then fail with "already exists".
+        if ($code -ne "200" -and $code -ne "404") {
+            Remove-Item $pypiTmp -ErrorAction SilentlyContinue
+            throw "cannot query PyPI for klava $version (HTTP $code)"
+        }
+        $present = @{}
+        if ($code -eq "200") {
+            $json = Get-Content -Raw $pypiTmp | ConvertFrom-Json
+            foreach ($u in $json.urls) { $present[$u.filename] = $true }
+        }
+        Remove-Item $pypiTmp -ErrorAction SilentlyContinue
         foreach ($a in $artifacts) {
-            $found = $false
-            try {
-                $json = Invoke-RestMethod -Uri "https://pypi.org/pypi/klava/$version/json" -TimeoutSec 20
-                foreach ($u in $json.urls) {
-                    if ($u.filename -eq $a.Name) { $found = $true; break }
-                }
-            } catch {
-                # a 404 means "version not on PyPI yet" (publish everything);
-                # anything else (network, auth) must not silently turn into
-                # "publish everything" and then fail with "already exists"
-                $code = $null
-                if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-                if ($code -ne 404) {
-                    throw "cannot query PyPI for klava $version (HTTP $code): $($_.Exception.Message)"
-                }
-            }
-            if ($found) { echo "skip: $($a.Name) already on PyPI" } else { $missing += $a.Path }
+            if ($present.ContainsKey($a.Name)) { echo "skip: $($a.Name) already on PyPI" } else { $missing += $a.Path }
         }
         if ($missing.Count -eq 0) {
             echo "nothing new to publish"
