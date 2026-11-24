@@ -138,6 +138,12 @@ impl EffortPolicy {
         self.resolve(EffortRequest::Unspecified)
     }
 
+    /// The configured per-model or global default *before* the cap is applied,
+    /// if any. Used to report "clamped from X" in diagnostics.
+    pub fn configured_default(&self) -> Option<ReasoningEffort> {
+        self.model_default.or(self.global_default)
+    }
+
     /// The cap in effect for this entry, if any.
     pub fn cap(&self) -> Option<ReasoningEffort> {
         self.model_cap.or(self.global_cap)

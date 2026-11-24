@@ -4,6 +4,7 @@
 //! to verify that the connection settings and the API are working.
 
 use crate::config::Config;
+use crate::effort::EffortPolicy;
 use crate::providers::Model;
 use crate::{error::Error, models::openai};
 use colored::*;
@@ -75,6 +76,40 @@ impl ServiceStatus {
     }
 }
 
+/// Show one model's effective reasoning effort (or "unset"), noting when a
+/// configured default is clamped down by a cap. Informational: a valid config
+/// is a pass even before we know what the endpoint honours.
+fn effort_check(policy: &EffortPolicy) -> CheckResult {
+    let name = "Reasoning Effort".to_string();
+    let Some(effective) = policy.default_level() else {
+        return CheckResult {
+            name,
+            passed: true,
+            message: "Reasoning effort: unset (endpoint default)".to_string(),
+        };
+    };
+    let clamped = policy
+        .configured_default()
+        .is_some_and(|cfg| cfg.rank() > effective.rank());
+    let detail = if clamped {
+        format!(
+            "{} (clamped to {} by cap)",
+            policy
+                .configured_default()
+                .unwrap_or(effective)
+                .variant_name(),
+            effective.variant_name()
+        )
+    } else {
+        effective.variant_name().to_string()
+    };
+    CheckResult {
+        name,
+        passed: true,
+        message: format!("Reasoning effort: {detail}"),
+    }
+}
+
 impl TestResult {
     pub fn print_summary(&self) {
         // Compact header
@@ -127,6 +162,13 @@ pub async fn test_provider(
         checks,
     };
 
+    // Surface the effective reasoning effort up front (incl. clamping) so the
+    // check doesn't wait for the network round-trip to tell us what klava
+    // would actually send for this model.
+    let effort_policy = EffortPolicy::for_entry(config, provider_config);
+    let effective_effort = effort_policy.default_level();
+    result.checks.push(effort_check(&effort_policy));
+
     // Check 1: Config validation
     if let Err(e) = provider_config.validate_config(config) {
         result.checks.push(CheckResult {
@@ -163,6 +205,9 @@ pub async fn test_provider(
             message: "No auth required".to_string(),
         });
     }
+    // The main request consumes `auth_headers`; clone now so the effort probe
+    // can send the same headers a moment later.
+    let probe_auth = auth_headers.clone();
 
     // Determine URL and model
     let url = provider_config
@@ -176,7 +221,7 @@ pub async fn test_provider(
     result.model = test_model.clone();
 
     let test_req = openai::OpenAIRequest {
-        model: test_model,
+        model: test_model.clone(),
         messages: vec![
             openai::Message {
                 role: "system".to_string(),
@@ -330,7 +375,106 @@ pub async fn test_provider(
         }
     }
 
+    // When a reasoning effort is configured, probe whether the endpoint
+    // actually honours the value. A hard 4xx (400/422/404) usually means the
+    // level is not supported and should be flagged; transient 429/5xx is just
+    // provider throttling and is reported without failing the check.
+    if result.success && let Some(effort) = effective_effort {
+        probe_effort(client, &url, &probe_auth, &test_model, effort)
+            .await
+            .attach_to(&mut result);
+    }
+
     Ok(result)
+}
+
+/// Result of probing one reasoning-effort value against the endpoint.
+pub enum EffortProbe {
+    /// The endpoint accepted the request unconditionally (200).
+    Honoured(String),
+    /// A hard 4xx rejected the request (likely the effort value).
+    Rejected(String),
+    /// 429/5xx or a transport failure: we cannot tell whether the value is
+    /// supported.
+    Unknown(String),
+}
+
+impl EffortProbe {
+    /// Fold the probe result into the check that `test_provider` pushed up
+    /// front, so the "Reasoning Effort" row reflects what the endpoint did.
+    fn attach_to(self, result: &mut TestResult) {
+        let Some(check) = result
+            .checks
+            .iter_mut()
+            .find(|c| c.name == "Reasoning Effort")
+        else {
+            return;
+        };
+        let base = check.message.clone();
+        match self {
+            EffortProbe::Honoured(detail) => {
+                check.message = format!("{base} — endpoint accepts it ({detail})");
+            }
+            EffortProbe::Rejected(detail) => {
+                check.passed = false;
+                check.message =
+                    format!("{base} — NOT honoured: this endpoint rejects it ({detail})");
+            }
+            EffortProbe::Unknown(detail) => {
+                check.message = format!("{base} — could not verify ({detail})");
+            }
+        }
+    }
+}
+
+/// Send one tiny request carrying `effort` and classify what the endpoint did.
+async fn probe_effort(
+    client: &Client,
+    url: &str,
+    auth: &Option<reqwest::header::HeaderMap>,
+    model: &str,
+    effort: openai::ReasoningEffort,
+) -> EffortProbe {
+    let probe = serde_json::json!({
+        "model": model,
+        "messages": [{"role":"user","content":"Reply with the single word OK."}],
+        "max_tokens": 16,
+        "stream": false,
+        "reasoning_effort": effort.variant_name(),
+    });
+    let mut builder = client
+        .post(url)
+        .json(&probe)
+        .timeout(Duration::from_secs(30));
+    if let Some(headers) = auth {
+        builder = builder.headers(headers.clone());
+    }
+    if url.contains("openrouter") {
+        builder = builder
+            .header("X-OpenRouter-Title", "Klava")
+            .header("X-OpenRouter-Categories", "cli-agent-proxy");
+    }
+    let Ok(resp) = builder.send().await else {
+        return EffortProbe::Unknown("request failed".into());
+    };
+    let code = resp.status();
+    if code.is_success() {
+        return EffortProbe::Honoured(format!("HTTP {}", code.as_u16()));
+    }
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let msg = body
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("HTTP {}", code.as_u16()));
+    match code.as_u16() {
+        400 | 422 | 404 => EffortProbe::Rejected(msg),
+        _ => {
+            // 429 throttling / 5xx provider trouble is not an effort verdict.
+            EffortProbe::Unknown(msg)
+        }
+    }
 }
 
 /// Validate a chat completions response body.
@@ -911,5 +1055,51 @@ mod tests {
         assert_eq!(first_line("  error: boom  \nsecond"), "error: boom");
         assert_eq!(first_line("   "), "");
         assert_eq!(first_line("single"), "single");
+    }
+
+    // ---- reasoning-effort report helpers ----------------------------------
+
+    fn policy(global_default: Option<&str>, model_effort: Option<&str>, model_cap: Option<&str>) -> EffortPolicy {
+        let config = Config {
+            reasoning_effort: global_default.map(str::to_string),
+            reasoning_effort_cap: None,
+            ..Config::default()
+        };
+        let model = Model {
+            reasoning_effort: model_effort.map(str::to_string),
+            reasoning_effort_cap: model_cap.map(str::to_string),
+            name: "~deepseek/deepseek-flash-latest".into(),
+            provider_type: crate::providers::Type::Klava,
+            ..Model::default()
+        };
+        EffortPolicy::for_entry(&config, &model)
+    }
+
+    #[test]
+    fn effort_check_reports_unset_without_effort() {
+        let check = effort_check(&policy(None, None, None));
+        assert!(check.passed);
+        assert!(check.message.contains("unset"), "{}", check.message);
+    }
+
+    #[test]
+    fn effort_check_shows_the_effective_effort() {
+        let check = effort_check(&policy(None, Some("max"), None));
+        assert!(check.passed);
+        assert!(check.message.contains("max"), "{}", check.message);
+        assert!(!check.message.contains("clamped"), "{}", check.message);
+    }
+
+    #[test]
+    fn effort_check_reports_clamping_down_to_the_cap() {
+        let check = effort_check(&policy(None, Some("max"), Some("high")));
+        assert!(check.passed);
+        assert!(check.message.contains("clamped to high"), "{}", check.message);
+    }
+
+    #[test]
+    fn effort_report_global_default_wins_when_model_unset() {
+        let check = effort_check(&policy(Some("medium"), None, None));
+        assert!(check.message.contains("medium"), "{}", check.message);
     }
 }

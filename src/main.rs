@@ -815,6 +815,23 @@ fn list_models(config: &config::Config) {
                 key,
                 jigor
             );
+            // Surface the effective reasoning effort (post-clamp) so the list
+            // doubles as an effort quick-check without needing a network hit.
+            let effort = klava::effort::EffortPolicy::for_entry(config, model);
+            if let Some(level) = effort.default_level() {
+                let clamped = effort
+                    .configured_default()
+                    .is_some_and(|c| c.rank() > level.rank());
+                if clamped {
+                    println!(
+                        "    Reasoning effort: {} (clamped from {} by cap)",
+                        level.variant_name(),
+                        effort.configured_default().unwrap_or(level).variant_name()
+                    );
+                } else {
+                    println!("    Reasoning effort: {}", level.variant_name());
+                }
+            }
         }
     }
 
