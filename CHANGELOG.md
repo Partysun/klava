@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.8] - 2026-11-24
+
+### Added
+
+- **`providers check` reports the effective reasoning effort per model.** Each
+  model now prints an `Reasoning effort: …` row showing what klava will actually
+  send — the per-model default, the global default, or `unset` (endpoint default)
+  — and calls out when a configured default is clamped down by a cap
+  (`max` → `clamped to high by cap`).
+- **`providers check` probes a configured effort against the endpoint.** A cheap
+  request carries the effort level and confirms the server accepts it: a hard
+  400/422/404 downgrades the row to `NOT honoured` (a warning), while transient
+  429/5xx throttling is reported as `could not verify` without failing the check.
+- **`providers list` shows the effective (post-clamp) reasoning effort** per
+  model, so a quick check needs no network round-trip.
+
 ## [0.3.7] - 2026-11-23
 
 ### Fixed
