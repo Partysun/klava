@@ -368,6 +368,19 @@ It's a work-in-progress tool.
   providers. `klava launch claude` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` (and
   persists it into `~/.claude/settings.json`) so the notice is skipped. Auto
   mode keeps working and its classifier requests are billed as before.
+- Seeing `the prompt's ids are outside what its maker reaches` mid-stream? An
+  alias such as `~deepseek/deepseek-flash-latest` resolves to many upstream
+  providers, and one conversation can be served by several of them. The
+  tool-call ids in the prompt were minted by an earlier provider, so the next
+  one rejects them as foreign (`prompt_bound`). It is **transient** — the
+  routing decision is per request, so retrying usually lands on a provider that
+  accepts the ids. The session itself is fine; there is nothing to repair.
+  Behind the klava gateway the client sees a generic `response_interrupted`
+  with a `request_id` once the redaction fix is deployed, because vendor error
+  text is never forwarded.
+  If you run your own OpenAI-compatible proxy in front of a multi-provider
+  router, note that this error arrives inside a `200` SSE stream, so a status
+  check will not catch it.
 
 ## Roadmap & Contributing
 
